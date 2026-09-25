@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qij_joint"
+version = "0.1.0"
+description = "Variance for estimators without a closed-form influence function"
+requires-python = ">=3.9,<3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "pyarrow",
+    "h5py",
+    "joblib",
+    # vqlp is the vector quantizer, from github.com/jt-ut/vqlp. Named
+    # plainly rather than pinned to a path or URL, so it resolves against
+    # whatever is installed. Install it before this package.
+    "vqlp",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+qij_joint = ["data/*.npz", "data/*.h5", "data/truth/*.json"]

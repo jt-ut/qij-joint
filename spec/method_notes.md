@@ -1,0 +1,350 @@
+# QIJ method notes
+
+Reference for the derivations behind `qij_joint`'s code, stated as the
+method now is. Terms and symbols follow `glossary.md` in this folder;
+subscripts i for data points, j for X-VQ prototypes, k for I-VQ bins,
+c for estimator outputs. Each module names the section here it
+implements, once.
+
+## 1. The weight constructor and step rule
+
+For a member set K of mass p in base weights omega0 (summing to the
+row count R), the one weight constructor is
+
+    omega_i(t) = (1 - t) * omega0_i + t * omega0_i * 1{i in K} / p
+
+Every omega_i(t) sums to R for every t. A relative step delta on K --
+the fraction of K's OWN mass the step moves it by -- is the weight
+parameter t = delta * p / (1 - p): under it, every member weight is
+multiplied by (1 + delta) and every other weight by (1 - t), so K's
+mass becomes p*(1 + delta). Steps used: delta_f = 2*sqrt(eta) for a
+single forward difference (the
+prototype survey, and a refinement split's one-shot measurement);
+delta = (3*eta)^(1/3) for the central stencil that measures the
+initial bins.
+
+The central stencil, at t = step_parameter(delta, p):
+
+    U = [T(+t) - T(-t)] / (2*t)
+
+is always used: every registered estimator's eta keeps delta <= 1, so
+the downward step never drives a member weight negative (the one-sided
+fallback for delta > 1 has no current use and is not carried).
+
+`Counter` counts every evaluation, its rows, and any evaluation whose
+result carries a NaN, and offers `T.prepare(A)` -- computed once per
+distinct array object A over the Counter's lifetime -- to any
+estimator that has it, so an estimator's weight-independent
+quantities (log-ratios, standardized X, fixed design bases) are not
+recomputed on every call. The prototype survey evaluates T on the
+prototypes, a different array from the full data X, so it gets its
+own prepared state.
+
+## 2. The X-VQ: prototype count and prototype survey
+
+The requested prototype count balances the cost of the two stages:
+
+    M_ref = ceil(sqrt(kappa_ref / eps)),  kappa_ref = 2.7
+    M_X   = ceil(sqrt((1 + 2*q*M_ref) * N / 2))
+
+floored at 20 (a regression needs points) and capped at N // 2, beyond
+which the X-VQ degrades toward a subsample jackknife -- the X-VQ is
+given the same row budget as the finite differences of stage 2.
+
+The quantizer (`vqlp.VQFitter`, Euclidean, two best-matching units) is
+fit with no estimator evaluation. The prototype survey then evaluates
+T once on the prototypes, weights M_used*p, for theta_Q; for each
+prototype j, one forward difference at t_j = step_parameter(delta_f,
+p_j) gives I_j = [T(omega(t_j)) - theta_Q] / t_j. A failed prototype
+evaluation is a missing response, per output: I_proto is mass-centred
+over the finite prototypes only, and a prototype left NaN by its own
+evaluation stays NaN, neither filled in nor dropped, since a vector
+estimator can fail one output and not another at the same prototype.
+
+## 3. The influence model: width search and noise floor
+
+Per output c, a Gaussian process through that output's finite
+prototypes: I_j = h(w_j)^T beta + f(w_j) + e_j, h(x) = (1, x) in
+whitened coordinates (constant-only when the finite design has at most
+d_z + 2 points), f ~ GP(0, s^2 k_ell) with the Matern-3/2 kernel,
+e_j ~ N(0, s^2 lam) homoscedastic. Non-constant coordinates are grouped
+by shared finite design so the width search runs once per group.
+
+**Width search.** ell is shared by every output in a group, searched
+on [ell_min, ell_max] (ell_min the median whitened distance between
+CONN-connected prototypes, ell_max ten times the largest
+inter-prototype distance): five log-spaced candidates, then one
+bounded refinement between the best grid point's neighbours, SKIPPED
+when the best grid point is the upper endpoint. With the affine mean
+projected out (Q, an orthonormal basis of its complement), the
+Matern-3/2 expansion loses its constant and quadratic terms exactly,
+so past about ell_max the family collapses to one fixed kernel (the
+r^3 polyharmonic spline); ell is not identified there and the
+refinement would only climb a shallow log-determinant tilt. The outer
+objective at each candidate ell is the sum, over the group's outputs,
+of the profiled restricted negative log marginal likelihood, computed
+from one shared eigendecomposition of the projected kernel per
+candidate width: Q^T K_ell Q's spectrum comes out of
+A_ell = (I-P) K_ell (I-P) + tau*P (P = W W^T, W spanning the affine
+mean, I-P = Q Q^T) in O(m_g M_g^2) rather than the O(M_g^3) of forming
+Q^T K_ell Q directly, since A_ell's range-Q eigenpairs are exactly
+those of Q^T K_ell Q and its range-P eigenvalues are tau repeated m_g
+times; tau = 2*M_g puts the m_g structural eigenvalues above every
+eigenvalue of Q^T K_ell Q (which lies in [0, M_g] since k(0) = 1), so
+`eigh`'s first M-m pairs are the ones profiling needs.
+
+**Noise floor.** The prototype influences are finite differences of
+accuracy eta, so I_proto carries real evaluation noise: noise sd
+sqrt(2)*eta*|theta_Q,c|/t_j at prototype j. The declared homoscedastic
+level is n_c^2 = 2*eta^2*theta_Q,c^2 * median_j(1/t_j^2) over
+coordinate c's own finite design. lam_c is searched by REML on
+[max(lam_floor,c, 1e-10), 1e2], where lam_floor,c is the unique root
+of lam*s_c^2(lam) = n_c^2 -- s_c^2(lam) the profiled closed form
+(1/(M-m)) sum_i z_i^2/(Lambda_i + lam), increasing in lam -- found by
+one bracketed root find on log lam, pinned to the nearer domain edge
+when the equation has no root inside it. The floor is recomputed at
+every candidate ell, since Lambda and z depend on it. For an estimator
+with eta at machine precision the floor lies below 1e-10 and the
+search is unchanged.
+
+**Factorization failure.** Each per-output system A = K + lam I is
+factored by Cholesky, retried with a ridge of 0, then 1e-10, 1e-9 and
+1e-8 times the mean diagonal of K. If every attempt fails the draw's
+stage 1 has failed: `QIJ.fit` returns a result with every variance
+NaN and no stage-2 evaluations, a failed draw like any other.
+
+**Point queries.** psi0(x) = h(x)^T beta + k(x)^T alpha from the
+per-coordinate Cholesky solve. sigma and the within-bin posterior
+variance v_k both read the group's shared eigendecomposition K = V
+Lambda V^T instead of a per-output Cholesky solve of A_c = K +
+(lam_c+jit_c) I: P = K_n V is formed once per group and every output
+in it takes its own weighted row sums from it -- an equivalent
+factorisation of the same quantity, agreeing with the Cholesky form to
+rounding, not bit for bit, but never touching psi0 itself. v_k =
+mean(diag Sigma_k) - mean(Sigma_k) is formed from bin-summed vectors,
+never an n_k x n_k matrix: mean(diag Sigma_k) is read from the
+already-computed sigma; mean(Sigma_k) needs s^T A^-1 s (through the
+shared eigendecomposition, kept on the same side of the subtraction as
+sigma's own factorisation, since v_k is a difference of two nearly
+equal quantities) and SS_k = sum_{i,j in bin} k(x_i,x_j), the one term
+no caching removes. For a one-dimensional design SS_k comes from
+running sums over the sorted points (O(n_k log n_k)) rather than the
+pairwise double sum: with c = sqrt(3)/ell and u_i = x_i - o against a
+local origin o,
+
+    S_i = e^{-c u_i} * sum_{j<i} e^{c u_j},   T_i = u_i*S_i - e^{-c u_i} * sum_{j<i} u_j e^{c u_j}
+
+are exclusive cumulative sums, re-based every block of about 200/c
+points so no exponential overflows; the carried sums transform exactly
+across a rebase, so no pair is dropped or approximated -- only the
+summation order differs from the pairwise form.
+
+## 4. The I-VQ, bin stencil, and refinement
+
+**Initial bins.** 1-D k-means (`kmeans_1d`) on psi0_c at M_init =
+min(ceil(sqrt(2.7/eps)), n_distinct): quantile init, `searchsorted`
+assignment against prototype midpoints, update by two `bincount`s
+(counts, sums); an empty bin is dropped and the rest relabelled.
+`bin_differences` then central-stencils each bin (section 1) against
+the shared base value theta_hat; a NaN stops the loop at the failing
+bin. V_btw = (1/N) sum_k p_k U_k^2 over the initial bins.
+
+**Split rule.** Each open leaf is priced once at creation (its
+Var(psi0) and mean of centered psi0 depend only on its own fixed point
+indices, so both are cached rather than recomputed at proposal time
+and again in the final gather) and proposed a split: a LEVEL split
+(two-means on psi0, at M=2) when Var_k(psi0) > v_k, expected gain
+
+    g_hat = rho^2 * (p_a*ubar_a^2 + p_b*ubar_b^2 - p_k*ubar_k^2) / N
+
+otherwise an ADJACENCY split -- the bin's points whose second-nearest
+X-VQ prototype carries a higher prototype influence than their
+nearest, against the rest (falling back to a level split if one side
+is empty) -- expected gain g_hat = rho^2 * p_k * v_k / N. A leaf with
+one point, or no valid proposal, is closed. `v_k` is priced once for
+every leaf as it is created, in one batched call to
+`bin_posterior_variance` covering a whole split's two children (or all
+the initial bins at once), never one call per leaf per round.
+
+**Queue and measurement.** The open leaf with the largest g_hat is
+taken (ties: lower leaf id); the loop stops when g_hat < tau =
+eps*V_btw/(current leaf count), or the cost guard (1 + M_X_used
+refinement evaluations) binds. The smaller child is measured by one
+forward-differenced evaluation at t_small = step_parameter(delta_f,
+p_small); the larger child's U is derived by mass balance:
+
+    U_large = (p_parent*U_parent - p_small*U_small) / p_large
+
+Realized gain Delta = (p_small*U_small^2 + p_large*U_large^2 -
+p_parent*U_parent^2)/N; V_btw += Delta.
+
+**Gain pricing (gamma).** Both children of a split take gamma =
+clip(Delta/g_hat, 0, 1) when g_hat is strictly positive and both
+quantities are finite, else 1 (no usable information, so the within
+term is not down-weighted). gamma scales the whole V_win_hat bracket
+for that leaf: a low gain ratio is measured evidence the bin held no
+variation the model successfully predicted, and the model's own
+uncertainty v_k is part of the prediction being discounted.
+
+**Closing rule.** Each leaf carries a strike flag, clear on the
+initial bins. If Delta >= tau (the tau at selection), both children's
+flags are clear and both are re-proposed. If Delta < tau and the
+parent's flag was clear, both children's flags are set and they are
+still re-proposed. If Delta < tau and the parent's flag was already
+set, both children are closed outright. One below-tolerance split
+cannot distinguish a bin with constant influence from one whose
+variation split evenly between its children; a second consecutive one
+can. A failed split evaluation cancels the split: the parent stays a
+closed bin, and the rest of the refinement proceeds.
+
+**V_win_hat.** Over the final bins with more than one point:
+
+    V_win_hat = rho^2 * (1/N) * sum_k p_k * gamma_k * [Var_k(psi0) + v_k]
+
+using each final bin's cached v_k from the round that created it --
+never a fresh `bin_posterior_variance` call over the final bin set.
+rho^2 = V_btw / ((1/N) sum_k p_k * ubar_k^2), recomputed over the
+current bins after every accepted non-closing split; ubar_k is the
+mean of centered psi0 over the bin. V_tot_hat = V_btw + V_win_hat.
+
+## 5. GMM2D
+
+`gmm.py`'s 2-D Gaussian-mixture estimator: K components, free full
+covariances, fit by multi-start weighted EM, polished with an exact
+Newton step, with an analytic influence via Louis's (1982) identity.
+`GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500)`; `T(X, w) ->
+ndarray(p,)` never raises (a failed fit is NaN); no state between
+calls; `T.influence(X, w) -> ndarray(N, p)`; `T.fit_and_influence(X, w)
+-> (ndarray(p,), ndarray(N, p))` from one fit.
+
+**Layout.** Parameter vector length `p = (K-1) + 5K`: the first `K-1`
+mixing weights (`pi_K = 1 - sum`), then every component's mean
+(`mu_1x, mu_1y, ..., mu_Kx, mu_Ky`), then every component's three free
+covariance entries (`S_1_11, S_1_12, S_1_22, ...`), each component's
+means-then-covariance grouped, component-major. `_pack`/`_unpack` are
+the only two places that need this order.
+
+**E-step.** With `Sigma_k = [[a,b],[b,c]]`, `det_k = a*c - b^2`,
+`log pi_k + log phi_k(x)` is a fixed linear combination of the six
+monomials `[x, y, x^2, xy, y^2, 1]`, so one `(N,6)` feature buffer `Q`
+(built once per fit, from the centered X) against a `(6,K)` coefficient
+matrix rebuilt each iteration gives the whole `(N,K)` log-density array
+in a single matmul (`_log_density_coeffs`, `_e_step_fast`). `Q`'s first
+five columns, in the same order, are the M-step's `(N,5)` moment matrix
+`XP = Q[:, :5]`, a view, not a second array built over the same data.
+
+**Multi-start**, drawn once from `X` alone (K distinct data points as
+means, the unweighted data covariance scaled by `1/K` as every
+component's start, equal mixing weights) via
+`np.random.default_rng(seed)`, deliberately blind to `w` so a weight
+perturbation cannot move the starting points.
+
+Two phases, shaped differently on purpose. Phase 1 (`_phase1_batch`)
+runs every start for a short, fixed `_SHORT_ITERS` budget in lockstep,
+batched as one `(N,6) @ (6, K*S)` E-step matmul and one batched M-step
+per iteration (`S = n_starts`), with no per-iteration convergence test
+or degeneracy check: a start whose covariance goes non-PD mid-phase
+just turns its own coefficient columns to NaN/Inf, confined to that
+start's own block by the batched matmul's column layout. Degeneracy is
+checked once, after the loop, per start; any start that fails is
+dropped before ranking.
+
+Phase 2 (`_run_em`, via `_fit_em_multistart`) takes the best
+`_PROMOTE_N` of phase 1's survivors, by weighted log-likelihood, and
+runs each one at a time, sequentially, to the caller's own `max_iter`
+(or convergence, whichever comes first). The selection pool is every
+surviving start, converged or not: hitting the iteration budget means
+the log-likelihood surface is locally flat there, not that the start
+found a bad point, and treating a budget-exhausted start as a failure
+would make pool membership a step function of `w`, incompatible with
+`T` needing to be differentiable in `w`. The pool is ranked by weighted
+log-likelihood; the best is canonically relabeled (`_canonical_sort`,
+ascending `mu_x`, ties on `mu_y`) BEFORE Newton polish, so `psi`/`A`
+need no further permutation -- without this, two starts landing on the
+same optimum with swapped labels would make `T` discontinuous in `w`.
+`_SHORT_ITERS = 25`, `_PROMOTE_N = 3` are chosen by measurement (not
+taste): validated to not move the winning start or `theta_hat` relative
+to running every start to full budget.
+
+**Newton polish** (`_fit`) takes up to `_MAX_NEWTON = 20` steps
+`theta <- theta + A^-1 (weighted mean score)`, using the same analytic
+score/information the influence needs. A step is accepted only if the
+weighted log-likelihood does not decrease and every component's
+covariance stays positive-definite; otherwise the polish stops and the
+current point is kept. The loop stops on either of two conditions: the
+weighted mean score's norm falling below `_NEWTON_SCORE_TOL` (~1e-14,
+the machine floor), or that norm no longer improving by a clear factor
+(`_NEWTON_PROGRESS_FACTOR`) once it is already below
+`_NEWTON_PROGRESS_FLOOR` -- a residual already at the noise floor can
+otherwise spend several more full information-matrix assemblies
+bouncing in place for no further change in theta.
+
+**Residual and `eta`.** After the polish loop exits, `resid =
+norm(A^-1 s_bar) / (1 + norm(theta_hat))` at the final point -- a
+dimensionless, reparameterization-invariant estimate of how far
+`theta_hat` sits from a true stationary point of the weighted
+log-likelihood. `resid > self.eta` (or `A` singular, so `resid` cannot
+even be computed) makes the whole evaluation fail (`T` and `influence`
+both NaN): a `theta_hat` that does not actually solve the score
+equation to the estimator's own claimed precision is not one QIJ
+should treat as exact.
+
+**The score and Louis's identity** (`_score_info`). Per observation,
+with responsibility `r_k`, residual `res = x - mu_k`,
+`P_k = Sigma_k^-1`, `G_k = 0.5*(P_k res res^T P_k - P_k)`:
+
+    d/dpi_j  = r_j/pi_j - r_K/pi_K                    (j = 1..K-1)
+    d/dmu_k  = r_k * P_k @ res
+    d/dS_k11 = r_k * G_k[0,0];  d/dS_k22 = r_k * G_k[1,1]
+    d/dS_k12 = r_k * 2 * G_k[0,1]           (E_12 + E_21 duplication)
+
+`A = (1/N) sum_i w_i I_i` by Louis's identity, `I_i = sum_k r_ik B_ik -
+sum_k r_ik s_ik s_ik^T + s_i s_i^T`, with `s_ik` the complete-data score
+(`r_k` replaced by an indicator) and `B_ik` its complete-data observed
+information. `B_ik` is block-diagonal across components but, within
+component `k`, carries the textbook `P_k` mu-block, the textbook
+diag/all-ones pi-block, AND a mu-Sigma cross block
+(`d(P_k res)_a / dS_b = -(P_k @ D_b @ P_k @ res)_a`) -- included because
+it is genuinely nonzero at any one observation (only its EXPECTATION
+over `res` vanishes, which is not what an observed-information Hessian
+evaluates); omitting it costs Newton's quadratic convergence.
+
+`sum_k r_ik B_ik` is never materialized as a per-observation
+`(N,K,p,p)` tensor: every entry of `B_ik`'s nonzero (pi-pi and
+component-`k`'s own 5x5) blocks is at most quadratic in `res`, so
+`sum_i w_i r_ik B_ik` reduces exactly to `n_k` times a small matrix
+built from the weighted moments `n_k = sum_i w_i r_ik`,
+`rbar_k = (1/n_k) sum_i w_i r_ik res_i`,
+`R2_k = (1/n_k) sum_i w_i r_ik res_i res_i^T` -- no `(N,p,p)` array, at
+any K. The `-sum_k r_ik s_ik s_ik^T` term keeps a small per-observation
+array per component (not `(N,p)`) because it is NOT reducible to
+moments (it is the outer product of the full per-observation score, not
+its expectation); it is assembled with one matmul per component.
+
+**Centering.** `X` is shifted by its own UNWEIGHTED mean once on entry
+(fit and influence both computed in the shifted frame; component means
+shifted back before `T` returns them) -- `Sigma = E[xx^T] - mu mu^T`
+loses digits catastrophically once the data sits far from the origin,
+and this module is Newton-polished to ~1e-12. The shift must be a
+constant of `w` alone, or it would become part of what the influence
+function measures. Covariances (and therefore `psi`, `A`, the
+influence) are exactly invariant under a constant shift, so `influence`
+never needs to shift anything back.
+
+**`prepare(X)`** holds the unweighted centering shift `xmean`, the
+centered data `Xc = X - xmean`, and the feature buffer `(Q, XP)` built
+from `Xc` -- all independent of `w`, and otherwise rebuilt from scratch
+on every one of a draw's many bootstrap replicates / QIJ perturbations
+of the same X.
+
+**Failure convention.** The evaluation fails (NaN) when: every one of
+the `n_starts` starts degenerates, so nothing survives phase 1 to rank;
+or, after polish, `resid > self.eta` or `A` is singular; or
+(`influence`/`fit_and_influence` only) `A`'s condition number exceeds
+`_COND_MAX = 1e12`. A bad OTHER start's mid-EM degeneracy just drops
+that one start -- multi-start's whole purpose.
+
+---
+Written by builder B2 (estimators and data) before B1's
+`spec/method_notes.md` existed; the coordinator merges this section in
+at the end of that file, per the build prompt's fallback instruction.

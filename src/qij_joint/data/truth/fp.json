@@ -1,0 +1,7 @@
+{
+  "all": {
+    "outputs": ["a", "b", "c", "scatter"],
+    "values": [0.4430472650833929, -1.0408404447235338, -2.856908061953086e-13, 0.2647246777292032],
+    "source": "estimators.fp fit with unit weights on the full data/fp_sdss.npz population; theta_true_<o> of QIJ_WSOM2026/runs/main/fp/fp/truth.parquet, constant across all 1000 draws"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "all": {
+    "outputs": ["m_c", "sigma", "x"],
+    "values": [0.2208756897653916, 0.4335962819597182, 1.0212537545440838],
+    "source": "estimators.Chabrier(m_min=0.0017582750879228115, m_b=1.0, bounds=((0.01,5.0),(0.02,5.0),(0.05,10.0))) fit with unit weights on the full data/stars.h5 population; theta_true_<o> of QIJ_WSOM2026/runs/main/imf/chabrier/truth.parquet, constant across all 1000 draws"
+  }
+}

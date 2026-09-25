@@ -1,0 +1,12 @@
+{
+  "nu": {
+    "outputs": ["nu"],
+    "values": [5.0],
+    "source": "specified by the data-generating process"
+  },
+  "tail": {
+    "outputs": ["P_tail"],
+    "values": [0.01],
+    "source": "specified by the data-generating process"
+  }
+}
