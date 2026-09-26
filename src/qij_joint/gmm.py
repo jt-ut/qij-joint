@@ -3,19 +3,29 @@ covariances) with an analytic influence function via Louis's (1982)
 identity.
 
 `GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`
-fits by multi-start weighted EM, polishes the winning start with a
-damped Newton step on the mixture log-likelihood, and reports the score
-and observed information at the fit for `influence`. Follows
-`estimators.py`'s conventions: `T(X, w) -> ndarray(p,)` never raises (a
-failed fit is NaN); no state between calls. With `reference`, every
-evaluation labels its components by the assignment to it minimizing
-total Bhattacharyya distance (method_notes section 5); without one,
-components are ordered by ascending first-mean coordinate.
+fits by multi-start weighted EM (SQUAREM-accelerated), polishes the
+winning start with a damped Newton step gated on the observed
+information's positive-definiteness, and reports the score and observed
+information at the fit for `influence`. Follows `estimators.py`'s
+conventions: `T(X, w) -> ndarray(p,)` never raises (a failed fit is
+NaN); no state between calls. With `reference`, every evaluation labels
+its components by the assignment to it minimizing total Bhattacharyya
+distance (method_notes section 5); without one, components are ordered
+by ascending first-mean coordinate.
 
-Parameter layout, the two-phase multi-start/EM design, the Newton
-polish and residual test, and the score/Louis's-identity construction
-of `(psi, A)` are documented in `spec/method_notes.md`, section
-"GMM2D"; each is implemented here exactly as described there.
+The estimand is the maximizer of the penalized log-likelihood ell_p =
+ell - a * sum_k[tr(S Sigma_k^-1) + log det Sigma_k] (Chen and Tan 2009,
+arXiv:0805.3906, eq. 2), a = 1/sum(w), S the w-weighted covariance of
+the rows passed to T -- always on, for every call, since the free-
+covariance mixture likelihood is otherwise unbounded. EM's M-step,
+Newton's score and observed information, and the analytic influence are
+all those of ell_p; method_notes section 5 gives every closed form.
+
+Parameter layout, the two-phase multi-start/EM design, the penalized
+M-step, SQUAREM acceleration, the Newton gate and polish, and the
+score/Louis's-identity construction of `(psi, A)` are documented in
+`spec/method_notes.md`, section "GMM2D"; each is implemented here
+exactly as described there.
 
 `prepare(X)` holds the unweighted centering shift and the `(N, 6)`
 feature buffer built from the centered X, both independent of `w` and
@@ -34,10 +44,9 @@ _ACCEPT_TOL = 1e-9
 _COND_MAX = 1e12
 _MAX_NEWTON = 20
 _MAX_HALVINGS = 30
-_NEWTON_SCORE_TOL = 1e-14
-_NEWTON_PROGRESS_FLOOR = 1e-11
-_NEWTON_PROGRESS_FACTOR = 0.1
-_ETA_DEFAULT = 1e-12
+# Declared from the score norm the polish reliably reaches on the demo
+# mixture's multi-start (module report), rounded up to a power of ten.
+_ETA = 1e-12
 
 # Phase 1's fixed screening budget and phase 2's promotion count, set by
 # measurement (module report): fastest choice that never moved the
@@ -183,6 +192,105 @@ def _sigma_terms(Ss: np.ndarray):
     return a, b, c, det
 
 
+def _penalty_sum(SA, SB, SC, det, Scov: np.ndarray):
+    """sum_k[tr(Scov Sigma_k^-1) + log det Sigma_k] from Sigma_k's own
+    monomials (`_sigma_terms`'s `a,b,c,det`, renamed to avoid clashing
+    with the penalty's `a_pen`). Scalar; the penalty's magnitude."""
+    s11, s12, s22 = Scov[0, 0], Scov[0, 1], Scov[1, 1]
+    trace_k = (SA * s22 + SC * s11 - 2.0 * SB * s12) / det
+    return float(np.sum(trace_k + np.log(det)))
+
+
+def _penalty_sum_batched(SA, SB, SC, det, Scov: np.ndarray, K: int, S: int):
+    """Same as `_penalty_sum` but per start: (K*S,) monomials -> (S,)
+    sums, one per start's own K components."""
+    s11, s12, s22 = Scov[0, 0], Scov[0, 1], Scov[1, 1]
+    trace_k = (SA * s22 + SC * s11 - 2.0 * SB * s12) / det
+    return (trace_k + np.log(det)).reshape(S, K).sum(axis=1)
+
+
+def _weighted_cov(Xc: np.ndarray, w: np.ndarray):
+    """W = sum(w), a_pen = 1/W, the w-weighted covariance Scov of the
+    (already unweighted-mean-centered) rows Xc -- the penalty's S -- and
+    the rows' residuals `d` from their own w-weighted mean (what the
+    influence needs beyond the raw score, method_notes section 5).
+    Recomputed once per fit,
+    since S depends on w."""
+    W = float(w.sum())
+    xbar = (w @ Xc) / W
+    d = Xc - xbar
+    Scov = (d * w[:, None]).T @ d / W
+    return W, 1.0 / W, Scov, d
+
+
+def _penalty_terms(Ss: np.ndarray, Scov: np.ndarray, a_pen: float):
+    """The penalty's contribution to the theta-gradient and Hessian of
+    ell_p, both zero outside the Sigma_k blocks (pi, mu are untouched):
+    penalty_sum (scalar), g (p,) = d(-a_pen*penalty_sum)/dtheta
+    (`-a(Sigma_k^-1 - Sigma_k^-1 S Sigma_k^-1)`), H (p,p, block-
+    diagonal across k) = d^2(-a_pen*penalty_sum)/dtheta^2, closed form
+    (method_notes section 5). Raises np.linalg.LinAlgError if any
+    Sigma_k is not PD."""
+    K = Ss.shape[0]
+    p = (K - 1) + 5 * K
+    SA, SB, SC, det = _sigma_terms(Ss)
+    penalty_sum = _penalty_sum(SA, SB, SC, det, Scov)
+    g = np.zeros(p)
+    H = np.zeros((p, p))
+    for k in range(K):
+        Pk = np.array([[SC[k], -SB[k]], [-SB[k], SA[k]]]) / det[k]
+        PS = Pk @ Scov
+        Gk = Pk - PS @ Pk  # Sigma_k^-1 - Sigma_k^-1 Scov Sigma_k^-1
+        idxs = _idx_S(K, k)
+        g[idxs[0]] = -a_pen * Gk[0, 0]
+        g[idxs[1]] = -a_pen * (Gk[0, 1] + Gk[1, 0])
+        g[idxs[2]] = -a_pen * Gk[1, 1]
+
+        for bi, btype in enumerate(_STYPES):
+            Db = _D[btype]
+            PDPb = Pk @ Db @ Pk
+            # d(Gk)/dDb: product rule through Sigma_k^-1's two factors.
+            Mb = -PDPb + PDPb @ Scov @ Pk + Pk @ Scov @ PDPb
+            for ai, atype in enumerate(_STYPES):
+                if atype == 'S11':
+                    val = Mb[0, 0]
+                elif atype == 'S22':
+                    val = Mb[1, 1]
+                else:
+                    val = Mb[0, 1] + Mb[1, 0]
+                H[idxs[ai], idxs[bi]] = -a_pen * val
+    return penalty_sum, g, H
+
+
+def _penalty_influence_extra(Ss: np.ndarray, Scov: np.ndarray, a_pen: float,
+                              W: float, d: np.ndarray) -> np.ndarray:
+    """(N, p) correction the penalized M-estimator's influence needs
+    beyond the raw score: d(penalized score)/domega_i through S(omega)
+    and a_pen(omega) at fixed theta (method_notes section 5). `d` =
+    the rows' residuals from their own omega-weighted mean, the same
+    mean Scov is built from. Zero outside the Sigma_k blocks."""
+    K = Ss.shape[0]
+    N = d.shape[0]
+    p = (K - 1) + 5 * K
+    SA, SB, SC, det = _sigma_terms(Ss)
+    extra = np.zeros((N, p))
+    for k in range(K):
+        Pk = np.array([[SC[k], -SB[k]], [-SB[k], SA[k]]]) / det[k]
+        PS = Pk @ Scov
+        Gk = Pk - PS @ Pk
+        PkScovPk = PS @ Pk
+        u = d @ Pk  # (N,2): Pk @ d_i for every i (Pk symmetric)
+
+        idxs = _idx_S(K, k)
+        M00 = (a_pen ** 2) * Gk[0, 0] - (a_pen / W) * (u[:, 0] ** 2 - PkScovPk[0, 0])
+        M11 = (a_pen ** 2) * Gk[1, 1] - (a_pen / W) * (u[:, 1] ** 2 - PkScovPk[1, 1])
+        M01 = (a_pen ** 2) * Gk[0, 1] - (a_pen / W) * (u[:, 0] * u[:, 1] - PkScovPk[0, 1])
+        extra[:, idxs[0]] = M00
+        extra[:, idxs[1]] = 2.0 * M01
+        extra[:, idxs[2]] = M11
+    return extra
+
+
 def _log_density_coeffs(pis: np.ndarray, mus: np.ndarray,
                          a: np.ndarray, b: np.ndarray, c: np.ndarray, det: np.ndarray):
     """(6, K) coefficients C such that QX @ C is log(pi_k) + log phi_k(x)
@@ -215,9 +323,13 @@ def _e_step_fast(Q: np.ndarray, pis: np.ndarray, mus: np.ndarray,
     return R, log_norm
 
 
-def _m_step(w: np.ndarray, R: np.ndarray, XP: np.ndarray):
+def _m_step(w: np.ndarray, R: np.ndarray, XP: np.ndarray,
+            Scov: np.ndarray, a_pen: float):
     """R (N,K) -> pis (K,), mus (K,2), Ss (K,3). One (K,N) @ (N,5) matmul
-    for the weighted moments of every component at once."""
+    for the weighted moments of every component at once. pi, mu are the
+    ordinary weighted-mean M-step (unchanged by the penalty); Sigma_k is
+    the closed-form inverse-Wishart MAP blend of the raw weighted covariance with
+    `Scov`, `Sigma_k = (n_k*Sigma_k_raw + 2*a_pen*Scov)/(n_k+2*a_pen)`."""
     N, K = R.shape
     rw = w[:, None] * R
     n_k = rw.sum(axis=0)
@@ -230,55 +342,139 @@ def _m_step(w: np.ndarray, R: np.ndarray, XP: np.ndarray):
         Exx = M[:, 2] / n_k
         Exy = M[:, 3] / n_k
         Eyy = M[:, 4] / n_k
-    S11 = Exx - mux * mux
-    S12 = Exy - mux * muy
-    S22 = Eyy - muy * muy
+    S11_raw = Exx - mux * mux
+    S12_raw = Exy - mux * muy
+    S22_raw = Eyy - muy * muy
+    denom_pen = n_k + 2.0 * a_pen
+    S11 = (n_k * S11_raw + 2.0 * a_pen * Scov[0, 0]) / denom_pen
+    S12 = (n_k * S12_raw + 2.0 * a_pen * Scov[0, 1]) / denom_pen
+    S22 = (n_k * S22_raw + 2.0 * a_pen * Scov[1, 1]) / denom_pen
     mus = np.stack([mux, muy], axis=-1)
     Ss = np.stack([S11, S12, S22], axis=-1)
     return pis, mus, Ss
 
 
-def _run_em(X, Q, XP, w, pis0, mus0, Ss0, tol, max_iter):
-    """Weighted EM for a single start. Returns None the moment the start
-    degenerates (non-PD covariance or non-finite log-likelihood).
-    Otherwise runs to `max_iter`; hitting that budget is not a failure
-    -- the start is finalized at its current point (`converged=False`)
-    and still returned. Returns dict(pis, mus, Ss, ll, converged, n_iter).
-    """
-    W = float(w.sum())
-    pis, mus, Ss = pis0.copy(), mus0.copy(), Ss0.copy()
-    prev_ll = None
+def _penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen):
+    """ell_p per unit weight at (pis, mus, Ss): the E-step's log-
+    normalizer plus the penalty, no M-step. Raises np.linalg.LinAlgError
+    if Ss is not PD."""
+    a, b, c, det = _sigma_terms(Ss)
+    _, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det)
+    return float(np.dot(w, log_norm)) / W - a_pen * _penalty_sum(a, b, c, det, Scov) / W
 
-    for it in range(max_iter):
-        try:
-            a, b, c, det = _sigma_terms(Ss)
-        except np.linalg.LinAlgError:
-            return None
-        r, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det)
-        ll = float(np.dot(w, log_norm) / W)
-        if not np.isfinite(ll):
-            return None
 
-        if prev_ll is not None:
-            denom = max(abs(prev_ll), 1e-300)
-            if abs(ll - prev_ll) / denom < tol:
-                return dict(pis=pis, mus=mus, Ss=Ss, ll=ll,
-                            converged=True, n_iter=it + 1)
+def _em_step(Q, XP, w, W, pis, mus, Ss, Scov, a_pen):
+    """One penalized-EM update -> (pis_new, mus_new, Ss_new, ll), `ll`
+    at the INPUT (the E-step's by-product, so a caller needing both
+    pays no extra pass). Raises np.linalg.LinAlgError if the input
+    covariance is not PD."""
+    a, b, c, det = _sigma_terms(Ss)
+    r, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det)
+    ll = float(np.dot(w, log_norm)) / W - a_pen * _penalty_sum(a, b, c, det, Scov) / W
+    pis_new, mus_new, Ss_new = _m_step(w, r, XP, Scov, a_pen)
+    return pis_new, mus_new, Ss_new, ll
 
-        prev_ll = ll
-        pis, mus, Ss = _m_step(w, r, XP)
 
-    # Budget exhausted: finalize at the current point with one more
-    # E-step so the reported ll pairs with the last M-step's output.
+def _feasible(pis: np.ndarray, Ss: np.ndarray) -> bool:
+    """True iff every weight is finite and positive and every
+    covariance is PD -- SQUAREM's safeguard test (method_notes section
+    5)."""
+    if not (np.all(np.isfinite(pis)) and np.all(pis > 0.0)):
+        return False
     try:
-        a, b, c, det = _sigma_terms(Ss)
+        _sigma_terms(Ss)
+    except np.linalg.LinAlgError:
+        return False
+    return True
+
+
+def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget):
+    """One SQUAREM round, spending at most `budget` (>=1) EM steps
+    (method_notes section 5: theta1, theta2 from two EM steps; r, v,
+    alpha = -norm(r)/norm(v) bounded below by -1; the extrapolated
+    point followed by one EM step is the candidate, discarded for
+    theta2 if infeasible or if its ll is below theta2's -- so the
+    returned ll is always >= theta2's, hence monotone as plain EM is).
+    `budget` < 3 skips the candidate trial and returns theta1
+    (`budget`==1) or theta2 (`budget`==2) plain. Returns (pis, mus, Ss,
+    ll, n_em) with ll at the RETURNED point and n_em <= budget the EM
+    steps used. Raises np.linalg.LinAlgError if (pis, mus, Ss) is
+    already infeasible."""
+    theta0 = _pack(K, pis, mus, Ss)
+    pis1, mus1, Ss1, _ = _em_step(Q, XP, w, W, pis, mus, Ss, Scov, a_pen)
+    if budget == 1:
+        return pis1, mus1, Ss1, _penalized_ll(Q, w, W, pis1, mus1, Ss1, Scov, a_pen), 1
+
+    theta1 = _pack(K, pis1, mus1, Ss1)
+    pis2, mus2, Ss2, _ = _em_step(Q, XP, w, W, pis1, mus1, Ss1, Scov, a_pen)
+    ll2 = _penalized_ll(Q, w, W, pis2, mus2, Ss2, Scov, a_pen)
+    if budget == 2:
+        return pis2, mus2, Ss2, ll2, 2
+
+    theta2 = _pack(K, pis2, mus2, Ss2)
+    r = theta1 - theta0
+    v = (theta2 - theta1) - r
+    vnorm = np.linalg.norm(v)
+    # v == 0 means r == 0 too at a genuine fixed point; the floor sends
+    # that case to theta2 with no 0/0 division.
+    alpha = max(-np.linalg.norm(r) / vnorm, -1.0) if vnorm > 0.0 else -1.0
+    pis_sq, mus_sq, Ss_sq = _unpack(K, theta0 - 2.0 * alpha * r + alpha ** 2 * v)
+
+    if _feasible(pis_sq, Ss_sq):
+        try:
+            pis3, mus3, Ss3, _ = _em_step(Q, XP, w, W, pis_sq, mus_sq, Ss_sq,
+                                           Scov, a_pen)
+            ll3 = _penalized_ll(Q, w, W, pis3, mus3, Ss3, Scov, a_pen)
+        except np.linalg.LinAlgError:
+            ll3 = None
+        if ll3 is not None and np.isfinite(ll3) and ll3 >= ll2:
+            return pis3, mus3, Ss3, ll3, 3
+
+    return pis2, mus2, Ss2, ll2, 2
+
+
+def _em_accelerated(Q, XP, w, W, pis, mus, Ss, ll, tol, max_iter, Scov, a_pen, K):
+    """SQUAREM rounds (`_squarem_round`) from (pis, mus, Ss) with its own
+    `ll`, to `tol` or `max_iter` EM steps (each round costs 1-3, method_notes
+    section 5). Returns (pis, mus, Ss, ll, n_used, converged). Raises
+    np.linalg.LinAlgError on a degenerate covariance anywhere along the
+    trajectory."""
+    n_used = 0
+    converged = False
+    while n_used < max_iter:
+        budget = max_iter - n_used
+        pis, mus, Ss, ll_new, n_em = _squarem_round(
+            Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget)
+        if not np.isfinite(ll_new):
+            raise np.linalg.LinAlgError('non-finite penalized log-likelihood')
+        n_used += n_em
+        converged = abs(ll_new - ll) / max(abs(ll), 1e-300) < tol
+        ll = ll_new
+        if converged:
+            break
+    return pis, mus, Ss, ll, n_used, converged
+
+
+def _run_em(Q, XP, w, pis0, mus0, Ss0, tol, max_iter, Scov, a_pen):
+    """Weighted EM for a single start, SQUAREM-accelerated
+    (`_em_accelerated`, method_notes section 5). None the moment the
+    start degenerates (non-PD covariance or non-finite penalized ll)
+    anywhere along the trajectory; otherwise runs to `tol` or
+    `max_iter` EM steps (budget exhaustion is not a failure -- the
+    start is finalized `converged=False`). Returns dict(pis, mus, Ss,
+    ll, converged, n_iter), `ll` = ell_p/W, `n_iter` the EM-step count
+    used."""
+    W = float(w.sum())
+    K = pis0.shape[0]
+    try:
+        ll0 = _penalized_ll(Q, w, W, pis0, mus0, Ss0, Scov, a_pen)
+        if not np.isfinite(ll0):
+            return None
+        pis, mus, Ss, ll, n_used, converged = _em_accelerated(
+            Q, XP, w, W, pis0, mus0, Ss0, ll0, tol, max_iter, Scov, a_pen, K)
     except np.linalg.LinAlgError:
         return None
-    r, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det)
-    ll = float(np.dot(w, log_norm) / W)
-    if not np.isfinite(ll):
-        return None
-    return dict(pis=pis, mus=mus, Ss=Ss, ll=ll, converged=False, n_iter=max_iter)
+    return dict(pis=pis, mus=mus, Ss=Ss, ll=ll, converged=converged, n_iter=n_used)
 
 
 def _sigma_terms_batched(Ss: np.ndarray):
@@ -310,10 +506,13 @@ def _e_step_batched(Q: np.ndarray, pis: np.ndarray, mus: np.ndarray,
     return R3.reshape(N, K * S), log_norm
 
 
-def _m_step_batched(w: np.ndarray, R: np.ndarray, XP: np.ndarray, K: int, S: int):
-    """Same moments as `_m_step` for all K*S components at once; only the
-    mixing-weight normalization is taken within each start's own K
-    components, not across all K*S."""
+def _m_step_batched(w: np.ndarray, R: np.ndarray, XP: np.ndarray, K: int, S: int,
+                     Scov: np.ndarray, a_pen: float):
+    """Same moments as `_m_step`, and the same penalized Sigma_k
+    blend (`Scov`, `a_pen` are the same for every start -- they depend
+    on (X, w) alone), for all K*S components at once; only the mixing-
+    weight normalization is taken within each start's own K components,
+    not across all K*S."""
     rw = w[:, None] * R
     n_k = rw.sum(axis=0)
     M = rw.T @ XP
@@ -325,24 +524,30 @@ def _m_step_batched(w: np.ndarray, R: np.ndarray, XP: np.ndarray, K: int, S: int
     Exx = M[:, 2] / n_k
     Exy = M[:, 3] / n_k
     Eyy = M[:, 4] / n_k
-    S11 = Exx - mux * mux
-    S12 = Exy - mux * muy
-    S22 = Eyy - muy * muy
+    S11_raw = Exx - mux * mux
+    S12_raw = Exy - mux * muy
+    S22_raw = Eyy - muy * muy
+    denom_pen = n_k + 2.0 * a_pen
+    S11 = (n_k * S11_raw + 2.0 * a_pen * Scov[0, 0]) / denom_pen
+    S12 = (n_k * S12_raw + 2.0 * a_pen * Scov[0, 1]) / denom_pen
+    S22 = (n_k * S22_raw + 2.0 * a_pen * Scov[1, 1]) / denom_pen
     mus = np.stack([mux, muy], axis=-1)
     Ss = np.stack([S11, S12, S22], axis=-1)
     return pis, mus, Ss
 
 
 def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
-                   K: int, iters: int):
+                   K: int, iters: int, Scov: np.ndarray, a_pen: float):
     """Run every start in `starts` for exactly `iters` EM iterations,
     batched in lockstep (one E-step matmul, one M-step matmul per
-    iteration, S = len(starts)); no convergence test, no per-iteration
-    bookkeeping. Degeneracy is checked once, after the loop, start by
-    start -- the batched matmuls are column-blocked per start, so a NaN
-    in one start's columns cannot reach another's. Returns a list of
-    dicts (`_run_em`'s shape, `converged=False`, `n_iter=iters` always),
-    one per surviving start."""
+    iteration, S = len(starts)), M-step the penalized one; no
+    convergence test, no per-iteration bookkeeping (so no per-iteration
+    penalized `ll` either -- only the trailing one, used for ranking).
+    Degeneracy is checked once, after the loop, start by start -- the
+    batched matmuls are column-blocked per start, so a NaN in one
+    start's columns cannot reach another's. Returns a list of dicts
+    (`_run_em`'s shape, `converged=False`, `n_iter=iters` always), one
+    per surviving start."""
     S = len(starts)
     W = float(w.sum())
     pis = np.concatenate([s[0] for s in starts])
@@ -353,12 +558,13 @@ def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
         for _ in range(iters):
             a, b, c, det = _sigma_terms_batched(Ss)
             R, _ = _e_step_batched(Q, pis, mus, a, b, c, det, K, S)
-            pis, mus, Ss = _m_step_batched(w, R, XP, K, S)
+            pis, mus, Ss = _m_step_batched(w, R, XP, K, S, Scov, a_pen)
 
         # One trailing E-step pairs the reported ll with the last M-step.
         a, b, c, det = _sigma_terms_batched(Ss)
         _, log_norm = _e_step_batched(Q, pis, mus, a, b, c, det, K, S)
-        ll = (w @ log_norm) / W  # (S,)
+        ll_raw = (w @ log_norm) / W  # (S,)
+        ll = ll_raw - a_pen * _penalty_sum_batched(a, b, c, det, Scov, K, S) / W
 
     pis_s = pis.reshape(S, K)
     mus_s = mus.reshape(S, K, 2)
@@ -380,15 +586,16 @@ def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
     return out
 
 
-def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter):
-    """Pool = every surviving start, ranked by weighted log-likelihood,
-    via the two-phase screen: phase 1 runs every start's short budget in
-    lockstep (`_phase1_batch`); the best few are carried, one at a time,
-    to `max_iter` (phase 2, sequential `_run_em`)."""
+def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter, Scov, a_pen):
+    """Pool = every surviving start, ranked by penalized weighted log-
+    likelihood (ell_p/W), via the two-phase screen: phase 1 runs
+    every start's short budget in lockstep (`_phase1_batch`); the best
+    few are carried, one at a time, to `max_iter` (phase 2, sequential
+    `_run_em`)."""
     starts = _starts(X, K, n_starts, seed)
     phase1_budget = min(_SHORT_ITERS, max_iter)
 
-    screened = _phase1_batch(Q, XP, w, starts, K, phase1_budget)
+    screened = _phase1_batch(Q, XP, w, starts, K, phase1_budget, Scov, a_pen)
     if not screened:
         return None
 
@@ -396,7 +603,8 @@ def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter):
     top = screened[:min(_PROMOTE_N, len(screened))]
     finished = []
     for r in top:
-        res = _run_em(X, Q, XP, w, r['pis'], r['mus'], r['Ss'], tol, max_iter)
+        res = _run_em(Q, XP, w, r['pis'], r['mus'], r['Ss'], tol, max_iter,
+                       Scov, a_pen)
         if res is not None:
             finished.append(res)
     if not finished:
@@ -575,58 +783,105 @@ def _score_info(X: np.ndarray, Q: np.ndarray, w: np.ndarray, K: int,
 # Full fit: multi-start EM -> canonical order -> Newton polish -> resid.
 # ======================================================================
 
+def _score_info_penalized(X, Q, w, K, pis, mus, Ss, Scov, a_pen, W):
+    """(psi_raw (N,p), A (p,p), ll, psi_bar (p,)) at (pis,mus,Ss): the
+    raw per-observation Louis's-identity score `psi_raw` (unpenalized,
+    `_score_info`), and the penalized observed information `A`,
+    penalized log-likelihood `ll` (= ell_p/W) and penalized weighted-
+    mean score `psi_bar` (= d(ell_p/W)/dtheta) -- the raw `A/N` and
+    `psi_bar_raw/W` each get the closed-form penalty Hessian/gradient
+    added (method_notes section 5). Raises np.linalg.LinAlgError if any
+    Sigma_k is not PD."""
+    N = X.shape[0]
+    psi_raw, A_raw, ll_raw = _score_info(X, Q, w, K, pis, mus, Ss)
+    penalty_sum, g, H = _penalty_terms(Ss, Scov, a_pen)
+    ll = ll_raw - a_pen * penalty_sum / W
+    psi_bar = np.dot(w, psi_raw) / W + g / W
+    A = A_raw - H / N
+    return psi_raw, A, ll, psi_bar
+
+
+def _cholesky_ok(A: np.ndarray) -> bool:
+    """True iff -H (A) is positive definite (a Cholesky succeeds) --
+    the Newton gate of method_notes section 5."""
+    try:
+        np.linalg.cholesky(A)
+        return True
+    except np.linalg.LinAlgError:
+        return False
+
+
 def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
-         reference=None):
+         eta: float, reference=None):
     """None on failure; else dict(theta, pis, mus, Ss, psi, A, ll,
-    score_history, polished, resid). Operates in the caller's own
-    (already-centered) coordinates with the caller's own (X-only) `Q`,
-    `XP`. Components are labelled by `reference` when given
-    (method_notes section 5), else ordered by ascending first-mean
-    coordinate."""
+    score_history, polished, resid) -- the penalized-likelihood
+    estimand (method_notes section 5). `ll` is ell_p/W; `A` is the
+    penalized observed information; `psi` is the raw mixture score plus
+    the per-point sensitivity of the penalty to that point's own
+    weight. Operates in the caller's own (already-centered) coordinates
+    with the caller's own (X-only) `Q`, `XP`. Components are labelled
+    by `reference` when given, else ordered by ascending first-mean
+    coordinate.
+
+    Newton gate: the polish only runs once -H (`A`) is PD (a Cholesky
+    succeeds); otherwise one more block of accelerated EM (the same
+    `max_iter` cap) and a single re-test, no further retry. NaN when
+    -H is still not PD after that, or the polish does not bring the
+    score norm under `eta`."""
+    W, a_pen, Scov, d = _weighted_cov(X, w)
+
     best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
-                               cfg.tol, cfg.max_iter)
+                               cfg.tol, cfg.max_iter, Scov, a_pen)
     if best is None:
         return None
-    if reference is None:
-        pis, mus, Ss = _canonical_sort(best['pis'], best['mus'], best['Ss'])
-    else:
-        pis, mus, Ss = _reference_sort(best['pis'], best['mus'], best['Ss'], reference)
+    pis, mus, Ss = best['pis'], best['mus'], best['Ss']
 
+    def _label(pis, mus, Ss):
+        if reference is None:
+            return _canonical_sort(pis, mus, Ss)
+        return _reference_sort(pis, mus, Ss, reference)
+
+    pis, mus, Ss = _label(pis, mus, Ss)
     try:
-        psi, A, ll = _score_info(X, Q, w, cfg.K, pis, mus, Ss)
+        psi, A, ll, psi_bar = _score_info_penalized(X, Q, w, cfg.K, pis, mus, Ss,
+                                                      Scov, a_pen, W)
     except np.linalg.LinAlgError:
         return None
 
-    theta = _pack(cfg.K, pis, mus, Ss)
-    score_history = [float(np.linalg.norm(np.dot(w, psi) / w.sum()))]
+    if not _cholesky_ok(A):
+        # Not near a maximum yet: one more accelerated-EM block, then
+        # re-label and re-test once, no further retry.
+        try:
+            pis, mus, Ss, ll, _, _ = _em_accelerated(
+                Q, XP, w, W, pis, mus, Ss, ll, cfg.tol, cfg.max_iter,
+                Scov, a_pen, cfg.K)
+        except np.linalg.LinAlgError:
+            return None
+        pis, mus, Ss = _label(pis, mus, Ss)
+        try:
+            psi, A, ll, psi_bar = _score_info_penalized(
+                X, Q, w, cfg.K, pis, mus, Ss, Scov, a_pen, W)
+        except np.linalg.LinAlgError:
+            return None
+        if not _cholesky_ok(A):
+            return None
 
+    theta = _pack(cfg.K, pis, mus, Ss)
+    score_history = [float(np.linalg.norm(psi_bar))]
+
+    # Damped Newton polish: A is -H of ell_p and PD here (the gate
+    # above), so the full step is the local quadratic model; halving
+    # only guards a step that leaves the feasible set or drops ell_p.
     polished = False
-    resid = float('nan')
-    prev_norm = None
     for _ in range(_MAX_NEWTON):
-        psi_bar = np.dot(w, psi) / w.sum()
         norm = float(np.linalg.norm(psi_bar))
-        if norm < _NEWTON_SCORE_TOL:
+        if norm <= eta:
             break
-        if (prev_norm is not None and prev_norm < _NEWTON_PROGRESS_FLOOR
-                and norm > _NEWTON_PROGRESS_FACTOR * prev_norm):
-            # The residual has already reached the noise floor and
-            # stopped improving by a clear factor: further steps just
-            # re-assemble A for no change in theta.
-            break
-        prev_norm = norm
         try:
             delta = np.linalg.solve(A, psi_bar)
         except np.linalg.LinAlgError:
             break
 
-        # Backtracking (damped) Newton: try the full step first, then
-        # halve it on rejection. A full step from an unconverged EM point
-        # is a step from OUTSIDE the local quadratic region the Newton
-        # model is accurate in, and routinely overshoots a small mixing
-        # weight past zero or a covariance past positive-definiteness; a
-        # fit that is already close enough for the full step to be valid
-        # takes it on the first trial, so a clean polish is unaffected.
         accepted = False
         for n_halvings in range(_MAX_HALVINGS + 1):
             theta_new = theta + delta * (0.5 ** n_halvings)
@@ -634,7 +889,8 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
             if np.any(pis_new <= 0.0):
                 continue
             try:
-                psi_new, A_new, ll_new = _score_info(X, Q, w, cfg.K, pis_new, mus_new, Ss_new)
+                psi_new, A_new, ll_new, psi_bar_new = _score_info_penalized(
+                    X, Q, w, cfg.K, pis_new, mus_new, Ss_new, Scov, a_pen, W)
             except np.linalg.LinAlgError:
                 continue
             if not np.isfinite(ll_new) or ll_new < ll - _ACCEPT_TOL:
@@ -645,20 +901,21 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
             break
 
         theta, pis, mus, Ss = theta_new, pis_new, mus_new, Ss_new
-        psi, A, ll = psi_new, A_new, ll_new
+        psi, A, ll, psi_bar = psi_new, A_new, ll_new, psi_bar_new
         polished = True
-        score_history.append(float(np.linalg.norm(np.dot(w, psi) / w.sum())))
+        score_history.append(float(np.linalg.norm(psi_bar)))
 
-    psi_bar = np.dot(w, psi) / w.sum()
-    try:
-        resid = float(np.linalg.norm(np.linalg.solve(A, psi_bar))
-                       / (1.0 + np.linalg.norm(theta)))
-    except np.linalg.LinAlgError:
-        resid = float('inf')
-    if resid > _ETA_DEFAULT:
+    resid = float(np.linalg.norm(psi_bar))
+    if resid > eta:
         return None
 
-    return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, psi=psi, A=A, ll=ll,
+    # The influence's per-point term: the raw score plus the per-point
+    # sensitivity of the penalty (through S(w) and a_pen(w)) to that
+    # point's own weight (method_notes section 5).
+    extra = _penalty_influence_extra(Ss, Scov, a_pen, W, d)
+    psi_full = psi + extra
+
+    return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, psi=psi_full, A=A, ll=ll,
                 score_history=score_history, polished=polished, resid=resid)
 
 
@@ -669,10 +926,8 @@ class GMM2D:
     `max_iter` as per-call keyword overrides, and an optional `prep`
     from `T.prepare(X)`; all three label components against
     `self.reference` (method_notes section 5) when it is not None.
-    `self.name`,
-    `self.outputs`, `self.eta`, `self.p` are fixed at construction from
-    the constructor's own `K`.
-    """
+    `self.name`, `self.outputs`, `self.eta`, `self.p` are fixed at
+    construction from the constructor's own `K`."""
 
     name = 'gmm2d'
 
@@ -687,7 +942,7 @@ class GMM2D:
 
         self.p = (self.K - 1) + 5 * self.K
         self.outputs = _make_outputs(self.K)
-        self.eta = _ETA_DEFAULT
+        self.eta = _ETA
 
     def _resolve(self, kwargs: dict) -> _Cfg:
         K = int(kwargs.get('K', self.K))
@@ -716,7 +971,7 @@ class GMM2D:
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP, self.reference)
+            fit = _fit(Xc, w, cfg, Q, XP, self.eta, self.reference)
             if fit is None:
                 return np.full(cfg.p, np.nan)
             theta = fit['theta']
@@ -735,7 +990,7 @@ class GMM2D:
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP, self.reference)
+            fit = _fit(Xc, w, cfg, Q, XP, self.eta, self.reference)
             if fit is None:
                 return np.full((N, cfg.p), np.nan)
             A = fit['A']
@@ -760,7 +1015,7 @@ class GMM2D:
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP, self.reference)
+            fit = _fit(Xc, w, cfg, Q, XP, self.eta, self.reference)
             if fit is None:
                 return nan_theta, nan_psi
             theta = fit['theta'].copy()

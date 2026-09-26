@@ -310,12 +310,41 @@ mean of centered psi0 over the bin. V_tot_hat = V_btw + V_win_hat.
 ## 5. GMM2D
 
 `gmm.py`'s 2-D Gaussian-mixture estimator: K components, free full
-covariances, fit by multi-start weighted EM, polished with a damped
-Newton step, with an analytic influence via Louis's (1982) identity.
-`GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500)`; `T(X, w) ->
-ndarray(p,)` never raises (a failed fit is NaN); no state between
-calls; `T.influence(X, w) -> ndarray(N, p)`; `T.fit_and_influence(X, w)
--> (ndarray(p,), ndarray(N, p))` from one fit.
+covariances, fit by multi-start weighted EM (SQUAREM-accelerated),
+polished with a damped Newton step gated on the observed information's
+positive-definiteness, with an analytic influence via Louis's (1982)
+identity.
+`GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`;
+`T(X, w) -> ndarray(p,)` never raises (a failed fit is NaN); no state
+between calls; `T.influence(X, w) -> ndarray(N, p)`;
+`T.fit_and_influence(X, w) -> (ndarray(p,), ndarray(N, p))` from one
+fit.
+
+**The estimand.** The free-covariance mixture likelihood is
+unbounded (a component can collapse onto a few points), so `GMM2D`'s
+estimand is the maximizer of the penalized log-likelihood
+
+    ell_p(theta; X, w) = ell(theta; X, w) - a * sum_k[tr(S Sigma_k^-1) + log det Sigma_k],
+    a = 1 / sum(w)  (= 1/N at unit weights),
+    S = the w-weighted covariance of the rows passed to T,
+
+the penalty function of Chen and Tan (2009, *Inference for multivariate
+normal mixtures*, J. Multivariate Anal. 100(7):1367-1383, arXiv:0805.3906,
+their eq. 2 with their `a_n = n^-1`, one of their two recommended
+choices; the M-step below is their closed form). It is always on, for
+every call and every fit -- no conditional switching -- since it is a
+Bayesian Wishart-prior-on-Sigma_k device that makes the likelihood
+surface bounded, not a diagnostic that should come and go with `w`. It
+is of relative order `1/N`, so it moves a well-behaved fit by less than
+its sampling error, and it vanishes as `N` grows. `S` is defined from
+the rows and weights `T` is actually called with, so the quantized-data
+fit and the full-data fit use the same definition, and `S`'s own
+w-weighted mean is generally not the zero that `X`'s UNWEIGHTED mean is
+(see **Centering** below) -- it is recomputed, from scratch, every fit.
+Every closed form below (M-step, score, Hessian, influence) is that of
+`ell_p`, not of the ordinary mixture log-likelihood `ell`; internally,
+`ll` always means `ell_p` at the current point, per unit weight
+(`ell_p / sum(w)`).
 
 **Layout.** Parameter vector length `p = (K-1) + 5K`: the first `K-1`
 mixing weights (`pi_K = 1 - sum`), then every component's mean
@@ -347,26 +376,32 @@ no start is degenerate at birth. Successive starts draw their k-means
 seeding from the same `np.random.default_rng(seed)`, so they differ from
 each other and the whole sequence is reproducible in `(X, seed)` alone.
 
-Two phases, shaped differently on purpose. Phase 1 (`_phase1_batch`)
-runs every start for a short, fixed `_SHORT_ITERS` budget in lockstep,
-batched as one `(N,6) @ (6, K*S)` E-step matmul and one batched M-step
-per iteration (`S = n_starts`), with no per-iteration convergence test
-or degeneracy check: a start whose covariance goes non-PD mid-phase
-just turns its own coefficient columns to NaN/Inf, confined to that
-start's own block by the batched matmul's column layout. Degeneracy is
-checked once, after the loop, per start; any start that fails is
-dropped before ranking.
+Two phases, shaped differently on purpose. Both use the penalized
+M-step (below) for Sigma_k -- there is no unpenalized code path.
+Phase 1 (`_phase1_batch`) runs every start for a short, fixed
+`_SHORT_ITERS` budget in lockstep, batched as one `(N,6) @ (6, K*S)`
+E-step matmul and one batched M-step per iteration (`S = n_starts`),
+with no per-iteration convergence test, degeneracy check, or `ll_p`
+computation (only the trailing one, after the loop, for ranking): a
+start whose covariance goes non-PD mid-phase just turns its own
+coefficient columns to NaN/Inf, confined to that start's own block by
+the batched matmul's column layout. Degeneracy is checked once, after
+the loop, per start; any start that fails is dropped before ranking.
 
 Phase 2 (`_run_em`, via `_fit_em_multistart`) takes the best
-`_PROMOTE_N` of phase 1's survivors, by weighted log-likelihood, and
-runs each one at a time, sequentially, to the caller's own `max_iter`
-(or convergence, whichever comes first). The selection pool is every
-surviving start, converged or not: hitting the iteration budget means
-the log-likelihood surface is locally flat there, not that the start
-found a bad point, and treating a budget-exhausted start as a failure
-would make pool membership a step function of `w`, incompatible with
-`T` needing to be differentiable in `w`. The pool is ranked by weighted
-log-likelihood; the best is canonically relabeled (`_canonical_sort`,
+`_PROMOTE_N` of phase 1's survivors, by penalized weighted log-
+likelihood (`ell_p / sum(w)`), and runs each one at a time,
+sequentially, to the caller's own `max_iter` EM steps (or convergence,
+whichever comes first) via SQUAREM acceleration (below), checking
+`ell_p`'s own relative-tolerance convergence after every SQUAREM round
+-- EM's monotonicity guarantee (below) is a monotonicity in `ell_p`, so
+that is what its own stopping rule must watch. The selection pool is every surviving start, converged or not:
+hitting the iteration budget means the log-likelihood surface is
+locally flat there, not that the start found a bad point, and treating
+a budget-exhausted start as a failure would make pool membership a
+step function of `w`, incompatible with `T` needing to be
+differentiable in `w`. The pool is ranked by penalized weighted log-
+likelihood; the best is canonically relabeled (`_canonical_sort`,
 ascending `mu_x`, ties on `mu_y`) BEFORE Newton polish, so `psi`/`A`
 need no further permutation -- without this, two starts landing on the
 same optimum with swapped labels would make `T` discontinuous in `w`.
@@ -374,13 +409,80 @@ same optimum with swapped labels would make `T` discontinuous in `w`.
 taste): validated to not move the winning start or `theta_hat` relative
 to running every start to full budget.
 
+**The penalized M-step** (`_m_step`, `_m_step_batched`). `pi`, `mu` are
+the ordinary weighted-mean M-step, untouched by the penalty. `Sigma_k` is Chen
+and Tan's closed-form inverse-Wishart MAP,
+
+    Sigma_k <- (sum_i r_ik w_i (x_i - mu_k)(x_i - mu_k)^T + 2a S) / (sum_i r_ik w_i + 2a),
+
+a convex blend of the ordinary weighted covariance about the just-
+updated `mu_k` (weight `n_k = sum_i r_ik w_i`) and `S` (weight `2a`);
+`a -> 0` as `N -> infinity` recovers the ordinary M-step exactly. EM
+with this M-step is monotone increasing in `ell_p` (Chen and Tan 2009):
+their argument is the ordinary EM monotonicity argument applied to
+`ell_p`'s own complete-data form, since the added term is a fixed
+(theta-independent-in-the-E-step) log-Wishart-density constant during
+the E-step and a concave function of `Sigma_k` whose maximizer, given
+the E-step's responsibilities, is exactly the closed form above.
+
+**SQUAREM acceleration** (`_squarem_round`, `_em_accelerated`,
+`_run_em`; Varadhan and Roland 2008, *Simple and globally convergent
+methods for accelerating the convergence of any EM algorithm*, Scand.
+J. Statist. 35:335-353, their steplength scheme S3). From the current
+point `theta0`, two plain EM steps (`_em_step`, one E-step then the
+penalized M-step above) give `theta1`, `theta2`; `r = theta1 - theta0`,
+`v = (theta2 - theta1) - r`; step length `alpha = -norm(r)/norm(v)`,
+bounded below by `-1` (a raw `alpha` more negative is clamped there --
+at `alpha = -1` exactly, `theta0 - 2*alpha*r + alpha^2*v` reduces
+algebraically to `theta2`, the paper's own description of that
+steplength: "a SQUAREM evaluation is the same as two EM updates"). The
+extrapolated point followed by one more EM step is the candidate;
+discarded for `theta2` if it leaves the feasible set (a mixing weight
+<= 0, a component covariance not PD) or its `ell_p` is below `theta2`'s
+-- so the accepted point's `ell_p` is always >= `theta2`'s, hence
+monotone in `ell_p` exactly as plain EM is, with no other constant or
+retry. A round costs 2 EM steps (candidate rejected or infeasible) or 3
+(accepted); `max_iter` is a budget in EM steps, not rounds, so a round
+near the end of the budget skips the candidate trial rather than
+overshoot it. The floor at `alpha = -1` is this estimator's own choice,
+not Varadhan and Roland's own S3 (which lets `alpha` run arbitrarily
+negative, relying on the monotonicity safeguard alone to reject a bad
+step): on a slowly, near-linearly converging trajectory (its own EM
+map close to critical, `v` nearly proportional to `r`) the unclamped
+`alpha` would be large and the floor removes most of the gain, which
+the demo mixture's own hardest start exhibits (module report) --
+`_squarem_round`'s candidate is still accepted almost every round
+there, just by too little to shorten the 500-EM-step budget measurably
+against plain EM on the same start. Phase 1's batched screen is not
+accelerated (it has no per-start convergence test to accelerate against
+-- a fixed lockstep budget, used for ranking, not for finding a root).
+
+**Newton gate** (`_cholesky_ok`, `_fit`). After phase 2's winning start
+is labelled and its penalized score/information `(psi_bar, A)` formed,
+the polish below runs only if `A` (`-H` of `ell_p`) is positive
+definite (`np.linalg.cholesky` succeeds): a start that is not there yet
+is not one the local quadratic model of Newton's step should be trusted
+on. If `A` is not PD, one more block of SQUAREM-accelerated EM (the
+same `max_iter` cap, continuing from the current point) runs, the start
+is re-labelled and its `(psi_bar, A)` re-formed, and the PD test is
+repeated once. Still not PD: the fit is NaN (below), no third block, no
+other retry. Enforcing this before the FIRST Newton step matters: a
+start whose EM has not actually reached a stationary point can have a
+PD `A` and yet leave PD-ness after just one full Newton step (the local
+quadratic model is only locally valid), producing exactly the
+plateaued-score, many-halvings symptom the gate is meant to keep out of
+a WINNING start's polish; a per-step re-test of `A`'s own PD-ness is not
+part of the polish itself (only a mixing weight <= 0, a component
+covariance not PD, or `ell_p` falling triggers a halving, all below).
+
 **Newton polish** (`_fit`) takes up to `_MAX_NEWTON = 20` damped Newton
-steps `theta <- theta + t * A^-1 (weighted mean score)`, using the same
-analytic score/information the influence needs. At each iteration the
+steps `theta <- theta + t * A^-1 (penalized weighted mean score)`, using
+the same analytic score/information the influence needs, both the
+penalized ones (below). At each iteration the
 full step (`t = 1`) is tried first; it is accepted if the new point is
 valid (every mixing weight positive, every component's covariance
-positive-definite, log-likelihood finite) and the weighted
-log-likelihood does not decrease, otherwise `t` is halved and the trial
+positive-definite, penalized log-likelihood finite) and the penalized
+weighted log-likelihood does not decrease, otherwise `t` is halved and the trial
 repeated, up to `_MAX_HALVINGS = 30` halvings (`t` as small as
 `2^-30 ~ 1e-9`). A full step from an unconverged EM point is a step from
 outside the region the Newton model is locally accurate in, and
@@ -388,27 +490,34 @@ routinely overshoots a small mixing weight past zero or a covariance
 past positive-definiteness; damping recovers a usable step there while
 leaving a polish that already accepts the full step at every iteration
 identical to before. If no step at any damping level is admissible, the
-polish stops and the current point is kept. The loop otherwise stops on
-either of two conditions: the weighted mean score's norm falling below
-`_NEWTON_SCORE_TOL` (~1e-14, the machine floor), or that norm no longer
-improving by a clear factor (`_NEWTON_PROGRESS_FACTOR`) once it is
-already below `_NEWTON_PROGRESS_FLOOR` -- a residual already at the
-noise floor can otherwise spend several more full information-matrix
-assemblies bouncing in place for no further change in theta.
+polish stops and the current point is kept. The loop otherwise stops
+when the penalized weighted mean score's norm falls to `self.eta` or
+below.
 
-**Residual and `eta`.** After the polish loop exits, `resid =
-norm(A^-1 s_bar) / (1 + norm(theta_hat))` at the final point -- a
-dimensionless, reparameterization-invariant estimate of how far
-`theta_hat` sits from a true stationary point of the weighted
-log-likelihood. `resid > self.eta` (or `A` singular, so `resid` cannot
-even be computed) makes the whole evaluation fail (`T` and `influence`
-both NaN): a `theta_hat` that does not actually solve the score
-equation to the estimator's own claimed precision is not one QIJ
-should treat as exact.
+**Residual and `eta`.** `resid = norm(s_bar)` at the point the polish
+loop exits, `s_bar` the penalized weighted mean score -- the same
+quantity, at the same scale, the loop's own stopping test and the Newton
+gate above both watch. `resid > self.eta` (or `A` singular at any point
+along the way, so the gate or a Newton step cannot even be evaluated)
+makes the whole evaluation fail (`T` and `influence` both NaN): a
+`theta_hat` whose score is not this small is not one QIJ should treat as
+an exact root of `ell_p`. `eta` is declared, not derived: `self.eta =
+1e-12`, from the score norm the polish reliably reaches on the demo
+mixture (`datasets.mix11`, K=9) once a start clears the gate and
+actually converges (module report: two of its three phase-2 starts
+converge to a `resid` of a few times `1e-13`; the third clears the gate
+but does not converge within `_MAX_NEWTON` steps and would itself be
+NaN, which is not "reliably reached" and is excluded from the
+declaration), rounded up to `1e-12`. A fit whose Newton polish does not
+converge at all fails `resid > eta` by orders of magnitude (`1e-3` or
+larger), not by a margin that would call `eta`'s value into question.
 
 **The score and Louis's identity** (`_score_info`). Per observation,
 with responsibility `r_k`, residual `res = x - mu_k`,
-`P_k = Sigma_k^-1`, `G_k = 0.5*(P_k res res^T P_k - P_k)`:
+`P_k = Sigma_k^-1`, `G_k = 0.5*(P_k res res^T P_k - P_k)`, all of the
+RAW (unpenalized) mixture likelihood -- the penalty's terms are added
+separately, below, since they are functions of `(Scov, a)` alone, not
+of any one observation:
 
     d/dpi_j  = r_j/pi_j - r_K/pi_K                    (j = 1..K-1)
     d/dmu_k  = r_k * P_k @ res
@@ -438,6 +547,58 @@ array per component (not `(N,p)`) because it is NOT reducible to
 moments (it is the outer product of the full per-observation score, not
 its expectation); it is assembled with one matmul per component.
 
+**The penalty's terms** (`_penalty_terms`, `_score_info_penalized`). The
+raw `(psi, A, ll)` above are combined with the penalty, which touches
+only the Sigma_k blocks (pi, mu are untouched: the penalty is not a
+function of them). With `P_k = Sigma_k^-1`, `G_k = P_k - P_k Scov P_k`
+(the penalty's own gradient w.r.t. `Sigma_k`, packed into the
+`(S11,S12,S22)` parametrization the same `d/dS_k12 = ... + ...`
+duplication way as the raw score above):
+
+    penalty_sum  = sum_k[tr(Scov P_k) + log det Sigma_k]
+    g            = -a * G_k                       (p,, zero outside Sigma blocks)
+    H[a,b]       = -a * tr(D_a @ dG_k/dD_b),  dG_k/dD_b = -P_k D_b P_k + P_k D_b P_k Scov P_k + P_k Scov P_k D_b P_k
+
+(`D_b` the same three basis matrices `_D['S11'/'S12'/'S22']` the raw
+Hessian's `PDP` already uses; `H` is block-diagonal across `k`, since
+`Scov` does not depend on theta and different components' Sigma_k's
+don't interact through the penalty). Then
+
+    ll     = ll_raw - a*penalty_sum/W        (ell_p / sum(w))
+    psi_bar = psi_bar_raw + g/W              (d(ell_p/sum(w))/dtheta)
+    A      = A_raw - H/N                     (the penalized observed information / N)
+
+matching the raw code's own normalization convention exactly (`psi_bar`
+by `sum(w)`, `A` by `N`) so Newton, the residual, and `influence`'s
+sandwich all stay self-consistent with how they already combined with
+the raw terms.
+
+**The influence's extra term** (`_penalty_influence_extra`). The
+penalty depends on `w` not just through `theta_hat` (already captured
+by the raw `psi`) but directly, through `S(w)` and `a(w)`: the M-
+estimator's implicit-function-theorem sensitivity `d(penalized
+score)/dw_i`, at fixed theta, therefore has a term beyond the raw
+`psi_i`. With `d_i = x_i - xbar_w` (the row's residual from `Scov`'s OWN
+w-weighted mean, not `prepare`'s unweighted `xmean`), `da/dw_i = -a^2`
+(constant in `i`) and `dScov/dw_i = (d_i d_i^T - Scov)/W` (both closed
+form, the second because `sum_i w_i d_i = 0` exactly by definition of
+the weighted mean), the extra per-point, per-component term is
+
+    Delta_k(w_i) = a^2 * G_k - (a/W) * P_k (d_i d_i^T - Scov) P_k,
+
+packed into the theta vector the same way `g` is, and `influence`'s
+per-observation term is `psi_full_i = psi_raw_i + sum_k Delta_k(w_i)`
+(its weight sum(w) is not what `influence` returns -- `psi_i = N *
+dT/dw_i` is, per the package's convention, and `A^-1 psi_full_i` gives
+exactly that for the SAME reason `A^-1 psi_raw_i` already did for the
+unpenalized estimator: `A` is `-Hessian(ell_p)/N`, and `psi_full_i` is
+`d(SCORE_p_total)/dw_i` at the unnormalized `ell_p` scale). The
+detector for a missing or wrong term here is the same as for the raw
+score: Newton stops converging quadratically, or (checked separately,
+by direct perturbation of `w`) the influence's first-order prediction
+of `T(X, w + t*e_i) - T(X, w)` stops improving by the expected ~100x
+per 10x shrink in `t`.
+
 **Centering.** `X` is shifted by its own UNWEIGHTED mean once on entry
 (fit and influence both computed in the shifted frame; component means
 shifted back before `T` returns them) -- `Sigma = E[xx^T] - mu mu^T`
@@ -446,7 +607,11 @@ and this module is Newton-polished to ~1e-12. The shift must be a
 constant of `w` alone, or it would become part of what the influence
 function measures. Covariances (and therefore `psi`, `A`, the
 influence) are exactly invariant under a constant shift, so `influence`
-never needs to shift anything back.
+never needs to shift anything back. `Scov` (the penalty's `S`) is a SEPARATE
+quantity, recomputed fresh every fit from `(Xc, w)` about `Scov`'s own
+w-weighted mean (`_weighted_cov`) -- unlike `xmean`, that mean is not
+zero in general (it moves with `w`) and is not the shift `T` centers
+on; it exists only to build `Scov` and the influence's `d_i` residuals.
 
 **`prepare(X)`** holds the unweighted centering shift `xmean`, the
 centered data `Xc = X - xmean`, and the feature buffer `(Q, XP)` built
@@ -456,10 +621,19 @@ of the same X.
 
 **Failure convention.** The evaluation fails (NaN) when: every one of
 the `n_starts` starts degenerates, so nothing survives phase 1 to rank;
-or, after polish, `resid > self.eta` or `A` is singular; or
-(`influence`/`fit_and_influence` only) `A`'s condition number exceeds
-`_COND_MAX = 1e12`. A bad OTHER start's mid-EM degeneracy just drops
-that one start -- multi-start's whole purpose.
+or the winning start's `A` is not PD even after the Newton gate's one
+retry block; or, after polish, `resid > self.eta` (nothing retried
+beyond the polish's own `_MAX_NEWTON` iterations) or `A` becomes
+singular along the way; or (`influence`/`fit_and_influence` only) `A`'s
+condition number exceeds `_COND_MAX = 1e12`. A bad OTHER start's mid-EM
+degeneracy just drops that one start -- multi-start's whole purpose. A
+start whose own EM never reaches `_run_em`'s relative-tolerance
+convergence within `max_iter` EM steps is not itself a failure (it is
+finalized `converged=False` and still ranked, above); but if the
+winning start then fails the Newton gate or its polish cannot bring
+`resid` under `eta`, the whole evaluation is NaN -- a real outcome for a
+hard mixture (K too large for N, near-empty or near-collinear clusters),
+not an artifact of the penalty.
 
 **Component labelling.** Without a reference, the winning start's
 components are labelled in ascending mu_x order. With

@@ -1,10 +1,12 @@
-"""The four data draws (pareto, mvt, fp, imf) and the MVT VQ transform.
+"""The four paper draws (pareto, mvt, fp, imf), the MVT VQ transform, and
+the `mix11` demo mixture (spec/QIJ_mods_waves.md section A7; not one of
+the paper's four).
 
-Parametric draws (`pareto`, `mvt`) sample the named law directly.
-Population draws (`fp`, `imf`) resample with replacement from the pool
-files shipped under `data/`, loaded once per process (E5's named
-exception for constant data read from the package's own files) and
-never re-read per draw.
+Parametric draws (`pareto`, `mvt`, `mix11`) sample the named law
+directly. Population draws (`fp`, `imf`) resample with replacement from
+the pool files shipped under `data/`, loaded once per process (E5's
+named exception for constant data read from the package's own files)
+and never re-read per draw.
 """
 
 import functools
@@ -13,6 +15,7 @@ from typing import Callable, Tuple
 
 import h5py
 import numpy as np
+from structsynhd import ChaconMixGenerator
 
 _DATA_DIR = pathlib.Path(__file__).parent / 'data'
 
@@ -44,6 +47,27 @@ def mvt(N: int, seed: int) -> np.ndarray:
     Z = rng.normal(size=(N, MVT_D))
     V = rng.chisquare(MVT_NU, size=(N, 1))
     return Z / np.sqrt(V / MVT_NU)
+
+
+# Chacon mixture 11's own means/covariances (structsynhd's loaded 2-D
+# order), with the demo weights of spec/QIJ_mods_waves.md section A7 --
+# the level sets stay close to the file's own, every component keeping
+# at least 50 points at N = 2000.
+MIX11_MIXNUM = 11
+MIX11_WEIGHTS = np.array(
+    [0.3775, 0.3775, 0.025, 0.035, 0.050, 0.025, 0.050, 0.035, 0.025])
+
+
+def mix11(N: int, seed: int) -> np.ndarray:
+    """N draws from Chacon mixture 11 (`ChaconMixGenerator`, its own
+    means/covariances and component order), weights replaced by
+    `MIX11_WEIGHTS` -- the talk's demo mixture, not one of the paper's
+    four draws. `expand_dimension` is never called (GMM2D is 2-D), so
+    overriding the instance's own `weights` before `sample` is enough."""
+    gen = ChaconMixGenerator(MIX11_MIXNUM)
+    gen.weights = MIX11_WEIGHTS
+    X, _ = gen.sample(N, random_state=seed)
+    return X
 
 
 @functools.lru_cache(maxsize=1)

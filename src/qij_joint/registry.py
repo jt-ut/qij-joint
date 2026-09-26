@@ -2,8 +2,10 @@
 
 `Case` bundles what a draw needs: the data-generating function, a
 factory for a fresh estimator instance, and the VQ transform (if any)
-QIJ should quantize in. Six cases, matching `datasets.py`'s four draws:
-pareto (shape, tail), mvt (nu, tail), fp (all), imf (all, Chabrier).
+QIJ should quantize in. Seven cases: the paper's six, matching
+`datasets.py`'s four draws -- pareto (shape, tail), mvt (nu, tail), fp
+(all), imf (all, Chabrier) -- plus the demo mixture, mix11 (all,
+`GMM2D`, spec/QIJ_mods_waves.md section A7).
 """
 
 import json
@@ -12,7 +14,7 @@ from typing import Callable, NamedTuple, Optional
 
 import numpy as np
 
-from . import datasets, estimators
+from . import datasets, estimators, gmm
 
 _TRUTH_DIR = pathlib.Path(__file__).parent / 'data' / 'truth'
 
@@ -41,6 +43,8 @@ _CASES = {
                               m_min=datasets.CHABRIER_M_MIN,
                               m_b=datasets.CHABRIER_M_B,
                               bounds=datasets.CHABRIER_BOUNDS), None),
+    ('mix11', 'all'): Case('mix11', 'all', datasets.mix11,
+                            lambda: gmm.GMM2D(K=9), None),
 }
 
 

@@ -201,6 +201,97 @@ sort labels the same-mean pair inconsistently from draw to draw and coverage
 for those coordinates is otherwise undefined. The reference is arrays, so
 it crosses the pool's boundary under the contract.
 
+### A7. Mixture estimator: the penalized-likelihood estimand (author's ruling, 26 September)
+
+**Why.** The likelihood of a Gaussian mixture with free covariances is
+unbounded (a component collapsing onto a few points), so its maximum does
+not exist and "the local maximum the best start reaches" is defined by the
+optimizer, not the model. `GMM2D`'s estimand is therefore the **penalized**
+maximum-likelihood estimate of Chen and Tan (2009; verify the constant
+against the paper before writing it down as theirs):
+
+    ℓ_p(θ; X, ω) = ℓ(θ; X, ω) − a · Σ_k [ tr(S Σ_k⁻¹) + log det Σ_k ],
+    a = 1 / Σ_i ω_i  (= 1/N at unit weights),
+    S = the ω-weighted covariance of the rows passed to T.
+
+The penalty is always on, for every caller and every fit; it is of relative
+order 1/N, so it moves a well-behaved fit by less than its sampling error,
+and it vanishes in the limit. A version that switched on only near
+singularity would make T discontinuous in ω and is excluded. S is defined
+from the rows and weights passed, so the quantized-data fit and the
+full-data fit use the same definition.
+
+**What changes in the code.**
+- The M-step for Σ_k has the closed form of the inverse-Wishart MAP,
+  Σ_k = (Σ_i r_ik ω_i (x_i − μ_k)(x_i − μ_k)ᵀ + 2a S) / (Σ_i r_ik ω_i + 2a);
+  EM stays monotone in ℓ_p. Weights and means are unchanged.
+- The Newton polish, the score and the observed information are those of
+  ℓ_p: the penalty's gradient with respect to Σ_k is
+  −a (Σ_k⁻¹ − Σ_k⁻¹ S Σ_k⁻¹), its Hessian is closed-form, both are added
+  in Louis's identity.
+- The analytic influence is that of the penalized M-estimator. Note that
+  the penalty depends on ω through S (and through a): the derivative of the
+  penalized score with respect to ω_i includes ∂S/∂ω_i and ∂a/∂ω_i, and
+  these terms are part of the influence. The detector for a missing term is
+  the same as before: Newton's convergence stops being quadratic.
+- **EM acceleration (ruled 26 September): SQUAREM**, Varadhan and Roland's
+  squared extrapolation, in its standard form: from θ take two EM steps
+  giving θ₁, θ₂; r = θ₁ − θ, v = (θ₂ − θ₁) − r; step length
+  α = −‖r‖/‖v‖ (bounded below by −1, i.e. never shorter than one plain EM
+  step); candidate θ′ = θ − 2αr + α²v followed by one EM step. Safeguard:
+  if θ′ leaves the feasible set (a weight ≤ 0, a covariance not positive
+  definite) or ℓ_p(θ′) < ℓ_p(θ₂), discard it and take θ₂. So every accepted
+  iterate has ℓ_p at least that of plain EM: monotone, deterministic, no
+  constant beyond the step-length bound. Convergence test as now, on the
+  relative change of ℓ_p; the iteration cap counts EM steps.
+- **Newton gating (ruled 26 September).** After EM (accelerated) has met
+  its tolerance or its cap, form the observed information H of ℓ_p. If −H
+  is positive definite (a Cholesky succeeds), run the damped Newton polish
+  as built (full step; halve while a weight ≤ 0, a covariance is not PD, or
+  ℓ_p falls; at most 20 iterations) until the score norm is ≤ η. If −H is
+  not positive definite, the iterate is not near a maximum: continue
+  accelerated EM for one more block (the same cap again) and re-test, once.
+  If −H is still not positive definite, or Newton does not reach η, the fit
+  is NaN under the acceptance rule. No third block, no other retry.
+- **Declared η.** The coder measures the score norm the polish reaches on
+  the demo mixture over the multi-start (one fit, all starts that pass the
+  gate) and declares `eta` at the level reliably reached, rounded up to a
+  power of ten; the author is told the number. It is not fixed at 1e-12 in
+  advance.
+- Acceptance: the norm of the penalized score at the returned point is at
+  most η, with η DECLARED as the accuracy the polish reliably reaches
+  (recorded in the estimator's `eta`), NaN otherwise. The same rule for
+  every caller. Nothing is retried.
+
+**Not part of the estimator.** Warm starts from a reference fit are NOT
+part of `GMM2D`'s definition: every call runs the full multi-start fit, so
+T is a function of (X, ω) alone and nothing in the package may depend on a
+warm start being available (author's ruling). The reference labelling of
+A6 stands as the labelling mechanism.
+
+**The demo mixture (author's ruling, 26 September).** The talk's estimand is
+Chacon mixture 11 with its means and covariances as loaded from
+`structsynhd` and these weights (in the loaded component order; the level
+sets are nearly unchanged, every component has at least 50 points at
+N = 2000, the rarest components stay fifteen times rarer than the blobs):
+
+| k | component | mean | weight |
+|---|---|---|---|
+| 0 | blob | (−1.5, 0) | 0.3775 |
+| 1 | blob | (+1.5, 0) | 0.3775 |
+| 2 | outer spike | (−2.5, −1) | 0.025 |
+| 3 | on-mean spike | (−1.5, 0) | 0.035 |
+| 4 | inner spike | (−0.5, +1) | 0.050 |
+| 5 | middle | (0, 0) | 0.025 |
+| 6 | inner spike | (+0.5, −1) | 0.050 |
+| 7 | on-mean spike | (+1.5, 0) | 0.035 |
+| 8 | outer spike | (+2.5, +1) | 0.025 |
+
+Sum 1.0000. The coder decides the plumbing (a dataset entry that loads
+mixture 11 and replaces the weights; the same generator otherwise, so
+`expand_dimension` still applies). Nothing else in this section is
+specific to that mixture.
+
 ### A5. Wave A audit and measurement
 
 Audit: with `gptrend=affine`, `gpwidth=global`, any worker count, every kept
