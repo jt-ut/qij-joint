@@ -237,13 +237,20 @@ full-data fit use the same definition.
 - **EM acceleration (ruled 26 September): SQUAREM**, Varadhan and Roland's
   squared extrapolation, in its standard form: from θ take two EM steps
   giving θ₁, θ₂; r = θ₁ − θ, v = (θ₂ − θ₁) − r; step length
-  α = −‖r‖/‖v‖ (bounded below by −1, i.e. never shorter than one plain EM
-  step); candidate θ′ = θ − 2αr + α²v followed by one EM step. Safeguard:
-  if θ′ leaves the feasible set (a weight ≤ 0, a covariance not positive
-  definite) or ℓ_p(θ′) < ℓ_p(θ₂), discard it and take θ₂. So every accepted
-  iterate has ℓ_p at least that of plain EM: monotone, deterministic, no
-  constant beyond the step-length bound. Convergence test as now, on the
-  relative change of ℓ_p; the iteration cap counts EM steps.
+  α = −‖r‖/‖v‖, then **α ← min(α, −1)**: the step is never SHORTER than
+  the two EM steps (α = −1 reproduces θ₂ exactly), and it may be much
+  longer. (Corrected 26 September: an earlier line here had the bound the
+  wrong way round, clipping every long step back to plain EM, which is why
+  the first build saved nothing.) Long steps are limited by the paper's
+  step-length control: α ← max(α, −m) with m starting at 4 and multiplied
+  by 4 each time the limit binds. Candidate θ′ = θ − 2αr + α²v followed by
+  one EM step. Safeguard: if θ′ leaves the feasible set (a weight ≤ 0, a
+  covariance not positive definite) or ℓ_p(θ′) < ℓ_p(θ₂), discard it and
+  take θ₂ (and, per the paper, halve the distance toward α = −1 before
+  giving up is NOT done: one candidate, then fall back). So every accepted
+  iterate has ℓ_p at least that of plain EM: monotone, deterministic.
+  Convergence test as now, on the relative change of ℓ_p; the iteration
+  cap counts EM steps.
 - **Newton gating (ruled 26 September).** After EM (accelerated) has met
   its tolerance or its cap, form the observed information H of ℓ_p. If −H
   is positive definite (a Cholesky succeeds), run the damped Newton polish

@@ -388,36 +388,41 @@ def _feasible(pis: np.ndarray, Ss: np.ndarray) -> bool:
     return True
 
 
-def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget):
+def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m):
     """One SQUAREM round, spending at most `budget` (>=1) EM steps
     (method_notes section 5: theta1, theta2 from two EM steps; r, v,
-    alpha = -norm(r)/norm(v) bounded below by -1; the extrapolated
-    point followed by one EM step is the candidate, discarded for
-    theta2 if infeasible or if its ll is below theta2's -- so the
-    returned ll is always >= theta2's, hence monotone as plain EM is).
-    `budget` < 3 skips the candidate trial and returns theta1
-    (`budget`==1) or theta2 (`budget`==2) plain. Returns (pis, mus, Ss,
-    ll, n_em) with ll at the RETURNED point and n_em <= budget the EM
-    steps used. Raises np.linalg.LinAlgError if (pis, mus, Ss) is
+    alpha = -norm(r)/norm(v), held at most -1 so the step is never
+    shorter than two EM steps, and at least -m, m multiplied by 4 each
+    time that limit binds; the extrapolated point followed by one EM
+    step is the candidate, discarded for theta2 if infeasible or if its
+    ll is below theta2's -- so the returned ll is always >= theta2's,
+    hence monotone as plain EM is). `budget` < 3 skips the candidate
+    trial and returns theta1 (`budget`==1) or theta2 (`budget`==2)
+    plain. Returns (pis, mus, Ss, ll, n_em, m) with ll at the RETURNED
+    point, n_em <= budget the EM steps used and m the step limit for
+    the next round. Raises np.linalg.LinAlgError if (pis, mus, Ss) is
     already infeasible."""
     theta0 = _pack(K, pis, mus, Ss)
     pis1, mus1, Ss1, _ = _em_step(Q, XP, w, W, pis, mus, Ss, Scov, a_pen)
     if budget == 1:
-        return pis1, mus1, Ss1, _penalized_ll(Q, w, W, pis1, mus1, Ss1, Scov, a_pen), 1
+        return pis1, mus1, Ss1, _penalized_ll(Q, w, W, pis1, mus1, Ss1, Scov, a_pen), 1, m
 
     theta1 = _pack(K, pis1, mus1, Ss1)
     pis2, mus2, Ss2, _ = _em_step(Q, XP, w, W, pis1, mus1, Ss1, Scov, a_pen)
     ll2 = _penalized_ll(Q, w, W, pis2, mus2, Ss2, Scov, a_pen)
     if budget == 2:
-        return pis2, mus2, Ss2, ll2, 2
+        return pis2, mus2, Ss2, ll2, 2, m
 
     theta2 = _pack(K, pis2, mus2, Ss2)
     r = theta1 - theta0
     v = (theta2 - theta1) - r
     vnorm = np.linalg.norm(v)
-    # v == 0 means r == 0 too at a genuine fixed point; the floor sends
-    # that case to theta2 with no 0/0 division.
-    alpha = max(-np.linalg.norm(r) / vnorm, -1.0) if vnorm > 0.0 else -1.0
+    # v == 0 means r == 0 too at a genuine fixed point; alpha = -1 then
+    # returns theta2 with no 0/0 division.
+    alpha = min(-np.linalg.norm(r) / vnorm, -1.0) if vnorm > 0.0 else -1.0
+    if alpha < -m:
+        alpha = -m
+        m *= 4.0
     pis_sq, mus_sq, Ss_sq = _unpack(K, theta0 - 2.0 * alpha * r + alpha ** 2 * v)
 
     if _feasible(pis_sq, Ss_sq):
@@ -428,9 +433,9 @@ def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget):
         except np.linalg.LinAlgError:
             ll3 = None
         if ll3 is not None and np.isfinite(ll3) and ll3 >= ll2:
-            return pis3, mus3, Ss3, ll3, 3
+            return pis3, mus3, Ss3, ll3, 3, m
 
-    return pis2, mus2, Ss2, ll2, 2
+    return pis2, mus2, Ss2, ll2, 2, m
 
 
 def _em_accelerated(Q, XP, w, W, pis, mus, Ss, ll, tol, max_iter, Scov, a_pen, K):
@@ -441,10 +446,11 @@ def _em_accelerated(Q, XP, w, W, pis, mus, Ss, ll, tol, max_iter, Scov, a_pen, K
     trajectory."""
     n_used = 0
     converged = False
+    m = 4.0
     while n_used < max_iter:
         budget = max_iter - n_used
-        pis, mus, Ss, ll_new, n_em = _squarem_round(
-            Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget)
+        pis, mus, Ss, ll_new, n_em, m = _squarem_round(
+            Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m)
         if not np.isfinite(ll_new):
             raise np.linalg.LinAlgError('non-finite penalized log-likelihood')
         n_used += n_em

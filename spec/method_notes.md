@@ -432,10 +432,10 @@ J. Statist. 35:335-353, their steplength scheme S3). From the current
 point `theta0`, two plain EM steps (`_em_step`, one E-step then the
 penalized M-step above) give `theta1`, `theta2`; `r = theta1 - theta0`,
 `v = (theta2 - theta1) - r`; step length `alpha = -norm(r)/norm(v)`,
-bounded below by `-1` (a raw `alpha` more negative is clamped there --
-at `alpha = -1` exactly, `theta0 - 2*alpha*r + alpha^2*v` reduces
-algebraically to `theta2`, the paper's own description of that
-steplength: "a SQUAREM evaluation is the same as two EM updates"). The
+held at most `-1` so the step is never shorter than two EM steps (at
+`alpha = -1` exactly, `theta0 - 2*alpha*r + alpha^2*v` reduces
+algebraically to `theta2`), and at least `-m`, with `m` starting at 4
+for each start's EM and multiplied by 4 each time that limit binds. The
 extrapolated point followed by one more EM step is the candidate;
 discarded for `theta2` if it leaves the feasible set (a mixing weight
 <= 0, a component covariance not PD) or its `ell_p` is below `theta2`'s
@@ -444,16 +444,11 @@ monotone in `ell_p` exactly as plain EM is, with no other constant or
 retry. A round costs 2 EM steps (candidate rejected or infeasible) or 3
 (accepted); `max_iter` is a budget in EM steps, not rounds, so a round
 near the end of the budget skips the candidate trial rather than
-overshoot it. The floor at `alpha = -1` is this estimator's own choice,
-not Varadhan and Roland's own S3 (which lets `alpha` run arbitrarily
-negative, relying on the monotonicity safeguard alone to reject a bad
-step): on a slowly, near-linearly converging trajectory (its own EM
-map close to critical, `v` nearly proportional to `r`) the unclamped
-`alpha` would be large and the floor removes most of the gain, which
-the demo mixture's own hardest start exhibits (module report) --
-`_squarem_round`'s candidate is still accepted almost every round
-there, just by too little to shorten the 500-EM-step budget measurably
-against plain EM on the same start. Phase 1's batched screen is not
+overshoot it. On a slowly, near-linearly converging trajectory (the EM
+map close to critical, `v` nearly proportional to `r`) the raw `alpha`
+is large in magnitude, which is where the long step pays; the limit
+`-m` grows as it binds, and the monotonicity safeguard rejects any
+candidate that does not improve on `theta2`. Phase 1's batched screen is not
 accelerated (it has no per-start convergence test to accelerate against
 -- a fixed lockstep budget, used for ranking, not for finding a root).
 
