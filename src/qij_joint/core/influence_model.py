@@ -937,7 +937,8 @@ def bin_posterior_variance(
     coordinate: int,
     groups: Sequence[np.ndarray],
     sigma_c: np.ndarray,
-) -> np.ndarray:
+    with_mean: bool = False,
+):
     """
     The within-bin posterior variance v_k for coordinate `coordinate`
     at each group in `groups` (spec/method_notes.md section 3):
@@ -978,12 +979,20 @@ def bin_posterior_variance(
 
     Returns 0.0 for a group of size <= 1, and 0.0 for every group when
     `model.constant_path[coordinate]` is true. Clipped at 0 from below.
+
+    With `with_mean=True` (the joint path's B4 measured check,
+    spec/method_notes.md section 6), returns `(v_k, u_k)` instead, u_k =
+    mean(Sigma_k) itself, read from the same `mean_Sigma` this function
+    already computes for the v_k subtraction -- not a second pass. u_k
+    is 0.0 wherever v_k is (group size <= 1, or the constant path). The
+    default path's arithmetic and return are unchanged.
     """
     c = coordinate
     n_groups = len(groups)
     out = np.zeros(n_groups, dtype=float)
+    out_mean = np.zeros(n_groups, dtype=float) if with_mean else None
     if model.constant_path[c]:
-        return out
+        return (out, out_mean) if with_mean else out
 
     terms = _point_terms(model, Z)
     Zw_full = terms.Zw
@@ -1056,5 +1065,10 @@ def bin_posterior_variance(
         mean_Sigma = (s2_c / (n_k ** 2)) * (SS_k - quad_A + R_vec @ Ginv_R)
 
         out[gi] = max(mean_diag - mean_Sigma, 0.0)
+        if with_mean:
+            out_mean[gi] = mean_Sigma
+
+    if with_mean:
+        return out, out_mean
 
     return out

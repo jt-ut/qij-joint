@@ -129,10 +129,13 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
 
 def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> dict:
     """One `qij` scalar row: `QIJResult`'s scalars flattened to columns
-    per stage and per output."""
+    per stage and per output, plus `ivqbins` and the joint scalars from
+    the joint second stage (spec/method_notes.md section 6) -- inert
+    under `ivqbins='marginal'`."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
-           'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed)}
+           'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
+           'ivqbins': res.ivqbins}
     for stage in ('prototype', 'full_data', 'refinement', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
@@ -140,6 +143,14 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['normalized_rows'] = float(res.rows_by_stage['total']) / res.N
     row['busy_time_total'] = float(res.busy_time_total)
     row['workers'] = int(res.workers)
+    row['L0'] = int(res.joint_L0)
+    row['L'] = int(res.joint_L)
+    row['n_growth_rounds'] = int(res.joint_n_growth_rounds)
+    row['growth_capped'] = bool(res.joint_growth_capped)
+    row['n_flagged'] = int(res.joint_n_flagged)
+    row['n_check_rounds'] = int(res.joint_n_check_rounds)
+    row['n_check_evals'] = int(res.joint_n_check_evals)
+    row['check_capped'] = bool(res.joint_check_capped)
     for j, o in enumerate(res.outputs):
         row[f'V_btw_{o}'] = float(res.V_btw[j])
         row[f'V_win_hat_{o}'] = float(res.V_win_hat[j])
@@ -156,19 +167,40 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'lam_bound_{o}'] = bool(res.lam_bound[j])
         row[f'c_{o}'] = float(res.c[j])
         row[f'c_bound_{o}'] = bool(res.c_bound[j])
+        row[f'S_pred_{o}'] = float(res.joint_S_pred[j])
+        row[f'a_{o}'] = float(res.joint_a[j])
     return row
 
 
 def _qij_points(res) -> pd.DataFrame:
     """`points` for `--diag-draws`: `i, bmu, psi0_<o>, sigma_<o>,
-    psi_hat_<o>, bin_label_<o>` (Section 6.2)."""
+    psi_hat_<o>, bin_label_<o>` under `ivqbins='marginal'`; under
+    `'joint'` a single shared `bin_label` in place of the per-output
+    labels, since every output shares one partition
+    (spec/method_notes.md section 6)."""
     N = res.psi0.shape[0]
     data = {'i': np.arange(N), 'bmu': np.asarray(res.bmu, dtype=np.int32)}
     for j, o in enumerate(res.outputs):
         data[f'psi0_{o}'] = res.psi0[:, j]
         data[f'sigma_{o}'] = res.sigma[:, j]
         data[f'psi_hat_{o}'] = res.psi_hat[:, j]
-        data[f'bin_label_{o}'] = np.asarray(res.bin_label[:, j], dtype=np.int32)
+        if res.ivqbins == 'marginal':
+            data[f'bin_label_{o}'] = np.asarray(res.bin_label[:, j], dtype=np.int32)
+    if res.ivqbins == 'joint':
+        data['bin_label'] = np.asarray(res.joint_bin_label, dtype=np.int32)
+    return pd.DataFrame(data)
+
+
+def _qij_bins(res) -> pd.DataFrame:
+    """`bins` for `--diag-draws` under `ivqbins='joint'`: `k, bin_mass,
+    bin_flagged, U_<o>, m_<o>`, the shared bin constituents of the joint
+    second stage (spec/method_notes.md section 6)."""
+    L = res.joint_bin_mass.shape[0]
+    data = {'k': np.arange(L), 'bin_mass': res.joint_bin_mass,
+            'bin_flagged': np.asarray(res.joint_bin_flagged, dtype=bool)}
+    for j, o in enumerate(res.outputs):
+        data[f'U_{o}'] = res.joint_bin_U[:, j]
+        data[f'm_{o}'] = res.joint_bin_m[:, j]
     return pd.DataFrame(data)
 
 
@@ -189,11 +221,12 @@ def _qij_prototypes(res) -> pd.DataFrame:
 def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
             out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
             workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
-            M_X: Optional[int] = None) -> Tuple[int, int]:
+            M_X: Optional[int] = None, ivqbins: str = 'marginal') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
-    prototype survey (method_notes section 2) runs in parallel -- the
-    rest of a draw is serial regardless of `workers`."""
+    prototype survey (method_notes section 2) and, under
+    `ivqbins='joint'`, the shared bins' full-data stencils run in
+    parallel -- the rest of a draw is serial regardless of `workers`."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -207,11 +240,13 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         dseed = seed + s
         X = case.draw(N, dseed)
         res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
-                  gptrend=gptrend, gpwidth=gpwidth, M_X=M_X).fit(X, T, pool=pool)
+                  gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         arrays = None
         if s in diag:
             arrays = {'points': _qij_points(res), 'prototypes': _qij_prototypes(res)}
+            if ivqbins == 'joint':
+                arrays['bins'] = _qij_bins(res)
         products.write_draw(md, s, row, arrays)
         written += 1
     if pool is not None:

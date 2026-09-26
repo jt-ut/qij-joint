@@ -39,6 +39,7 @@ def main(argv=None) -> None:
     p.add_argument('--gptrend', choices=['affine', 'quadratic'], default='affine')
     p.add_argument('--gpwidth', choices=['global', 'local'], default='global')
     p.add_argument('--M-X', dest='M_X', type=int, default=None)
+    p.add_argument('--ivqbins', choices=['marginal', 'joint'], default='marginal')
     args = p.parse_args(argv)
 
     md = products.method_dir(args.out, args.dataset, args.estimator, args.N, args.method)
@@ -62,11 +63,13 @@ def main(argv=None) -> None:
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
             if args.diag_draws else []
-        params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X)
+        params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
+                      ivqbins=args.ivqbins)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
-            workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X)
+            workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
+            ivqbins=args.ivqbins)
 
     products.append_log(md, sys.argv, params, written, skipped)
 

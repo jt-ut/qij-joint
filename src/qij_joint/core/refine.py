@@ -31,7 +31,11 @@ from .differences import forward_step, perturbed_weights, step_parameter
 from .influence_model import bin_posterior_variance
 from .ivq import BinSet, between_terms, bin_differences, build_bins, kmeans_1d
 
-__all__ = ["CoordinateResult", "run_refinement"]
+__all__ = [
+    "CoordinateResult", "run_refinement",
+    "level_gain_value", "adjacency_gain_value",
+    "level_split_gain", "adjacency_split_gain",
+]
 
 
 @dataclass
@@ -138,6 +142,52 @@ def _try_adjacency_split(
     if not mask.any() or mask.all():
         return None
     return idx[mask], idx[~mask]
+
+
+def level_gain_value(p_a, ubar_a, p_b, ubar_b, p_k, ubar_k, N, rho2) -> float:
+    """rho2*(p_a*ubar_a^2 + p_b*ubar_b^2 - p_k*ubar_k^2)/N (spec section
+    4) at a KNOWN partition: the marginal path passes rho2=rho^2, the
+    joint check (spec/method_notes.md section 6) rho2=1 per output."""
+    return (rho2 * (p_a * ubar_a ** 2 + p_b * ubar_b ** 2 - p_k * ubar_k ** 2)) / N
+
+
+def adjacency_gain_value(p_k: float, v_k: float, N: int, rho2: float) -> float:
+    """rho2*p_k*v_k/N (spec section 4): the marginal path passes
+    rho2=rho^2, the joint check (method_notes section 6) rho2=1."""
+    return (rho2 * p_k * v_k) / N
+
+
+def level_split_gain(
+    idx: np.ndarray, psi0_c: np.ndarray, psi_centered_c: np.ndarray,
+    N: int, p_k: float, ubar_k: float, rho2: float,
+) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+    """Propose a level split (two-means on psi0_c, `_try_level_split`)
+    and price it with `level_gain_value` (spec section 4); None if
+    fewer than two distinct psi0 values or the split collapses."""
+    split = _try_level_split(idx, psi0_c[idx])
+    if split is None:
+        return None
+    idx_a, idx_b = split
+    ubar_a = float(psi_centered_c[idx_a].mean())
+    ubar_b = float(psi_centered_c[idx_b].mean())
+    p_a, p_b = idx_a.size / N, idx_b.size / N
+    g = level_gain_value(p_a, ubar_a, p_b, ubar_b, p_k, ubar_k, N, rho2)
+    return idx_a, idx_b, g
+
+
+def adjacency_split_gain(
+    idx: np.ndarray, I_proto_c: np.ndarray, bmu: np.ndarray, bmu2: np.ndarray,
+    N: int, p_k: float, v_k: float, rho2: float,
+) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+    """Propose the CADJ adjacency split (`_try_adjacency_split`) and
+    price it with `adjacency_gain_value` (spec section 4); None if one
+    side would be empty."""
+    split = _try_adjacency_split(idx, I_proto_c, bmu, bmu2)
+    if split is None:
+        return None
+    idx_a, idx_b = split
+    g = adjacency_gain_value(p_k, v_k, N, rho2)
+    return idx_a, idx_b, g
 
 
 def _degenerate_result(coordinate: int, name: str, N: int, bins0: BinSet, M_X_used: int) -> CoordinateResult:
@@ -299,37 +349,31 @@ def run_refinement(
         rho2_local = rho2_current if np.isfinite(rho2_current) else 0.0
 
         if var_k > v_k:
-            split = _try_level_split(idx, psi0_c[idx])
-            if split is None:
-                leaf['open'] = False
-                leaf['split'] = None
-                leaf['g'] = 0.0
-                return
-            idx_a, idx_b = split
-            ubar_a = float(psi_centered[idx_a].mean())
-            ubar_b = float(psi_centered[idx_b].mean())
-            p_a = idx_a.size / N
-            p_b = idx_b.size / N
-            g = (rho2_local * (p_a * ubar_a ** 2 + p_b * ubar_b ** 2 - p_k * ubar_k ** 2)) / N
-            leaf['split'] = ('level', idx_a, idx_b)
-            leaf['g'] = g
-            leaf['open'] = True
+            result = level_split_gain(idx, psi0_c, psi_centered, N, p_k, ubar_k, rho2_local)
+            kind = 'level'
         else:
-            split = _try_adjacency_split(idx, I_proto_c, bmu, bmu2)
+            # Priced by the adjacency gain (v_k-based) whichever
+            # geometry supplies the partition: the choice between level
+            # and adjacency pricing follows Var_k(psi0) vs v_k above,
+            # not which split happened to be feasible.
+            result = adjacency_split_gain(idx, I_proto_c, bmu, bmu2, N, p_k, v_k, rho2_local)
             kind = 'adjacency'
-            if split is None:
+            if result is None:
                 split = _try_level_split(idx, psi0_c[idx])
                 kind = 'level'
-            if split is None:
-                leaf['open'] = False
-                leaf['split'] = None
-                leaf['g'] = 0.0
-                return
-            idx_a, idx_b = split
-            g = (rho2_local * p_k * v_k) / N
-            leaf['split'] = (kind, idx_a, idx_b)
-            leaf['g'] = g
-            leaf['open'] = True
+                result = (
+                    None if split is None
+                    else (split[0], split[1], adjacency_gain_value(p_k, v_k, N, rho2_local))
+                )
+        if result is None:
+            leaf['open'] = False
+            leaf['split'] = None
+            leaf['g'] = 0.0
+            return
+        idx_a, idx_b, g = result
+        leaf['split'] = (kind, idx_a, idx_b)
+        leaf['g'] = g
+        leaf['open'] = True
 
     rho2 = compute_rho2()
     batch_v(list(leaves.values()))

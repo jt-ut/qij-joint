@@ -180,3 +180,79 @@ part.
 > macOS `dyld` assertion, rerun it once and note it. Nothing else is run.
 > Report one table: field groups by case, exact or not, and every
 > difference in full.
+
+## Wave B
+
+Implements `QIJ_mods_waves.md` B1-B7 as amended 26 September (B4's scale
+factor a_c; gpwidth=local not adopted; the B7 measurement on the FP).
+
+### Agents
+
+Two builders in parallel on disjoint files, then the B7 audit, then (on
+the author's go) the B7 measurement.
+
+| Agent | Files | Spec items |
+|---|---|---|
+| B-CORE | new `core/joint.py`; `core/influence_model.py` (u_kc beside v_k); `core/refine.py` (expose the split proposals and expected gains as module-level functions shared with the joint check); `spec/method_notes.md` (new section: the joint path) | B1-B4, B6's computations |
+| B-PL | `qij.py`, `result.py`, `pipeline.py`, `scripts/run.py`, `products.py` (only if needed) | the `ivqbins` switch, B5, B6's products |
+
+### Pinned interfaces
+
+**Joint second stage** (`core/joint.py`, B-CORE):
+
+```
+run_joint(X, counter, theta_hat, psi0_all, sigma_all, model, Z, xvq, eta, eps,
+          pool=None, lloyd=False) -> JointResult
+grow(psi0_all, eps, M_X_used, lloyd=False) -> Growth   # B1-B2 only, no evaluations
+```
+
+`JointResult` fields: per output (q,): `V_btw`, `V_win_hat`, `V_tot_hat`,
+`S_pred`, `a`, `gain_ratio`; shared: `L0`, `L`, `n_growth_rounds`,
+`growth_capped`, `S_pred_pre_lloyd` (q,) (NaN when `lloyd` is False),
+`n_flagged`, `n_check_rounds`, `n_check_evals`, `n_level_splits`,
+`n_adjacency_splits`, `check_capped`, `failed` (a failed output or a
+failed initial measurement fails the draw, B1 and B3); bin constituents
+`bin_mass` (L,), `bin_U` (L, q), `bin_m` (L, q), `bin_flagged` (L,);
+`bin_label` (N,); `busy_delta` (pool task time less the pool's elapsed
+time, as the other pool stages report it). `lloyd` is the growth's
+optional Lloyd pass, a function argument used by the B7 measurement only,
+not exposed by `QIJ` or the CLI until the measurement decides it.
+
+**Posterior per bin** (`core/influence_model.py`, B-CORE):
+`bin_posterior_variance(..., with_mean=False)` returns v_k as now; with
+`with_mean=True` it returns `(v_k, u_k)`, u_k = mean(Sigma_k), from the same
+chunked pairwise pass. The marginal path's calls and results are unchanged.
+
+**Refinement helpers** (`core/refine.py`, B-CORE): the level and
+adjacency split proposals and their expected gain g, currently inside
+`run_refinement`'s closures, become module-level functions both paths call;
+the marginal path's arithmetic and results are unchanged.
+
+**QIJ** (`qij.py`, B-PL): `QIJ(..., ivqbins='marginal')`; `'joint'` calls
+`run_joint` in place of the per-output `run_refinement` loop; stage 1 and
+θ̂ are shared. `QIJResult` gains `ivqbins` and the `JointResult` fields
+under names that do not collide with the marginal ones (for example
+`joint_L0`); under `marginal` they are NaN / 0 / empty, under `joint` the
+marginal-only fields (per-output `L`, `rho`, `psi_hat`, refinement counts)
+are NaN / 0. `busy_time_total` adds `JointResult.busy_delta`.
+
+**Products** (`pipeline.py`, B-PL): the qij scalar row gains `ivqbins` and
+the joint scalars (per output `S_pred_<o>`, `a_<o>`, `gain_ratio_<o>`;
+shared `L0`, `L`, `n_growth_rounds`, `growth_capped`, `n_flagged`,
+`n_check_rounds`, `n_check_evals`, `check_capped`); under `joint` a new
+array kind `bins` (L rows: `k, bin_mass, bin_flagged, U_<o>, m_<o>`) is
+written for `--diag-draws`, and `points` carries `bin_label` (shared) in
+place of the per-output labels. CLI: `--ivqbins {marginal,joint}`.
+
+### Line budgets
+
+`core/joint.py` 450; `influence_model.py` 1,090; `refine.py` 500;
+`qij.py` 280; `result.py` 150; `pipeline.py` 270; `scripts/run.py` 80.
+
+### Cost stated before dispatch
+
+Builders run pyflakes and the one check only. The B7 audit (`ivqbins=
+marginal`, the audit draws, B = 20, qij at 1 and 4 workers) is about 7
+minutes, as wave A's was. The B7 measurement (FP, N 2000, M_X 371, joint,
+1 and 8 workers, growth with and without the Lloyd pass) is seconds of FP
+evaluations; dispatched on the author's go.

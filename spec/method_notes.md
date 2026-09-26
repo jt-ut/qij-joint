@@ -481,3 +481,120 @@ wanting output c to be the same component throughout a draw fits once on
 the full data without a reference, converts that fit with
 `reference_from_theta(theta, K)`, and builds the estimator for every other
 evaluation of the draw with it; the naive ordering remains the default.
+
+## 6. The joint second stage
+
+Under `ivqbins='joint'` (`core/joint.py`), stage 2 replaces the marginal
+path's per-output 1-D quantizer and refinement queue by one partition
+shared across every output: grown to the tolerance (`grow`), measured on
+the full data, then corrected by a measured check against that
+measurement. `ivqbins='marginal'` is section 4 in full and is untouched
+by this section; stage 1 (sections 2-3) is untouched by the switch.
+
+**Standardization and the shared failure rule.** Ψ̃ = psi0_all with
+each output divided by its own standard deviation sd_c over the N
+points, V_hat_c = sd_c^2 the predicted total variance of output c. An
+output on the constant path (section 3) has no usable psi0 spread; since
+every output shares one partition, such an output fails the whole draw
+(`failed=True`, no growth attempted), rather than voiding only its own
+coordinate as the marginal path does.
+
+**Growth.** From one bin holding every point, a round computes, for
+every current bin k and output c, w_kc = p_k * Var_k(psi0_c) / V_hat_c
+(population variance over the bin's own points, 0 for a bin of one
+distinct row) and S_c = sum_k w_kc, the predicted within share of
+output c. Growth stops when every S_c <= eps. Otherwise every bin with
+max_c w_kc > eps/L (L the current bin count) is split, in the same
+round, by two-means on Ψ̃ (`two_means_split`): initial centroids are the
+means of the two halves of the bin's rows split at the median of their
+projection onto the bin's own first principal axis (an eigh of the
+bin's q x q covariance), refined by Lloyd iterations to convergence or
+100 iterations, deterministically. A bin whose two-means is infeasible
+(fewer than two distinct rows) is left whole for the round; the
+tolerance test guarantees this never blocks progress, since a bin
+selected for splitting has w_kc > 0 for some c and therefore at least
+two distinct rows. Growth also stops, `growth_capped` recorded, once L
+reaches M_X_used -- checked only after confirming the tolerance is
+still unmet, so a round that both converges and reaches the cap counts
+as converged, not capped. An optional Lloyd pass (`lloyd`, a `grow`
+argument the driver does not yet expose) then reassigns every point to
+its nearest of the L centroids at once, to convergence or 100
+iterations, dropping any centroid this empties; S_pred is read after
+this pass, S_pred_pre_lloyd before (NaN when the pass is not run).
+Growth spends no evaluations and never runs on `pool`.
+
+**Measurement.** The grown partition is measured by the existing
+`ivq.bin_differences` central stencil, one task pair per bin on `pool`,
+giving each bin's centered U_k in R^q from the same two evaluations for
+every output; a NaN anywhere fails the whole draw (section 4's rule,
+ported as is since every output already shares these bins).
+V_btw,c = sum_k p_k U_kc^2 (`ivq.between_terms` per output).
+
+**The measured check.** For every bin k and output c: m_kc = mean of
+psi0_c over the bin's points (the model's predicted bin mean); u_kc =
+mean(Sigma_k), the posterior variance of that mean
+(`influence_model.bin_posterior_variance(..., with_mean=True)`, the
+same chunked pairwise pass that prices v_kc, the marginal path's
+expected within-bin variance -- both returned together, since u_kc is
+exactly the `mean_Sigma` term v_kc's own formula already computes
+before its diag-mean subtraction). A single scale a_c per output,
+
+    a_c = sum_k p_k * U_kc * m_kc / sum_k p_k * m_kc^2,
+
+is fitted once, after this first measurement, from every bin, and held
+fixed through every check round: a model whose scale is off but whose
+ordering is right (section 3's noise floor can leave psi0 on the wrong
+scale by orders of magnitude while still recovering most of the oracle
+variance) must not read that uniform error as per-bin disagreement.
+Bin k is flagged when, for some output c,
+
+    p_k * (U_kc - a_c*m_kc)^2  >  eps * V_hat_c / L  +  p_k * a_c^2 * u_kc,
+
+the measured derivative differing from the rescaled prediction by more
+than the bin's share of the tolerance plus what the posterior allows
+for the error of a bin mean. There is no tau, no closing-strike flag, no
+expected-gain queue, no rho^2 rescaling here: gain_ratio (below) is a
+reported diagnostic, not a stopping rule.
+
+Each check round, every currently flagged bin is priced and split in
+one batch: the split kind is level when
+sum_c Var_k(psi0_c)/V_btw,c >= sum_c v_kc/V_btw,c, else adjacency,
+falling back to the other kind when the first choice is infeasible
+(both infeasible closes the bin, with no further evaluation). A level
+split is `two_means_split` on the bin's own Ψ̃ rows, exactly as growth's
+own split. An adjacency split evaluates, for every output c, the ported
+CADJ proposal (`refine.adjacency_split_gain`, the prototype-influence
+ordering shared with the marginal path) and takes the output whose
+proposal has the largest expected gain divided by that output's V_btw,c
+(both proposal and gain use rho^2 = 1, since the joint path has no
+rho). This ordering needs I_proto, the survey's per-prototype
+influence; `run_joint` takes it as an optional argument that `QIJ.fit`
+does not yet supply, so until that wiring is added every adjacency
+proposal is infeasible and the fallback routes every split through the
+level kind. The smaller of the chosen split's two children is measured
+by one ported forward evaluation; the larger's U follows by mass
+balance, exactly as the marginal path's own split (section 4); every
+flagged bin's evaluation in a round runs through `pool` together.
+V_btw,c is then updated (the split parent's term replaced by the sum of
+its two children's) and each new child is checked by the same flag
+test at the new, larger L; a failed evaluation cancels its split (the
+parent stays a final bin, closed, its one evaluation still counted).
+The check stops when no bin is flagged, or when check evaluations reach
+1 + M_X_used (`check_capped`).
+
+**Products (B6).** Per output: V_btw, V_win_hat, V_tot_hat = V_btw +
+V_win_hat; V_win_hat = (1/N) sum_k p_k (Var_k(psi0_c) + v_kc) over the
+final bins, v_kc cached from the round that priced it (never a fresh
+posterior-variance pass over the final bin set), with no rho^2 and no
+gamma_k -- the joint path has neither. S_pred, S_pred_pre_lloyd, a_c as
+above. gain_ratio,c = sum of realized Delta_c over sum of expected g_c
+across every check split (both at the split's own chosen partition and
+kind, g_c using rho^2 = 1; NaN when output c had no check splits).
+Shared: L0 (bins after growth), L (final), n_growth_rounds,
+growth_capped, n_flagged (bins flagged by the first check), n_check_
+rounds, n_check_evals, n_level_splits, n_adjacency_splits, check_capped,
+failed. Bin constituents bin_mass, bin_U, bin_m (predicted means),
+bin_flagged (true only for a bin still flagged when check_capped
+stopped the check, since a bin closed for any other reason is never
+revisited); per point, the shared bin_label. The q x q between-bin
+matrix is recoverable from bin_mass and bin_U and is not stored.

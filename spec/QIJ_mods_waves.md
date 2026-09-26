@@ -14,7 +14,7 @@ items marked ⇒ and refers to the rest by number):
 | # | item | status |
 |---|---|---|
 | 1a | quadratic GP trend | ⇒ wave A |
-| 1b | GP correlation length = one factor × local CONN spacing | ⇒ wave A |
+| 1b | GP correlation length = one factor × local CONN spacing | built in wave A; ruled NOT adopted 26 Sept (FP and MVT tables), `global` is the default, option kept |
 | 1c | GP in latent coordinates from the survey | deferred |
 | 2 | gradient survey by prototype-position perturbation | deferred |
 | 3 | within-field share of ψ̂₀ on second-order CADJ cells | dropped |
@@ -163,13 +163,9 @@ for.
 An explicit argument `M_X` overrides the rule when given. Every product
 records `M_X` and `M_X_source` (`rule` or `argument`).
 
-The rule scales with q because the marginal second stage does. The joint
-second stage does not, so under `ivqbins=joint` the rule is the wrong
-scaling and a large-q estimator reaches the cap. A joint-path default, the
-same cost balance with 2·L (the grown bin count) in place of 2·q·M_ref,
-will be set after wave B's measurement reports L for mixture 11; it will
-apply under `ivqbins=joint` only, so the ported rule and the paper's counts
-are untouched. Until then the joint path takes `M_X` explicitly.
+The rule is the default for both values of `ivqbins`. Where it reaches the
+cap, a large-q estimator at small N, the `M_X` argument is the override,
+and that is the whole of the design: item 4 is closed.
 
 ### A6. Mixture estimator labelling (mods item 10)
 
@@ -221,7 +217,12 @@ estimand, not a test bench.) The measurement is therefore the Fundamental
 Plane, `fp all` (q = 4, d_x = 3, analytic influence), N = 2000, one draw at
 seed 0, at `M_X = 371` (the rule) and `M_X = 742` (twice it). Per M_X: one
 𝒳-VQ and one survey, shared by the four switch combinations (the survey
-does not depend on the switches); then four GP fits. Reported per combination and output: the mass-weighted
+does not depend on the switches); then four GP fits. **Added 26 September
+(author's approval):** the same protocol on the multivariate t, `mvt nu`
+and `mvt tail`, with its `vq_transform`, at the rule's count and twice it,
+because the Fundamental Plane's influence is near-quadratic and cannot
+judge `gpwidth=local`; the author rules on item 1b from the two tables
+together. Reported per combination and output: the mass-weighted
 mean squared error of ψ̂₀ against the analytic influence; the share of the
 output's oracle variance recovered by 17 level-set bins of ψ̂₀, built with
 the ported 1-D quantizer on ψ̂₀ and scored with the analytic influence, no
@@ -300,13 +301,26 @@ posterior covariance block, mean(Σ_k). (The ported v_k = mean(diag Σ_k) −
 mean(Σ_k) is the expected within-bin variance and is the wrong quantity
 here; both come from the same chunked pairwise computation.)
 
+**Scale factor (P, 26 September).** The model's scale for an output can be
+off while its ordering is right (the A5 tables show ψ̂₀ for the MVT's ν at
+tens to hundreds of times the oracle's magnitude with a recovered share of
+0.99). The check must not read a uniform scale error as disagreement in
+every bin, so one factor per output is fitted from the bins themselves,
+
+    a_c = Σ_k p_k U_kc m_kc / Σ_k p_k m_kc² ,
+
+the least-squares scale of the measured derivatives on the predicted means
+over all bins after the first measurement, and held fixed through the check
+rounds. `a_c` is a product; a value far from one is the diagnostic of a
+scale error and calls for no action inside the method.
+
 Bin k is **flagged** when for some output c
 
-    p_k · (U_kc − m_kc)²  >  ε · V̂_c / L  +  p_k · u_kc ,
+    p_k · (U_kc − a_c · m_kc)²  >  ε · V̂_c / L  +  p_k · a_c² · u_kc ,
 
-that is, when the measured derivative differs from the prediction by more
-than the bin's allotment of the tolerance plus what the posterior allows
-for the error of a bin mean. No other constant enters.
+that is, when the measured derivative differs from the (rescaled)
+prediction by more than the bin's allotment of the tolerance plus what the
+posterior allows for the error of a bin mean. No other constant enters.
 
 A check round: every flagged bin is split by the ported split-kind rule in
 its multi-output form (level split when Σ_c Var_k(ψ̂₀^(c))/V_btw,c ≥
@@ -340,7 +354,7 @@ Per output c: `V_btw`; `V_win_hat` = (1/N) Σ_k p_k (Var_k(ψ̂₀^(c)) + v_kc)
 over the final bins, with v_kc the ported expected within-bin posterior
 variance, no ρ² and no γ_k since the joint path has neither; `V_tot_hat` =
 `V_btw` + `V_win_hat`; `S_pred` (the predicted within share at the end of
-growth, after the Lloyd pass if kept); `gain_ratio` = Σ_splits Δ_c /
+growth, after the Lloyd pass if kept); `a_c` (the check's scale factor, B4); `gain_ratio` = Σ_splits Δ_c /
 Σ_splits g_c over the check splits, with Δ_c = p_a U_ac² + p_b U_bc² −
 p_k U_kc² the realized gain and g_c the ported expected gain of the chosen
 split kind for output c (NaN when there were no check splits). `B_hat` and
@@ -363,9 +377,10 @@ nothing else.
 
 Measurement (one agent, after the audit, no package change; testing rule 3
 applies). By the same ruling as A5, the Fundamental Plane (`fp all`), N = 2000, one
-draw at seed 0, `M_X` at the count the author selects from A5 (371 or 742),
-`ivqbins=joint`, wave A's switches at the values the author selects from
-A5. (At q = 4 the joint path is not expected to save evaluations over the
+draw at seed 0, `M_X` from the rule (371), `ivqbins=joint`,
+`gptrend=quadratic`, `gpwidth=global` (the author's rulings from the A5
+tables, 26 September: item 1a adopted; item 1b not adopted, the option kept
+with `global` as the default). (At q = 4 the joint path is not expected to save evaluations over the
 marginal one, whose initial count is 1 + 2·4·17 = 137; this measurement is
 of the mechanism, growth, check and parallel rounds, not of the saving,
 which needs a large-q estimand and waits for the demo.) Two runs of the joint path on that one draw, at 1 worker and at 8
