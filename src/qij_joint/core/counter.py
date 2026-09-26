@@ -54,3 +54,12 @@ class Counter:
     def snapshot(self) -> Tuple[int, int]:
         """Return (evaluations, rows) so far, for per-stage differencing."""
         return (self.evaluations, self.rows)
+
+    def add(self, evaluations: int, rows: int, failed: int) -> None:
+        """Account for evaluations a worker performed on `self`'s behalf
+        (parallelism contract rule 4): the parent calls this once per
+        task, with that task's own bookkeeping, in place of a direct
+        `__call__` it never made in this process."""
+        self.evaluations += evaluations
+        self.rows += rows
+        self.failed += failed

@@ -1,22 +1,25 @@
 """
 The initial influence estimate (spec/method_notes.md section 3): a
-per-coordinate Gaussian process with an affine mean and a Matern-3/2
-kernel through the pairs (w_j, I_j) in whitened coordinates,
+per-coordinate Gaussian process through the pairs (w_j, I_j) in
+whitened coordinates,
 
-    I_proto(w_j) = h(w_j)^T beta + f(w_j) + e_j,   f ~ GP(0, s^2 k_ell)
-    k_ell(r) = (1 + sqrt(3) r / ell) exp(-sqrt(3) r / ell)   (Matern 3/2)
-    e_j ~ N(0, s^2 lam)                                      (unweighted noise)
+    I_proto(w_j) = h(w_j)^T beta + f(w_j) + e_j,   f ~ GP(0, s^2 k)
+    e_j ~ N(0, s^2 lam)                             (unweighted noise)
 
-h(x) = (1, x) in whitened coordinates, constant-only when the design
-is too small for an affine basis. A failed prototype evaluation is a
-missing response, per coordinate: each coordinate is fitted only on
-the prototypes where its own I_proto column is finite, so non-constant
-coordinates are grouped by their shared finite design and the width
-search runs once per group.
+h(x) is the affine basis (1, x), or, under `gptrend='quadratic'`, the
+quadratic basis (1, x, {x_a x_b}_{a<=b}); constant-only when the design
+is too small for the requested basis. The kernel k is the Matern-3/2
+`_matern32` at one length ell shared by the whole group under
+`gpwidth='global'`, or the non-stationary `_matern32_nonstationary` at
+ell_j = c*h_j (h_j prototype j's local CONN spacing) under
+`gpwidth='local'`, one shared factor c per group. A failed prototype
+evaluation is a missing response, per coordinate: each coordinate is
+fitted only on the prototypes where its own I_proto column is finite,
+so non-constant coordinates are grouped by their shared finite design
+and the width (or c) search runs once per group.
 
-Width ell (per group) and the noise-to-signal ratio lam_c (per
-coordinate, floored from the stencil's own evaluation noise) are
-detailed in spec/method_notes.md section 3. `psi0`, `uncertainty` and
+The width/c search and the noise floor lam_c are detailed in
+spec/method_notes.md section 3. `psi0`, `uncertainty` and
 `bin_posterior_variance` query the same fitted posterior at the same N
 rows of Z, served from one cached pass per draw (`_point_terms`),
 through the group's shared eigendecomposition of the kernel rather
@@ -41,6 +44,7 @@ from scipy.spatial.distance import cdist
 from .differences import forward_step
 
 _SQRT3 = math.sqrt(3.0)
+_SQRT2 = math.sqrt(2.0)
 _LOG_LAM_LO = math.log(1e-10)  # the absolute floor
 _LOG_LAM_HI = math.log(1e2)
 _N_WIDTH_GRID = 5
@@ -94,7 +98,7 @@ class InfluenceModel:
     """
     The fitted initial influence estimate: one Gaussian process per
     estimand coordinate, sharing a whitening and, for the non-constant
-    coordinates, a common kernel width ell across whichever other
+    coordinates, a common kernel width across whichever other
     coordinates happen to share its design (spec/method_notes.md
     section 3).
 
@@ -104,28 +108,34 @@ class InfluenceModel:
     array holding that coordinate's own (possibly smaller) design.
     """
 
-    alpha: List[np.ndarray]       # per coordinate, (M_c,) GP weights on the kernel term; length 0 on the constant path
-    beta: List[np.ndarray]        # per coordinate, (m_c,) affine-mean coefficients; length 0 on the constant path
-    centers: List[np.ndarray]     # per coordinate, (M_c, d_z) whitened positions of that coordinate's finite prototypes
+    gptrend: str                   # 'affine' or 'quadratic' (method_notes section 3)
+    gpwidth: str                   # 'global' or 'local' (method_notes section 3)
+    alpha: List[np.ndarray]        # per coordinate, (M_c,) GP weights on the kernel term; length 0 on the constant path
+    beta: List[np.ndarray]         # per coordinate, (m_c,) mean-basis coefficients; length 0 on the constant path
+    centers: List[np.ndarray]      # per coordinate, (M_c, d_z) whitened positions of that coordinate's finite prototypes
+    h_design: List[Optional[np.ndarray]]  # per coordinate, (M_c,) that group's own CONN spacing h[idx_g] (gpwidth='local' only); None under 'global' and on the constant path
     whitening: Tuple[np.ndarray, np.ndarray]  # (mean, transform): raw Z -> whitened coordinates
-    width: np.ndarray             # (q,) Matern-3/2 length scale ell_c; NaN on the constant path
-    lam: np.ndarray               # (q,) profiled noise-to-signal ratio lam_c; NaN on the constant path
-    lam_floor: np.ndarray         # (q,) the declared-noise floor lam_floor,c at the final chosen ell; NaN on the constant path
-    s2: np.ndarray                # (q,) profiled GP signal variance s^2_c
-    at_bound: np.ndarray          # (q, 2) bool: (ell_c, lam_c) within 1% in log of its search bound
-    jitter: np.ndarray            # (q,) diagonal jitter added to A at the final solve; NaN on the constant path
-    constant_path: np.ndarray     # (q,) bool: coordinate has no usable spread in I_proto over its own finite design
-    const_value: np.ndarray       # (q,) the constant psi0 value returned on the constant path
-    m: np.ndarray                 # (q,) int, basis size per coordinate: 1 (constant only) or d_z + 1 (affine); 0 on the constant path
-    n_width_evals: np.ndarray     # (q,) number of shared outer-objective evaluations used to pick ell, within that coordinate's group
-    offset: np.ndarray            # (q,) mean of psi0 over Z (diagnostic; not subtracted from psi0)
-    ml_wall_time: np.ndarray      # (q,) wall time of the marginal-likelihood fit, per coordinate
-    median_sigma: np.ndarray      # (q,) median posterior sd (sigma) over Z
-    p95_sigma: np.ndarray         # (q,) 95th percentile posterior sd (sigma) over Z
-    chol_A: List[Optional[Tuple]]         # per coordinate, cho_factor of A = K_ell + lam_c*I (None on the constant path)
+    width: np.ndarray              # (q,) Matern-3/2 length scale ell_c under gpwidth='global'; NaN under 'local' and on the constant path
+    c: np.ndarray                  # (q,) fitted width factor under gpwidth='local' (ell_j = c*h_j, shared per group); NaN under 'global' and on the constant path
+    h: np.ndarray                  # (M_used,) per-prototype CONN spacing h_j, over every live prototype; NaN under gpwidth='global'
+    bmu: Optional[np.ndarray]      # (N,) best-matching prototype per data point, from xvq.bmu at fit time -- gives a query point its length scale under gpwidth='local'; None under 'global'
+    lam: np.ndarray                # (q,) profiled noise-to-signal ratio lam_c; NaN on the constant path
+    lam_floor: np.ndarray          # (q,) the declared-noise floor lam_floor,c at the final chosen width; NaN on the constant path
+    s2: np.ndarray                 # (q,) profiled GP signal variance s^2_c
+    at_bound: np.ndarray           # (q, 2) bool: (width parameter, lam_c) within 1% in log of its search bound; column 0 flags ell_c under 'global' or c under 'local'
+    jitter: np.ndarray             # (q,) diagonal jitter added to A at the final solve; NaN on the constant path
+    constant_path: np.ndarray      # (q,) bool: coordinate has no usable spread in I_proto over its own finite design
+    const_value: np.ndarray        # (q,) the constant psi0 value returned on the constant path
+    m: np.ndarray                  # (q,) int, basis size per coordinate: 1 (constant only), d_z+1 (affine) or 1+d_z+d_z(d_z+1)/2 (quadratic); 0 on the constant path
+    n_width_evals: np.ndarray      # (q,) number of shared outer-objective evaluations used to pick the width, within that coordinate's group
+    offset: np.ndarray             # (q,) mean of psi0 over Z (diagnostic; not subtracted from psi0)
+    ml_wall_time: np.ndarray       # (q,) wall time of the marginal-likelihood fit, per coordinate
+    median_sigma: np.ndarray       # (q,) median posterior sd (sigma) over Z
+    p95_sigma: np.ndarray          # (q,) 95th percentile posterior sd (sigma) over Z
+    chol_A: List[Optional[Tuple]]         # per coordinate, cho_factor of A = K + lam_c*I (None on the constant path)
     g_chol: List[Optional[Tuple]]         # per coordinate, cho_factor of G = Hb^T A^-1 Hb (None on the constant path)
     ainv_hb: List[Optional[np.ndarray]]   # per coordinate, A^-1 Hb, (M_c, m_c) (None on the constant path)
-    # Shared eigendecomposition K_ell = V Lambda V^T at the chosen width,
+    # Shared eigendecomposition K = V Lambda V^T at the chosen width,
     # one `eigh` per coordinate group (same three objects across a
     # group): k_eigval is Lambda clipped at 0, k_eigvec is V, hb_eig is
     # V^T Hb. None on the constant path.
@@ -161,13 +171,50 @@ def _matern32(r: np.ndarray, ell: float) -> np.ndarray:
     return (1.0 + s) * np.exp(-s)
 
 
+def _matern32_nonstationary(r: np.ndarray, ell_row: np.ndarray, ell_col: np.ndarray, d_z: int) -> np.ndarray:
+    """
+    Paciorek-Schervish non-stationary Matern-3/2 (method_notes
+    section 3): for whitened distance r between two locations of
+    lengths ell, ell',
+
+        k(r; ell, ell') = (2*ell*ell'/(ell^2+ell'^2))^(d_z/2)
+                          * kappa(r*sqrt(2)/sqrt(ell^2+ell'^2)),
+        kappa(t) = (1 + sqrt(3)*t) * exp(-sqrt(3)*t).
+
+    `r` is (n, m); `ell_row` (n,) and `ell_col` (m,) are the two
+    sides' length scales. Equals `_matern32(r, ell)` mathematically
+    when ell_row == ell_col == ell everywhere, not bit for bit --
+    gpwidth='global' evaluates `_matern32` itself for that reason.
+    """
+    ell_row = np.asarray(ell_row, dtype=float).reshape(-1, 1)
+    ell_col = np.asarray(ell_col, dtype=float).reshape(1, -1)
+    sum2 = ell_row ** 2 + ell_col ** 2
+    pref = (2.0 * ell_row * ell_col / sum2) ** (d_z / 2.0)
+    s = _SQRT3 * (r * _SQRT2 / np.sqrt(sum2))
+    return pref * (1.0 + s) * np.exp(-s)
+
+
+def _conn_spacing(conn, D_full: np.ndarray) -> np.ndarray:
+    """
+    h_j = median over live prototype j's CONN neighbours of the
+    whitened distance ||z_j - z_k|| (method_notes section 3):
+    every live prototype has at least one CONN neighbour, so no floor,
+    no minimum degree, no fallback. `conn` is the (M, M) symmetrized
+    CADJ graph on the same M prototypes as `D_full`.
+    """
+    mask = np.asarray(conn.toarray(), dtype=bool)
+    np.fill_diagonal(mask, False)
+    return np.nanmedian(np.where(mask, D_full, np.nan), axis=1)
+
+
 def _matern32_self_sum_1d(x: np.ndarray, ell: float) -> float:
     """
     sum_{i,j} k_ell(|x_i - x_j|) over one bin's OWN points, for a
     one-dimensional design, in O(n log n) via running sums over the
-    sorted points rather than the O(n^2) pairwise sum
-    (spec/method_notes.md section 3 derives the recursion). The origin
-    is re-based every `_SELF_SUM_LOG_RANGE`/c points so no exponential
+    sorted points (spec/method_notes.md section 3 derives the
+    recursion) rather than the O(n^2) pairwise sum -- a shortcut valid
+    only for this STATIONARY kernel (gpwidth='global'). The origin is
+    re-based every `_SELF_SUM_LOG_RANGE`/c points so no exponential
     overflows; the carried running sums are exact across a rebase, so
     no pair is dropped or approximated -- only the summation order
     differs from the pairwise form.
@@ -219,13 +266,19 @@ def _matern32_self_sum_1d(x: np.ndarray, ell: float) -> float:
 
 
 def _basis(Zw: np.ndarray, m: int) -> np.ndarray:
-    """h(x) = (1, x) in whitened coordinates (m = d_z + 1), or the
-    constant basis (m = 1) when the design is too small for the affine
-    basis."""
-    N = Zw.shape[0]
+    """
+    h(x) in whitened coordinates (method_notes section 3): the
+    constant basis (m = 1, also the small-design fallback for either
+    trend), the affine basis (1, x) at m = d_z + 1, or the quadratic
+    basis (1, x, {x_a x_b}_{a<=b}) at m = 1 + d_z + d_z(d_z+1)/2.
+    """
+    N, d_z = Zw.shape
     if m == 1:
         return np.ones((N, 1), dtype=float)
-    return np.hstack([np.ones((N, 1), dtype=float), Zw])
+    if m == d_z + 1:
+        return np.hstack([np.ones((N, 1), dtype=float), Zw])
+    quad = np.stack([Zw[:, a] * Zw[:, b] for a in range(d_z) for b in range(a, d_z)], axis=1)
+    return np.hstack([np.ones((N, 1), dtype=float), Zw, quad])
 
 
 def _length_scale_bounds(conn, D_full: np.ndarray) -> Tuple[float, float]:
@@ -236,7 +289,9 @@ def _length_scale_bounds(conn, D_full: np.ndarray) -> Tuple[float, float]:
     every prototype coincides. ell_max = 10x the largest
     inter-prototype distance, forced to 10x ell_min if that is not
     larger than ell_min. `conn`/`D_full` are taken over whichever
-    design is in play (a coordinate group's own finite subset).
+    design is in play (a coordinate group's own finite subset); under
+    gpwidth='local' these same two bounds are converted to the bounds
+    on c (method_notes section 3) rather than searched directly.
     """
     M = D_full.shape[0]
     iu = np.triu_indices(M, k=1)
@@ -303,7 +358,7 @@ def _floor_equation(log_lam: float, z: np.ndarray, Lambda: np.ndarray, M_minus_m
 def _lambda_floor(z: np.ndarray, Lambda: np.ndarray, M_minus_m: int, n_c2: float) -> float:
     """
     The declared-noise floor lam_floor,c for one coordinate at one
-    candidate ell (spec section 3): the unique root of
+    candidate width (spec section 3): the unique root of
     lam*s_c^2(lam) = n_c2 in log lam, found by one `brentq` call, since
     `_floor_equation` is increasing in lam. Pinned to the search
     domain's own edges, [1e-10, 1e2], when the root falls outside it:
@@ -323,14 +378,18 @@ def _lambda_floor(z: np.ndarray, Lambda: np.ndarray, M_minus_m: int, n_c2: float
 
 def fit_influence_model(
     Z: np.ndarray, xvq, I_proto: np.ndarray, theta_Q: np.ndarray, eta: float,
+    gptrend: str = 'affine', gpwidth: str = 'global',
 ) -> InfluenceModel:
     """
     The initial influence estimate for every estimand coordinate
     (spec/method_notes.md section 3): Gaussian-process regression with
-    an affine mean and a Matern-3/2 kernel. `xvq.p` and `theta_Q` are
-    used for the constant-response threshold and, with `eta`, for the
-    declared noise floor on lam_c; the kernel-regression noise itself
-    is unweighted.
+    a mean basis set by `gptrend` ('affine' or 'quadratic') and a
+    Matern-3/2 kernel whose width is either one shared ell per group
+    (`gpwidth='global'`) or a per-prototype length
+    ell_j = c*h_j at one shared factor c per group (`gpwidth='local'`).
+    `xvq.p` and `theta_Q` are used for the constant-response threshold
+    and, with `eta`, for the declared noise floor on lam_c; the
+    kernel-regression noise itself is unweighted.
 
     A prototype whose evaluation failed for coordinate c is a missing
     response: coordinate c's design is exactly the prototypes where
@@ -358,6 +417,14 @@ def fit_influence_model(
     mean, transform = _whitening_from(Z)
     centers_full = (raw_centers - mean) @ transform.T
 
+    if gpwidth == 'local':
+        D_proto_full = cdist(centers_full, centers_full)
+        h_full = _conn_spacing(xvq.conn, D_proto_full)
+        bmu_full = np.asarray(xvq.bmu, dtype=np.intp).copy()
+    else:
+        h_full = np.full(M_X_used, np.nan, dtype=float)
+        bmu_full = None
+
     finite = np.isfinite(I_proto)  # (M_X_used, q)
 
     constant_path = np.zeros(q, dtype=bool)
@@ -366,9 +433,11 @@ def fit_influence_model(
     m_arr = np.zeros(q, dtype=int)
 
     centers: List[np.ndarray] = [np.empty((0, d_z), dtype=float)] * q
+    h_design: List[Optional[np.ndarray]] = [None] * q
     alpha: List[np.ndarray] = [np.empty(0, dtype=float)] * q
     beta: List[np.ndarray] = [np.empty(0, dtype=float)] * q
     width = np.full(q, np.nan, dtype=float)
+    c_arr = np.full(q, np.nan, dtype=float)
     lam = np.full(q, np.nan, dtype=float)
     lam_floor = np.full(q, np.nan, dtype=float)
     s2 = np.zeros(q, dtype=float)
@@ -416,17 +485,43 @@ def fit_influence_model(
         else:
             groups.setdefault(tuple(idx_c.tolist()), []).append(c)
 
+    # The requested basis size for the trend in use; the small-design
+    # fallback (m_g = 1) applies whenever a group's own finite design
+    # cannot support it (method_notes section 3).
+    m_full = (d_z + 1) if gptrend == 'affine' else (1 + d_z + d_z * (d_z + 1) // 2)
+
     for idx_key, cols_g in groups.items():
         idx_g = np.asarray(idx_key, dtype=np.intp)
         M_g = idx_g.size
         centers_g = centers_full[idx_g]
-        m_g = 1 if M_g <= d_z + 2 else d_z + 1
+        m_g = 1 if M_g <= m_full + 1 else m_full
         Hb_g = _basis(centers_g, m_g)
 
         D_full_g = cdist(centers_g, centers_g)
         conn_g = xvq.conn[idx_g, :][:, idx_g]
         ell_min, ell_max = _length_scale_bounds(conn_g, D_full_g)
-        grid_log_ell = np.linspace(math.log(ell_min), math.log(ell_max), _N_WIDTH_GRID)
+
+        # The outer search runs over ell directly under 'global'
+        # (`kernel_at` an exact alias of `_matern32`), or over c under
+        # 'local': its bounds carried from ell_min,
+        # ell_max via this group's own prototypes' CONN spacing, so
+        # c_min is about 1 (spec section 3).
+        if gpwidth == 'global':
+            param_min, param_max = ell_min, ell_max
+            h_design_g = None
+
+            def kernel_at(param: float, _D=D_full_g) -> np.ndarray:
+                return _matern32(_D, param)
+        else:
+            h_design_g = h_full[idx_g]
+            param_min = ell_min / float(np.median(h_design_g))
+            param_max = ell_max / float(np.min(h_design_g))
+
+            def kernel_at(param: float, _D=D_full_g, _h=h_design_g, _dz=d_z) -> np.ndarray:
+                ell_vec = param * _h
+                return _matern32_nonstationary(_D, ell_vec, ell_vec, _dz)
+
+        grid_log_param = np.linspace(math.log(param_min), math.log(param_max), _N_WIDTH_GRID)
 
         Qfull, _R = np.linalg.qr(Hb_g, mode='complete')
         Q = Qfull[:, m_g:]
@@ -434,10 +529,10 @@ def fit_influence_model(
 
         Qt_psi = {c: Q.T @ I_proto[idx_g, c] for c in cols_g}
 
-        # A_ell = (I-P) K_ell (I-P) + tau P, P = W W^T, gives the same
-        # spectrum as Q^T K_ell Q in O(m_g M_g^2) rather than two
-        # M_g x M_g matmuls, with the m_g structural eigenvalues shifted
-        # above the kernel's own (derivation: spec/method_notes.md
+        # A_param = (I-P) K_param (I-P) + tau*P, P = W W^T, gives the
+        # same spectrum as Q^T K_param Q in O(m_g M_g^2) rather than
+        # two M_g x M_g matmuls, with the m_g structural eigenvalues
+        # shifted above the kernel's own (derivation: spec/method_notes.md
         # section 3).
         W_g = Qfull[:, :m_g]
         tau_g = 2.0 * float(M_g)
@@ -445,14 +540,14 @@ def fit_influence_model(
 
         # Declared noise floor, per coordinate in this group: n_c^2 =
         # 2*eta^2*theta_Q,c^2 * median_j(1/t_j^2) over the group's own
-        # finite design, independent of ell so computed once per group.
+        # finite design, independent of the width so computed once per group.
         p_g = p[idx_g]
         t_g = delta_f * p_g / (1.0 - p_g)
         inv_t2_median_g = float(np.median(1.0 / t_g ** 2))
         n_c2_g = {c: 2.0 * eta ** 2 * float(theta_Q[c]) ** 2 * inv_t2_median_g for c in cols_g}
 
-        # Joint outer search over log ell, within this group: one
-        # kernel and one eigendecomposition of Q^T K_ell Q per width,
+        # Joint outer search over log(width), within this group: one
+        # kernel and one eigendecomposition of Q^T K Q per candidate,
         # shared across the group; each coordinate profiles its own
         # lam_c from that shared eigendecomposition, and the outer
         # objective is the SUM of the group's per-coordinate profiled
@@ -460,11 +555,11 @@ def fit_influence_model(
         t_shared0 = time.perf_counter()
         trace: List[dict] = []
 
-        def outer_obj(log_ell: float, _trace=trace, _cols_g=cols_g,
-                       _psi_proj=psi_proj, _W=W_g, _tau=tau_g, _D_full=D_full_g,
-                       _M_minus_m=M_minus_m, _n_c2=n_c2_g) -> float:
-            ell = math.exp(log_ell)
-            K = _matern32(_D_full, ell)
+        def outer_obj(log_param: float, _trace=trace, _cols_g=cols_g,
+                       _psi_proj=psi_proj, _W=W_g, _tau=tau_g,
+                       _M_minus_m=M_minus_m, _n_c2=n_c2_g, _kernel_at=kernel_at) -> float:
+            param = math.exp(log_param)
+            K = _kernel_at(param)
             C = _W.T @ K                      # (m_g, M_g)
             E = C @ _W                        # (m_g, m_g)
             E[np.diag_indices_from(E)] += _tau
@@ -486,7 +581,7 @@ def fit_influence_model(
                     return (_M_minus_m / 2.0) * math.log(s2_val) + 0.5 * np.sum(np.log(denom))
 
                 # The search for lam_c is bounded below by lam_floor,c
-                # at THIS candidate ell (Lambda, z both depend on ell).
+                # at THIS candidate width (Lambda, z both depend on it).
                 lam_floor_c = _lambda_floor(z, Lambda, _M_minus_m, _n_c2[c])
                 lo_bound = max(math.log(lam_floor_c), _LOG_LAM_LO)
                 if lo_bound >= _LOG_LAM_HI:
@@ -501,24 +596,25 @@ def fit_influence_model(
                 per_c[c] = dict(log_lam=log_lam_star, nll=nll_c, lam_floor=lam_floor_c)
                 total_nll += nll_c
 
-            _trace.append(dict(log_ell=log_ell, ell=ell, K=K, per_c=per_c, nll=total_nll))
+            _trace.append(dict(log_param=log_param, param=param, K=K, per_c=per_c, nll=total_nll))
             return total_nll
 
-        for le in grid_log_ell:
-            outer_obj(float(le))
+        for lp in grid_log_param:
+            outer_obj(float(lp))
 
         grid_nlls = [t['nll'] for t in trace[:_N_WIDTH_GRID]]
         best_idx = int(np.argmin(grid_nlls))
         # Skip the bounded refinement when the best grid point is the
-        # upper endpoint: past about ell_max the kernel family collapses
-        # and ell is not identified there (spec/method_notes.md section
-        # 3). The lower endpoint keeps the refinement.
+        # upper endpoint: past about the upper bound the kernel family
+        # collapses and the width is not identified there (spec/
+        # method_notes.md section 3). The lower endpoint keeps the
+        # refinement.
         if best_idx == _N_WIDTH_GRID - 1:
             lo = hi = None
         elif best_idx == 0:
-            lo, hi = grid_log_ell[0], grid_log_ell[1]
+            lo, hi = grid_log_param[0], grid_log_param[1]
         else:
-            lo, hi = grid_log_ell[best_idx - 1], grid_log_ell[best_idx + 1]
+            lo, hi = grid_log_param[best_idx - 1], grid_log_param[best_idx + 1]
 
         if lo is not None and hi > lo:
             minimize_scalar(outer_obj, bounds=(float(lo), float(hi)), method='bounded')
@@ -528,7 +624,7 @@ def fit_influence_model(
         t_shared_total = time.perf_counter() - t_shared0
         t_shared_share = t_shared_total / len(cols_g)
 
-        ell_c = best['ell']
+        param_val = best['param']
         K_c = best['K']
 
         # The group's shared eigendecomposition of K: one `eigh` of the
@@ -562,15 +658,19 @@ def fit_influence_model(
 
             # denom_m = M_g - m_g is always > 0 here: every coordinate
             # in this group left the constant path, which requires
-            # M_g >= 3, and m_g is 1 (M_g <= d_z+2) or d_z+1
-            # (M_g > d_z+2) -- either way M_g - m_g >= 2.
+            # M_g >= 3, and m_g is 1 (M_g <= m_full+1) or m_full
+            # (M_g > m_full+1) -- either way M_g - m_g >= 2.
             denom_m = M_g - m_g
             resid_quad = float(psi_c @ Ainv_psi - u_vec @ beta_c)
             s2_c = max(resid_quad, 0.0) / denom_m
 
             centers[c] = centers_g
+            h_design[c] = h_design_g
             m_arr[c] = m_g
-            width[c] = ell_c
+            if gpwidth == 'global':
+                width[c] = param_val
+            else:
+                c_arr[c] = param_val
             lam[c] = lam_c
             lam_floor[c] = lam_floor_final
             s2[c] = s2_c
@@ -578,7 +678,7 @@ def fit_influence_model(
             alpha[c] = alpha_c
             beta[c] = beta_c
             n_width_evals[c] = n_shared_evals
-            at_bound[c, 0] = _within_1pct_log(ell_c, ell_min, ell_max)
+            at_bound[c, 0] = _within_1pct_log(param_val, param_min, param_max)
             # lam_c's own search bound is [max(lam_floor_final, 1e-10),
             # 1e2], not the fixed [1e-10, 1e2]: the declared floor,
             # when active, moves the lower edge.
@@ -594,11 +694,17 @@ def fit_influence_model(
             ml_wall_time[c] = t_shared_share + (time.perf_counter() - t0)
 
     model = InfluenceModel(
+        gptrend=gptrend,
+        gpwidth=gpwidth,
         alpha=alpha,
         beta=beta,
         centers=centers,
+        h_design=h_design,
         whitening=(mean, transform),
         width=width,
+        c=c_arr,
+        h=h_full,
+        bmu=bmu_full,
         lam=lam,
         lam_floor=lam_floor,
         s2=s2,
@@ -657,7 +763,11 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     `uncertainty` and `bin_posterior_variance` read instead of
     recomputing. psi0 and sigma are produced together because they
     share the kernel rows k(x_i, w_j), which every caller asks for on
-    every draw.
+    every draw. Under `gpwidth='local'` those rows come from
+    `_matern32_nonstationary` at each query row's own length scale
+    c*h[bmu_i] (`model.bmu`, set at fit time) against the design's
+    c*h_design; under 'global' from `_matern32` at the group's shared
+    ell.
     """
     cached = model._points
     if cached is not None and cached.Z is Z:
@@ -669,6 +779,7 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     mean, transform = model.whitening
     Zw = (Za - mean) @ transform.T
     N = Zw.shape[0]
+    d_z = Zw.shape[1]
     q = len(model.centers)
 
     psi0_out = np.empty((N, q), dtype=float)
@@ -694,11 +805,15 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
         c0 = cols[0]
         centers_g = model.centers[c0]
         M_g = centers_g.shape[0]
-        ell_g = float(model.width[c0])
         m_g = int(model.m[c0])
         V_K = model.k_eigvec[c0]
         Lambda_K = model.k_eigval[c0]
         HbV_g = model.hb_eig[c0]
+        if model.gpwidth == 'global':
+            ell_g = float(model.width[c0])
+        else:
+            c_val_g = float(model.c[c0])
+            h_col_g = c_val_g * model.h_design[c0]
 
         # Per-coordinate constants of the eigen form: w_c = 1 /
         # (Lambda + lam_c + jit_c) is A_c^-1's spectrum, and B_c =
@@ -720,7 +835,11 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
             sl = slice(start, start + batch)
             Zc = Zw[sl]
             Hc = _basis(Zc, m_g)
-            Kc = _matern32(cdist(Zc, centers_g), ell_g)  # (nb, M_g)
+            if model.gpwidth == 'global':
+                Kc = _matern32(cdist(Zc, centers_g), ell_g)  # (nb, M_g)
+            else:
+                ell_row = c_val_g * model.h[model.bmu[sl]]
+                Kc = _matern32_nonstationary(cdist(Zc, centers_g), ell_row, h_col_g, d_z)
 
             for c in cols:
                 psi0_out[sl, c] = Hc @ model.beta[c] + Kc @ model.alpha[c]
@@ -818,10 +937,12 @@ def bin_posterior_variance(
     cached; `s` is accumulated over the group's rows in chunks of at
     most 2048, from the cached kernel rows when available. `SS_k` is
     the one term no cache removes -- a sum of raw kernel values between
-    the bin's OWN points: `_matern32_self_sum_1d` gets it in
-    O(n_k log n_k) for a one-dimensional design; in two dimensions or
-    more the pairwise double sum stands, chunked on both sides so no
-    block larger than 2048 x 2048 is ever materialized.
+    the bin's OWN points. Under `gpwidth='global'` in one dimension,
+    `_matern32_self_sum_1d` gets it in O(n_k log n_k) (a shortcut valid
+    only for that stationary kernel); otherwise, and always under
+    `gpwidth='local'` (the kernel is non-stationary, so no running-sum
+    shortcut applies), the pairwise double sum stands, chunked on both
+    sides so no block larger than 2048 x 2048 is ever materialized.
 
     `s^T A^-1 s` is taken through the group's shared eigendecomposition
     (never a Cholesky solve of A_c): v_k is a difference of two nearly
@@ -840,21 +961,32 @@ def bin_posterior_variance(
 
     terms = _point_terms(model, Z)
     Zw_full = terms.Zw
+    d_z = Zw_full.shape[1]
     R_full = terms.R[c]
     K_full = terms.K[c]
     sigma_c = np.asarray(sigma_c, dtype=float)
 
-    ell_c = float(model.width[c])
     s2_c = float(model.s2[c])
     g_chol_c = model.g_chol[c]
     centers_c = model.centers[c]
     M = centers_c.shape[0]
     V_K = model.k_eigvec[c]
     w_c = 1.0 / (model.k_eigval[c] + float(model.lam[c]) + float(model.jitter[c]))
+
+    is_local = model.gpwidth == 'local'
+    if is_local:
+        c_val = float(model.c[c])
+        h_col = c_val * model.h_design[c]
+        bmu = model.bmu
+        ell_c = None
+    else:
+        ell_c = float(model.width[c])
+        c_val = h_col = bmu = None
+
     # A one-dimensional design takes SS_k from the sorted running sums
-    # instead of the pairwise double sum. In two dimensions or more the
-    # pairwise path stands.
-    one_dim = Zw_full.shape[1] == 1
+    # instead of the pairwise double sum, but only for the stationary
+    # kernel: under 'local' the pairwise path always stands.
+    one_dim = (d_z == 1) and not is_local
 
     for gi, idx in enumerate(groups):
         idx = np.asarray(idx)
@@ -868,6 +1000,7 @@ def bin_posterior_variance(
 
         s_vec = np.zeros(M, dtype=float)
         SS_k = _matern32_self_sum_1d(Zw_k[:, 0], ell_c) if one_dim else 0.0
+        ell_row_bin = c_val * model.h[bmu[idx]] if is_local else None
 
         for start in range(0, n_k, _BPV_CHUNK):
             sl = slice(start, start + _BPV_CHUNK)
@@ -875,6 +1008,8 @@ def bin_posterior_variance(
 
             if K_full is not None:
                 Kc = K_full[idx[sl]]  # (nb, M), the rows already formed
+            elif is_local:
+                Kc = _matern32_nonstationary(cdist(Zc, centers_c), ell_row_bin[sl], h_col, d_z)
             else:
                 Kc = _matern32(cdist(Zc, centers_c), ell_c)  # (nb, M)
 
@@ -885,7 +1020,10 @@ def bin_posterior_variance(
             for start2 in range(0, n_k, _BPV_CHUNK):
                 sl2 = slice(start2, start2 + _BPV_CHUNK)
                 Dcc = cdist(Zc, Zw_k[sl2])
-                Kcc = _matern32(Dcc, ell_c)
+                if is_local:
+                    Kcc = _matern32_nonstationary(Dcc, ell_row_bin[sl], ell_row_bin[sl2], d_z)
+                else:
+                    Kcc = _matern32(Dcc, ell_c)
                 SS_k += float(Kcc.sum())
 
         R_vec = R_full[idx].sum(axis=0)

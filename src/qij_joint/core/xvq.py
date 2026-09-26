@@ -1,14 +1,14 @@
 """
 The X-VQ: quantize the data, then measure the influence at each
-prototype by forward differences (spec/method_notes.md section 2).
-`fit_xvq` fits the codebook (no estimator evaluations); `prototype_
-influences` evaluates T once on the prototypes for theta_Q, then one
-forward difference per prototype; `run_xvq` is stage 1 in full.
+prototype by forward differences (spec/method_notes.md section 2),
+`prototype_influences`' per-prototype step run through `pool` when
+given (method_notes section 2). `run_xvq` is stage 1 in full.
 """
 
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable, Tuple
 
@@ -21,6 +21,11 @@ _KAPPA_REF = 2.7
 # Row batch for the second-BMU repair: bounds the (rows, M_used)
 # distance block at tens of megabytes rather than gigabytes at large N.
 _BMU2_BATCH_CAP = 4096
+
+# Per-process, per-draw `prepare(W_X)` cache, keyed on identity --
+# `bootstrap._boot_task`'s pattern, since every survey task shares W_X.
+_prep_W_X = None
+_prep_value = None
 
 
 @dataclass
@@ -44,10 +49,9 @@ def cost_rule_M(N: int, q: int, eps: float) -> int:
 
 
 def fit_xvq(Z: np.ndarray, M: int, seed: int) -> XVQ:
-    """k-means on Z via `vqlp.VQFitter`, empty receptive fields dropped
-    (M_used <= M), first/second best-matching units and the CADJ
-    adjacency reindexed into the live prototype space. No estimator
-    evaluation."""
+    """k-means on Z via `vqlp.VQFitter`; empty receptive fields dropped
+    (M_used <= M), BMUs and CADJ reindexed to the live prototypes. No
+    estimator evaluation."""
     Z = np.asarray(Z, dtype=float)
     N = Z.shape[0]
 
@@ -79,10 +83,9 @@ def fit_xvq(Z: np.ndarray, M: int, seed: int) -> XVQ:
 
 
 def _resolve_bmu2(Z: np.ndarray, centers: np.ndarray, bmu: np.ndarray, bmu2: np.ndarray) -> np.ndarray:
-    """`bmu2` is -1 wherever the second-BMU pointed at a prototype
-    dropped as empty; repair to the nearest LIVE prototype other than
-    `bmu`, batched over rows so the (rows, M_used) distance block stays
-    bounded even when most points need repair."""
+    """Repair `bmu2 < 0` (its live prototype was dropped) to the nearest
+    LIVE prototype other than `bmu`, batched over rows so the
+    (rows, M_used) distance block stays bounded."""
     bmu2 = np.array(bmu2, dtype=int, copy=True)
     missing = bmu2 < 0
     if not missing.any():
@@ -102,28 +105,74 @@ def _resolve_bmu2(Z: np.ndarray, centers: np.ndarray, bmu: np.ndarray, bmu2: np.
     return bmu2
 
 
-def prototype_influences(W_X: np.ndarray, counter, p: np.ndarray, eta: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    theta_Q = T(W_X, M_used*p) once; then for each prototype j, one
-    forward-differenced evaluation at t_j = step_parameter(delta_f,
-    p_j), delta_f = forward_step(eta), mass-centred over the finite
-    prototypes (spec/method_notes.md section 2). 1 + M_used evaluations
-    of `counter` on M_used rows.
-    """
+def _survey_task(T, case, W_X: np.ndarray, task):
+    """One task: evaluate T at prototype j's perturbed weights against
+    the shared W_X, `T.prepare` cached per process (method_notes
+    section 2). A failing evaluation is caught here, this task's own
+    declared failure boundary. Returns (j, raw evaluation, failure
+    flag, this call's own wall time)."""
+    global _prep_W_X, _prep_value
+    j, omega = task
+    prep = None
+    if hasattr(T, 'prepare'):
+        if W_X is not _prep_W_X:
+            _prep_value = T.prepare(W_X)
+            _prep_W_X = W_X
+        prep = _prep_value
+    t0 = time.perf_counter()
+    try:
+        result = T(W_X, omega, prep=prep) if prep is not None else T(W_X, omega)
+        result = np.asarray(result, dtype=float)
+        failed = bool(np.any(np.isnan(result)))
+    except Exception:
+        result = np.full(len(T.outputs), np.nan)
+        failed = True
+    return j, result, failed, time.perf_counter() - t0
+
+
+def _step_prototype(omega0: np.ndarray, p: np.ndarray, delta_f: float, j: int) -> Tuple[float, np.ndarray]:
+    """t_j = step_parameter(delta_f, p_j) and omega0 perturbed at prototype j alone."""
+    member = np.zeros(len(p), dtype=bool)
+    member[j] = True
+    t_j = step_parameter(delta_f, float(p[j]))
+    omega = perturbed_weights(omega0, member, t_j)
+    return t_j, omega
+
+
+def prototype_influences(
+    W_X: np.ndarray, counter, p: np.ndarray, eta: float, pool=None,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """theta_Q = T(W_X, M_used*p) once, then one forward difference per
+    prototype at t_j = step_parameter(delta_f, p_j), on `pool` when
+    given, mass-centred over the finite prototypes (spec/method_
+    notes.md section 2). `busy_delta` is 0 with `pool=None`, else the
+    tasks' summed wall time less `pool.map`'s own wall clock."""
     M_used = len(p)
     omega0 = M_used * p
     delta_f = forward_step(eta)
-
     theta_Q = np.asarray(counter(W_X, omega0), dtype=float)
     q = theta_Q.shape[0]
 
     I_proto = np.empty((M_used, q), dtype=float)
-    for j in range(M_used):
-        member = np.zeros(M_used, dtype=bool)
-        member[j] = True
-        t_j = step_parameter(delta_f, float(p[j]))
-        omega = perturbed_weights(omega0, member, t_j)
-        I_proto[j] = (counter(W_X, omega) - theta_Q) / t_j
+    busy_delta = 0.0
+    if pool is None:
+        for j in range(M_used):
+            t_j, omega = _step_prototype(omega0, p, delta_f, j)
+            I_proto[j] = (counter(W_X, omega) - theta_Q) / t_j
+    else:
+        pool.share(W_X)
+        t_j = np.empty(M_used, dtype=float)
+        tasks = []
+        for j in range(M_used):
+            t_j[j], omega = _step_prototype(omega0, p, delta_f, j)
+            tasks.append((j, omega))
+        t_map0 = time.perf_counter()
+        results = pool.map(_survey_task, tasks)
+        busy_delta = -(time.perf_counter() - t_map0)
+        for j, result, failed, wall in results:
+            I_proto[j] = (result - theta_Q) / t_j[j]
+            counter.add(1, M_used, int(failed))
+            busy_delta += wall
 
     # A failed evaluation at a prototype is a missing response: centre
     # over the finite prototypes only, mass-weighted, per coordinate (a
@@ -133,16 +182,18 @@ def prototype_influences(W_X: np.ndarray, counter, p: np.ndarray, eta: float) ->
     mass = np.sum(np.where(finite, p[:, None], 0.0), axis=0)
     psi_bar = np.sum(np.where(finite, p[:, None] * I_proto, 0.0), axis=0) / mass
     I_proto -= psi_bar[None, :]
-    return theta_Q, I_proto
+    return theta_Q, I_proto, busy_delta
 
 
 def run_xvq(
-    Z: np.ndarray, inverse: Callable[[np.ndarray], np.ndarray], counter, eta: float, M: int, seed: int,
-) -> Tuple[XVQ, np.ndarray, np.ndarray]:
+    Z: np.ndarray, inverse: Callable[[np.ndarray], np.ndarray], counter, eta: float,
+    M: int, seed: int, pool=None,
+) -> Tuple[XVQ, np.ndarray, np.ndarray, float]:
     """Stage 1 in full: fit the codebook on Z, map its prototypes to
-    T's native coordinates with `inverse`, and measure the prototype
-    influences. The only function in `core/` that calls `inverse`."""
+    T's native coordinates with `inverse`, and survey them, on `pool`
+    when given (method_notes section 2). The only function in `core/`
+    that calls `inverse`."""
     xvq = fit_xvq(Z, M, seed)
     W_X = inverse(xvq.centers)
-    theta_Q, I_proto = prototype_influences(W_X, counter, xvq.p, eta)
-    return xvq, theta_Q, I_proto
+    theta_Q, I_proto, busy_delta = prototype_influences(W_X, counter, xvq.p, eta, pool)
+    return xvq, theta_Q, I_proto, busy_delta

@@ -61,37 +61,93 @@ over the finite prototypes only, and a prototype left NaN by its own
 evaluation stays NaN, neither filled in nor dropped, since a vector
 estimator can fail one output and not another at the same prototype.
 
-## 3. The influence model: width search and noise floor
+**The prototype count as an argument.** `QIJ(M_X=...)` replaces the rule
+above when given; the result records `M_X_source`, `'rule'` or
+`'argument'`.
+
+**The survey on a pool.** With a pool, the M_used per-prototype forward
+differences are pool tasks; the base evaluation theta_Q stays in the
+parent. W_X is shared with the workers once per draw; each task carries
+its prototype index and perturbed weights, computed by the parent, and
+returns the raw evaluation, a failure flag and its own wall time. The
+parent assembles I_j in prototype order and adds each task's evaluation,
+rows and failure to the counter, so I_proto and every count are the same
+at any worker count. A worker computes `T.prepare(W_X)` once per draw.
+`busy_time_total` replaces the pool's elapsed time within the survey by
+the tasks' summed wall times; without a pool it equals the elapsed total.
+
+## 3. The influence model: trend, width search and noise floor
 
 Per output c, a Gaussian process through that output's finite
-prototypes: I_j = h(w_j)^T beta + f(w_j) + e_j, h(x) = (1, x) in
-whitened coordinates (constant-only when the finite design has at most
-d_z + 2 points), f ~ GP(0, s^2 k_ell) with the Matern-3/2 kernel,
+prototypes: I_j = h(w_j)^T beta + f(w_j) + e_j, f ~ GP(0, s^2 k),
 e_j ~ N(0, s^2 lam) homoscedastic. Non-constant coordinates are grouped
-by shared finite design so the width search runs once per group.
+by shared finite design so the width (or c) search runs once per
+group.
 
-**Width search.** ell is shared by every output in a group, searched
-on [ell_min, ell_max] (ell_min the median whitened distance between
-CONN-connected prototypes, ell_max ten times the largest
-inter-prototype distance): five log-spaced candidates, then one
-bounded refinement between the best grid point's neighbours, SKIPPED
-when the best grid point is the upper endpoint. With the affine mean
-projected out (Q, an orthonormal basis of its complement), the
-Matern-3/2 expansion loses its constant and quadratic terms exactly,
-so past about ell_max the family collapses to one fixed kernel (the
-r^3 polyharmonic spline); ell is not identified there and the
-refinement would only climb a shallow log-determinant tilt. The outer
-objective at each candidate ell is the sum, over the group's outputs,
-of the profiled restricted negative log marginal likelihood, computed
-from one shared eigendecomposition of the projected kernel per
-candidate width: Q^T K_ell Q's spectrum comes out of
-A_ell = (I-P) K_ell (I-P) + tau*P (P = W W^T, W spanning the affine
-mean, I-P = Q Q^T) in O(m_g M_g^2) rather than the O(M_g^3) of forming
-Q^T K_ell Q directly, since A_ell's range-Q eigenpairs are exactly
-those of Q^T K_ell Q and its range-P eigenvalues are tau repeated m_g
-times; tau = 2*M_g puts the m_g structural eigenvalues above every
-eigenvalue of Q^T K_ell Q (which lies in [0, M_g] since k(0) = 1), so
-`eigh`'s first M-m pairs are the ones profiling needs.
+**Trend.** h(x) is the affine basis (1, x) under `gptrend='affine'`,
+or the quadratic basis (1, x, {x_a x_b}_{a<=b}) under
+`gptrend='quadratic'`, both in whitened coordinates; m, the basis
+size, is d_z+1 (affine) or 1+d_z+d_z(d_z+1)/2 (quadratic). Constant-
+only (m=1) when the finite design has at most m+1 points, m the size
+of the REQUESTED basis for the trend in use.
+
+**The kernel.** Under `gpwidth='global'` k is the stationary
+Matern-3/2, k_ell(r) = (1 + sqrt(3) r/ell) exp(-sqrt(3) r/ell), one
+ell shared by every output in the group. Under `gpwidth='local'` k is
+the non-stationary Paciorek-Schervish kernel: for two locations of
+lengths ell, ell' at whitened distance r,
+
+    k(r; ell, ell') = (2*ell*ell' / (ell^2+ell'^2))^(d_z/2)
+                      * kappa( r*sqrt(2) / sqrt(ell^2+ell'^2) ),
+    kappa(t) = (1 + sqrt(3)*t) * exp(-sqrt(3)*t),
+
+d_z the dimension of the GP's input z (equal to d_x unless a
+`vq_transform` changes it). This equals k_ell(r) mathematically when
+ell = ell', but not bit-equal to it, since sqrt(2)/sqrt(2*ell^2) is
+not bit-equal to 1/ell -- `gpwidth='global'` evaluates k_ell itself
+for that reason, so its results do not depend on the local-width code.
+
+**Local spacing.** Under `gpwidth='local'`, live prototype j's length
+is ell_j = c*h_j, one factor c shared by the group, h_j the median
+over j's CONN neighbours k (CONN, the symmetrized CADJ graph on live
+prototypes) of the whitened distance ||z_j - z_k||. Every live
+prototype has at least one CONN neighbour, so h_j is defined
+everywhere: no floor, no minimum degree, no fallback (with one
+neighbour the median is that distance). h is computed once, over
+every live prototype (not per group), so a group's own h_j values are
+a slice of it. A query point (a data point at any of fit, prediction
+or bin-variance time) takes the length of its best-matching prototype,
+ell(x) = ell_{bmu(x)}; the model stores bmu at fit time, since every
+query in this package is at the draw's own N points.
+
+**Width/c search.** Searched jointly for the group on
+[param_min, param_max]: under `gpwidth='global'` directly on ell,
+param_min the median whitened distance between CONN-connected
+prototypes, param_max ten times the largest inter-prototype distance
+(both over the group's own finite design); under `gpwidth='local'` on
+c instead, with the same two bounds converted through the group's own
+h: c_min = param_min / median_j(h_j) (so c_min is about 1), c_max =
+param_max / min_j(h_j). Either way: five log-spaced candidates, then
+one bounded refinement between the best grid point's neighbours,
+SKIPPED when the best grid point is the upper endpoint. With the mean
+basis projected out (Q, an orthonormal basis of its complement), the
+Matern-3/2 expansion loses its low-order terms exactly, so past about
+param_max the family collapses to one fixed kernel; the width is not
+identified there and the refinement would only climb a shallow log-
+determinant tilt. The outer objective at each candidate is the sum,
+over the group's outputs, of the profiled restricted negative log
+marginal likelihood, computed from one shared eigendecomposition of
+the projected kernel per candidate: Q^T K Q's spectrum comes out of
+A = (I-P) K (I-P) + tau*P (P = W W^T, W spanning the mean basis,
+I-P = Q Q^T) in O(m_g M_g^2) rather than the O(M_g^3) of forming
+Q^T K Q directly, since A's range-Q eigenpairs are exactly those of
+Q^T K Q and its range-P eigenvalues are tau repeated m_g times;
+tau = 2*M_g puts the m_g structural eigenvalues above every eigenvalue
+of Q^T K Q (which lies in [0, M_g] since k(0,.) = 1), so `eigh`'s
+first M-m pairs are the ones profiling needs. This search (and the
+per-candidate eigendecomposition it shares across the group's outputs)
+is the same one `gpwidth='global'` runs over ell; over c it is the
+identical procedure with the non-stationary kernel in place of k_ell.
 
 **Noise floor.** The prototype influences are finite differences of
 accuracy eta, so I_proto carries real evaluation noise: noise sd
@@ -103,7 +159,7 @@ of lam*s_c^2(lam) = n_c^2 -- s_c^2(lam) the profiled closed form
 (1/(M-m)) sum_i z_i^2/(Lambda_i + lam), increasing in lam -- found by
 one bracketed root find on log lam, pinned to the nearer domain edge
 when the equation has no root inside it. The floor is recomputed at
-every candidate ell, since Lambda and z depend on it. For an estimator
+every candidate width, since Lambda and z depend on it. For an estimator
 with eta at machine precision the floor lies below 1e-10 and the
 search is unchanged.
 
@@ -127,17 +183,24 @@ already-computed sigma; mean(Sigma_k) needs s^T A^-1 s (through the
 shared eigendecomposition, kept on the same side of the subtraction as
 sigma's own factorisation, since v_k is a difference of two nearly
 equal quantities) and SS_k = sum_{i,j in bin} k(x_i,x_j), the one term
-no caching removes. For a one-dimensional design SS_k comes from
-running sums over the sorted points (O(n_k log n_k)) rather than the
-pairwise double sum: with c = sqrt(3)/ell and u_i = x_i - o against a
-local origin o,
+no caching removes. Under `gpwidth='global'`, for a one-dimensional
+design, SS_k comes from running sums over the sorted points
+(O(n_k log n_k)) rather than the pairwise double sum: with
+c = sqrt(3)/ell and u_i = x_i - o against a local origin o,
 
     S_i = e^{-c u_i} * sum_{j<i} e^{c u_j},   T_i = u_i*S_i - e^{-c u_i} * sum_{j<i} u_j e^{c u_j}
 
 are exclusive cumulative sums, re-based every block of about 200/c
 points so no exponential overflows; the carried sums transform exactly
 across a rebase, so no pair is dropped or approximated -- only the
-summation order differs from the pairwise form.
+summation order differs from the pairwise form. This shortcut assumes
+a stationary kernel, so it does not apply under `gpwidth='local'`
+(non-stationary): there, and in two dimensions or more under either
+switch, SS_k stands as the pairwise double sum, chunked on both sides
+so no block larger than 2048 x 2048 is ever materialized; the same
+chunked pass also forms s = sum_{i in bin} k_i against the design, at
+each bin point's own length ell(x_i) = c*h_{bmu(i)} under `gpwidth=
+'local'`.
 
 ## 4. The I-VQ, bin stencil, and refinement
 
@@ -344,7 +407,23 @@ or, after polish, `resid > self.eta` or `A` is singular; or
 `_COND_MAX = 1e12`. A bad OTHER start's mid-EM degeneracy just drops
 that one start -- multi-start's whole purpose.
 
----
-Written by builder B2 (estimators and data) before B1's
-`spec/method_notes.md` existed; the coordinator merges this section in
-at the end of that file, per the build prompt's fallback instruction.
+**Component labelling.** Without a reference, the winning start's
+components are labelled in ascending mu_x order. With
+`reference=(means (K,2), covs (K,2,2))`, they are labelled by the K x K
+assignment (`scipy.optimize.linear_sum_assignment`) minimizing the total
+Bhattacharyya distance to the reference components,
+
+    D_B(a, b) = (1/8)(mu_a - mu_b)^T Sigma_bar^-1 (mu_a - mu_b)
+                + (1/2) ln(det Sigma_bar / sqrt(det Sigma_a det Sigma_b)),
+    Sigma_bar = (Sigma_a + Sigma_b)/2.
+
+The covariance term separates a spike from the blob sharing its mean; the
+mean term separates equal-covariance components. The labelling is applied
+where the components are ordered, before the score, Hessian and Newton
+polish, so it fixes the whole parameterization (including which
+component's weight is implicit), not a permutation of a finished theta.
+The reference is fixed at construction and every call uses it. A caller
+wanting output c to be the same component throughout a draw fits once on
+the full data without a reference, converts that fit with
+`reference_from_theta(theta, K)`, and builds the estimator for every other
+evaluation of the draw with it; the naive ordering remains the default.

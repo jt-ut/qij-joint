@@ -1,6 +1,7 @@
 """The four methods' per-draw loops (Sections 2 and 4). `oracle` and `ij`
 run their draws across a process pool; `boot` and `qij` loop over draws
-in sequence -- `boot` parallel within each draw, `qij` serial for now.
+in sequence, each parallel within a draw -- `boot` over replicate
+chunks, `qij` over its prototype survey (method_notes section 2).
 """
 from __future__ import annotations
 
@@ -130,7 +131,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     """One `qij` scalar row: `QIJResult`'s scalars flattened to columns
     per stage and per output."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
-           's': s, 'seed': seed, 'M_X': int(res.M_X), 'n_failed': int(res.n_failed)}
+           's': s, 'seed': seed, 'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
+           'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed)}
     for stage in ('prototype', 'full_data', 'refinement', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
@@ -152,6 +154,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'lam_{o}'] = float(res.lam[j])
         row[f'ell_bound_{o}'] = bool(res.ell_bound[j])
         row[f'lam_bound_{o}'] = bool(res.lam_bound[j])
+        row[f'c_{o}'] = float(res.c[j])
+        row[f'c_bound_{o}'] = bool(res.c_bound[j])
     return row
 
 
@@ -169,7 +173,8 @@ def _qij_points(res) -> pd.DataFrame:
 
 
 def _qij_prototypes(res) -> pd.DataFrame:
-    """`prototypes` for `--diag-draws`: `j, p, w_<d>, I_<o>` (Section 6.2)."""
+    """`prototypes` for `--diag-draws`: `j, p, w_<d>, I_<o>, h`
+    (method_notes section 3)."""
     M = res.prototype_p.shape[0]
     W = np.atleast_2d(np.asarray(res.prototype_w, dtype=float).reshape(M, -1))
     data = {'j': np.arange(M), 'p': res.prototype_p}
@@ -177,30 +182,38 @@ def _qij_prototypes(res) -> pd.DataFrame:
         data[f'w_{d}'] = W[:, d]
     for j, o in enumerate(res.outputs):
         data[f'I_{o}'] = res.prototype_I[:, j]
+    data['h'] = res.prototype_h
     return pd.DataFrame(data)
 
 
 def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
-            out_dir: str, eps: float, diag_draws: Optional[Iterable[int]],
-            force: bool) -> Tuple[int, int]:
-    """`qij`: a sequential draw loop, serial within each draw -- QIJ
-    parallelism within a draw is not built in this package yet."""
+            out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
+            workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
+            M_X: Optional[int] = None) -> Tuple[int, int]:
+    """`qij`: a sequential draw loop; with `workers > 1` one pool is
+    created for the run and passed to every draw's fit, so only the
+    prototype survey (method_notes section 2) runs in parallel -- the
+    rest of a draw is serial regardless of `workers`."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()
     case = registry.case(dataset, estimator)
     T = case.make_T()
+    pool = Pool(workers, T=T) if workers > 1 else None
     written = 0
     for s in draws:
         if not force and products.is_done(md, s):
             continue
         dseed = seed + s
         X = case.draw(N, dseed)
-        res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform).fit(X, T)
+        res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
+                  gptrend=gptrend, gpwidth=gpwidth, M_X=M_X).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         arrays = None
         if s in diag:
             arrays = {'points': _qij_points(res), 'prototypes': _qij_prototypes(res)}
         products.write_draw(md, s, row, arrays)
         written += 1
+    if pool is not None:
+        pool.close()
     return written, len(draws) - written

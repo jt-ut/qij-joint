@@ -24,7 +24,9 @@ _prep_value = None
 def _boot_task(T, case, X: np.ndarray, counts: np.ndarray):
     """Evaluate `T` at each row of `counts` against the shared `X`;
     returns the chunk's replicates and this call's own wall time. A
-    failing evaluation is caught here, its declared boundary (R7)."""
+    failing evaluation is caught here, the one place an estimator's
+    exception is allowed to turn into a NaN replicate rather than
+    aborting the chunk."""
     global _prep_X, _prep_value
     prep = None
     if hasattr(T, 'prepare'):

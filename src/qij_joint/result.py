@@ -31,11 +31,16 @@ class QIJResult:
     rho: np.ndarray                # (q,)
     gain_ratio: np.ndarray         # (q,)
     n_refine_evals: np.ndarray     # (q,) int
-    ell: np.ndarray                # (q,)
+    ell: np.ndarray                # (q,); NaN under gpwidth='local'
     lam: np.ndarray                # (q,)
-    ell_bound: np.ndarray          # (q,) bool
+    ell_bound: np.ndarray          # (q,) bool; False under gpwidth='local'
     lam_bound: np.ndarray          # (q,) bool
+    gptrend: str                   # 'affine' or 'quadratic' (method_notes section 3)
+    gpwidth: str                   # 'global' or 'local' (method_notes section 3)
+    c: np.ndarray                  # (q,) fitted local-width factor; NaN under gpwidth='global'
+    c_bound: np.ndarray            # (q,) bool; False under gpwidth='global'
     M_X: int
+    M_X_source: str                # 'rule' or 'argument' (method_notes section 2)
     n_failed: int
     evals_by_stage: Dict[str, int]
     rows_by_stage: Dict[str, int]
@@ -50,6 +55,7 @@ class QIJResult:
     prototype_p: np.ndarray        # (M,)
     prototype_w: np.ndarray        # (M,) or (M, d), native coordinates
     prototype_I: np.ndarray        # (M, q)
+    prototype_h: np.ndarray        # (M,) local CONN spacing; NaN under gpwidth='global'
 
     @property
     def variance(self) -> np.ndarray:

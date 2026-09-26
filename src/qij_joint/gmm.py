@@ -2,13 +2,15 @@
 covariances) with an analytic influence function via Louis's (1982)
 identity.
 
-`GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500)` fits by
-multi-start weighted EM, polishes the winning start with an exact
-Newton step on the mixture log-likelihood, and reports the score and
-observed information at the fit for `influence`. Follows
+`GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`
+fits by multi-start weighted EM, polishes the winning start with an
+exact Newton step on the mixture log-likelihood, and reports the score
+and observed information at the fit for `influence`. Follows
 `estimators.py`'s conventions: `T(X, w) -> ndarray(p,)` never raises (a
-failed fit is NaN); no state between calls; the weight vector alone
-distinguishes one caller's evaluation from another.
+failed fit is NaN); no state between calls. With `reference`, every
+evaluation labels its components by the assignment to it minimizing
+total Bhattacharyya distance (method_notes section 5); without one,
+components are ordered by ascending first-mean coordinate.
 
 Parameter layout, the two-phase multi-start/EM design, the Newton
 polish and residual test, and the score/Louis's-identity construction
@@ -17,13 +19,13 @@ of `(psi, A)` are documented in `spec/method_notes.md`, section
 
 `prepare(X)` holds the unweighted centering shift and the `(N, 6)`
 feature buffer built from the centered X, both independent of `w` and
-otherwise rebuilt on every one of a draw's many evaluations of the same
-X.
+otherwise rebuilt on every evaluation of the same X.
 """
 
 from collections import namedtuple
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 _LOG2PI = float(np.log(2.0 * np.pi))
 _ACCEPT_TOL = 1e-9
@@ -371,6 +373,48 @@ def _canonical_sort(pis, mus, Ss):
     return pis[order].copy(), mus[order].copy(), Ss[order].copy()
 
 
+def _covs_from_Ss(Ss: np.ndarray) -> np.ndarray:
+    """(K,3) [S11,S12,S22] -> (K,2,2) full symmetric covariances."""
+    K = Ss.shape[0]
+    covs = np.empty((K, 2, 2))
+    covs[:, 0, 0], covs[:, 0, 1], covs[:, 1, 1] = Ss[:, 0], Ss[:, 1], Ss[:, 2]
+    covs[:, 1, 0] = covs[:, 0, 1]
+    return covs
+
+
+def _bhattacharyya(mus: np.ndarray, Ss: np.ndarray,
+                    ref_means: np.ndarray, ref_covs: np.ndarray) -> np.ndarray:
+    """(K,K) Bhattacharyya distance between K fitted Gaussians (mus, Ss)
+    and K reference Gaussians (ref_means, ref_covs) (method_notes
+    section 5)."""
+    covs = _covs_from_Ss(Ss)
+    det_a = covs[:, 0, 0] * covs[:, 1, 1] - covs[:, 0, 1] * covs[:, 1, 0]
+    det_b = ref_covs[:, 0, 0] * ref_covs[:, 1, 1] - ref_covs[:, 0, 1] * ref_covs[:, 1, 0]
+    Sigma = 0.5 * (covs[:, None, :, :] + ref_covs[None, :, :, :])
+    det_bar = Sigma[..., 0, 0] * Sigma[..., 1, 1] - Sigma[..., 0, 1] * Sigma[..., 1, 0]
+    diff = mus[:, None, :] - ref_means[None, :, :]
+    inv00, inv01, inv11 = Sigma[..., 1, 1] / det_bar, -Sigma[..., 0, 1] / det_bar, Sigma[..., 0, 0] / det_bar
+    quad = diff[..., 0] ** 2 * inv00 + 2.0 * diff[..., 0] * diff[..., 1] * inv01 + diff[..., 1] ** 2 * inv11
+    return 0.125 * quad + 0.5 * np.log(det_bar / np.sqrt(det_a[:, None] * det_b[None, :]))
+
+
+def _reference_sort(pis, mus, Ss, reference):
+    """Relabel K fitted components by the assignment to the reference
+    components minimizing total Bhattacharyya distance (method_notes
+    section 5)."""
+    ref_means, ref_covs = reference
+    _, col = linear_sum_assignment(_bhattacharyya(mus, Ss, ref_means, ref_covs))
+    order = np.argsort(col)
+    return pis[order].copy(), mus[order].copy(), Ss[order].copy()
+
+
+def reference_from_theta(theta: np.ndarray, K: int) -> tuple:
+    """A fitted theta (p,) as (means (K,2), covs (K,2,2)), the format
+    `GMM2D`'s `reference` argument takes (method_notes section 5)."""
+    _, mus, Ss = _unpack(K, theta)
+    return mus.copy(), _covs_from_Ss(Ss)
+
+
 # ======================================================================
 # Score and Louis's-identity information.
 # ======================================================================
@@ -495,16 +539,22 @@ def _score_info(X: np.ndarray, Q: np.ndarray, w: np.ndarray, K: int,
 # Full fit: multi-start EM -> canonical order -> Newton polish -> resid.
 # ======================================================================
 
-def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray):
+def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
+         reference=None):
     """None on failure; else dict(theta, pis, mus, Ss, psi, A, ll,
     score_history, polished, resid). Operates in the caller's own
     (already-centered) coordinates with the caller's own (X-only) `Q`,
-    `XP`."""
+    `XP`. Components are labelled by `reference` when given
+    (method_notes section 5), else ordered by ascending first-mean
+    coordinate."""
     best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
                                cfg.tol, cfg.max_iter)
     if best is None:
         return None
-    pis, mus, Ss = _canonical_sort(best['pis'], best['mus'], best['Ss'])
+    if reference is None:
+        pis, mus, Ss = _canonical_sort(best['pis'], best['mus'], best['Ss'])
+    else:
+        pis, mus, Ss = _reference_sort(best['pis'], best['mus'], best['Ss'], reference)
 
     try:
         psi, A, ll = _score_info(X, Q, w, cfg.K, pis, mus, Ss)
@@ -566,20 +616,23 @@ class GMM2D:
     w) -> ndarray(N, p)`, `T.fit_and_influence(X, w) -> (ndarray(p,),
     ndarray(N, p))`; all three accept `K`, `n_starts`, `seed`, `tol`,
     `max_iter` as per-call keyword overrides, and an optional `prep`
-    from `T.prepare(X)`. `self.name`, `self.outputs`, `self.eta`,
-    `self.p` are fixed at construction from the constructor's own `K`; a
-    per-call `K` override does not change what they describe.
+    from `T.prepare(X)`; all three label components against
+    `self.reference` (method_notes section 5) when it is not None.
+    `self.name`,
+    `self.outputs`, `self.eta`, `self.p` are fixed at construction from
+    the constructor's own `K`.
     """
 
     name = 'gmm2d'
 
     def __init__(self, K: int, n_starts: int = 20, seed: int = 0,
-                 tol: float = 1e-8, max_iter: int = 500):
+                 tol: float = 1e-8, max_iter: int = 500, reference=None):
         self.K = int(K)
         self.n_starts = int(n_starts)
         self.seed = int(seed)
         self.tol = float(tol)
         self.max_iter = int(max_iter)
+        self.reference = reference
 
         self.p = (self.K - 1) + 5 * self.K
         self.outputs = _make_outputs(self.K)
@@ -612,7 +665,7 @@ class GMM2D:
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP)
+            fit = _fit(Xc, w, cfg, Q, XP, self.reference)
             if fit is None:
                 return np.full(cfg.p, np.nan)
             theta = fit['theta']
@@ -631,7 +684,7 @@ class GMM2D:
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP)
+            fit = _fit(Xc, w, cfg, Q, XP, self.reference)
             if fit is None:
                 return np.full((N, cfg.p), np.nan)
             A = fit['A']
@@ -656,7 +709,7 @@ class GMM2D:
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP)
+            fit = _fit(Xc, w, cfg, Q, XP, self.reference)
             if fit is None:
                 return nan_theta, nan_psi
             theta = fit['theta'].copy()
