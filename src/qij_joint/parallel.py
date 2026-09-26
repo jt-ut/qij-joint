@@ -25,6 +25,29 @@ _worker_case = None
 _loaded_X_path: Optional[str] = None
 _loaded_X: Optional[np.ndarray] = None
 
+# The one per-process `T.prepare(A)` cache: single-slot, keyed on the
+# identity of the shared array a draw's tasks hand it, so every task
+# module reuses one slot instead of keeping its own (contract rule 3).
+_prepared_A: Optional[np.ndarray] = None
+_prepared_value = None
+
+
+def prepared(T, A: np.ndarray):
+    """`T.prepare(A)`, computed once per distinct array object `A` seen
+    by this worker process and reused by every later call with the same
+    object; None when `T` has no `prepare`. Every task function that
+    shares an array across its calls (the bootstrap replicates, the
+    prototype survey, the bin stencils, theta_hat) calls this rather
+    than keeping its own cache, so the same value is reused the same way
+    everywhere."""
+    global _prepared_A, _prepared_value
+    if not hasattr(T, 'prepare'):
+        return None
+    if A is not _prepared_A:
+        _prepared_value = T.prepare(A)
+        _prepared_A = A
+    return _prepared_value
+
 
 def _init_worker(T, case_key: Optional[Tuple[str, str]]) -> None:
     """Pool initializer: pin the five BLAS thread variables, then build

@@ -7,12 +7,15 @@ X-VQ, prototype influences, initial influence estimate) and stage 2
 (the shared full-data evaluation, then per-output refinement),
 returning a `QIJResult`. `gptrend`/`gpwidth` pass straight to
 `fit_influence_model` (method_notes section 3); `M_X` overrides the
-prototype-count rule when given (method_notes section 2); with a
-`pool`, the survey's per-prototype evaluations run on it (method_notes
-section 2), every other stage staying serial. A plain
-callable T is wrapped with outputs=('theta',) and machine-precision
-eta. The method sees T only through `Counter`: it never sees an
-analytic influence.
+prototype-count rule when given (method_notes section 2). With a
+`pool`: the survey and each coordinate's initial-bin stencils run on
+it, the full-data base evaluation is submitted at the start and
+collected after stage 1, the influence model's width-grid candidates
+run on it (method_notes section 3), and the codebook fit uses
+`pool.workers` FAISS threads (method_notes sections 2 and 4); a
+refinement split's own evaluation stays serial. A plain callable T is wrapped with
+outputs=('theta',) and machine-precision eta; the method sees T only
+through `Counter`, never an analytic influence.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ from .core.influence_model import psi0 as _psi0
 from .core.influence_model import uncertainty as _uncertainty
 from .core.refine import run_refinement
 from .core.xvq import cost_rule_M, run_xvq
+from .parallel import prepared
 from .result import QIJResult
 
 
@@ -40,6 +44,21 @@ def _wrap(T):
     T.eta = float(np.finfo(float).eps)
     T.name = getattr(T, '__name__', 'theta')
     return T
+
+
+def _theta_hat_task(T, case, X: np.ndarray, _task):
+    """theta_hat = T(X, ones(N)) on the pool, submitted at draw start
+    (method_notes section 2). Returns (evaluation, failure, wall time)."""
+    prep = prepared(T, X)
+    t0 = time.perf_counter()
+    try:
+        w = np.ones(len(X))
+        result = T(X, w, prep=prep) if prep is not None else T(X, w)
+        result = np.asarray(result, dtype=float)
+        failed = bool(np.any(np.isnan(result)))
+    except Exception:
+        result, failed = np.full(len(T.outputs), np.nan), True
+    return result, failed, time.perf_counter() - t0
 
 
 def _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
@@ -84,12 +103,9 @@ class QIJ:
         self.M_X = M_X
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
-        """Run the method on one draw: the X-VQ and prototype
-        influences and the initial influence estimate, then the shared
-        full-data base evaluation, then per-output gain-driven
-        refinement. The prototype survey runs on `pool` when given
-        (method_notes section 2); every other stage is serial in this
-        build."""
+        """Run the method on one draw: stage 1 (X-VQ, prototype
+        influences), the shared full-data base evaluation, then
+        per-output refinement, on `pool` per the module docstring."""
         t_start = time.perf_counter()
         X = np.asarray(X)
         N = len(X)
@@ -100,6 +116,11 @@ class QIJ:
         workers = pool.workers if pool is not None else 1
 
         counter = Counter(T, N)
+
+        theta_future = None
+        if pool is not None:
+            pool.share(X)
+            theta_future = pool.submit(_theta_hat_task, None)
 
         # `vq_transform` returns (Z, inverse) fitted to this draw;
         # identity when `vq_transform` is None. A 1-D Z is promoted to
@@ -117,18 +138,20 @@ class QIJ:
             M_requested, M_X_source = cost_rule_M(N, q, self.eps), 'rule'
 
         t0 = time.perf_counter()
-        xvq, theta_Q, I_proto, busy_delta = run_xvq(
-            Z, inverse, counter, eta, M_requested, self.seed, pool)
+        xvq, theta_Q, I_proto, xvq_busy = run_xvq(
+            Z, inverse, counter, eta, M_requested, self.seed, pool, workers)
         # Prototype positions in T's native coordinates, for the
         # result's diagnostics -- the same `inverse(xvq.centers)`
         # `run_xvq` already applied, recovered rather than re-derived.
         W_X = np.asarray(inverse(xvq.centers), dtype=float)
         try:
-            model = fit_influence_model(
-                Z, xvq, I_proto, theta_Q, eta, gptrend=self.gptrend, gpwidth=self.gpwidth)
+            model, model_busy = fit_influence_model(
+                Z, xvq, I_proto, theta_Q, eta, gptrend=self.gptrend, gpwidth=self.gpwidth,
+                pool=pool)
         except (RuntimeError, LinAlgError):
-            # A Cholesky that fails even after the jitter escalation is a
-            # failed stage 1: the draw is recorded as failed, never retried.
+            # A failed stage 1 is recorded as failed, never retried; a
+            # submitted `theta_future` is left uncollected and uncounted,
+            # as the serial code never reaches its own call here either.
             return _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
                                  self.gptrend, self.gpwidth, M_X_source, workers)
         psi0_all = _psi0(model, Z)
@@ -137,8 +160,17 @@ class QIJ:
         ev1, rows1 = counter.snapshot()
 
         t0 = time.perf_counter()
-        theta_hat = np.asarray(counter(X, np.ones(N)), dtype=float)
+        if theta_future is None:
+            theta_hat = np.asarray(counter(X, np.ones(N)), dtype=float)
+            full_data_busy = 0.0
+        else:
+            result, failed, full_data_busy = theta_future.result()
+            theta_hat = np.asarray(result, dtype=float)
+            counter.add(1, N, int(failed))
         wall_time_full_data = time.perf_counter() - t0
+
+        if pool is not None:
+            pool.share(X)  # re-share X: the survey shared W_X on `pool`
 
         t0 = time.perf_counter()
         coordinates = [
@@ -146,8 +178,7 @@ class QIJ:
                 X, counter, theta_hat, c, name,
                 psi0_all[:, c], float(model.offset[c]), sigma_all[:, c],
                 I_proto[:, c], xvq.bmu, xvq.bmu2,
-                eta, self.eps, xvq.M_used, bool(model.constant_path[c]),
-                Z, model,
+                eta, self.eps, xvq.M_used, bool(model.constant_path[c]), Z, model, pool,
             )
             for c, name in enumerate(outputs)
         ]
@@ -169,9 +200,10 @@ class QIJ:
         wall_time_total = time.perf_counter() - t_start
         wall_time_by_stage = {'prototype': wall_time_prototype, 'full_data': wall_time_full_data,
                                'refinement': wall_time_refinement, 'total': wall_time_total}
-        # Parent serial work plus what the survey's workers actually
-        # spent, in place of the survey's share of the elapsed total.
-        busy_time_total = wall_time_total + busy_delta
+        # Parent work plus every pool task's own time, in place of each
+        # parallel stage's share of the elapsed total.
+        refine_busy = sum(cr.busy_delta for cr in coordinates)
+        busy_time_total = wall_time_total + xvq_busy + model_busy + full_data_busy + refine_busy
 
         # at_bound[:, 0] is whichever width parameter gpwidth fits
         # (method_notes section 3).

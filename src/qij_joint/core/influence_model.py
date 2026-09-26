@@ -55,12 +55,6 @@ _BPV_CHUNK = 2048
 # costs is bounded by about 100 roundings on a sum of positive terms.
 _SELF_SUM_LOG_RANGE = 200.0
 
-# The per-draw kernel-row cache's memory budget: the (N, M_g) kernel
-# matrices of every coordinate group together may occupy at most this
-# many bytes, or none of them is cached and every consumer re-forms its
-# rows in chunks instead -- bit-identical either way (spec section 3).
-_KERNEL_CACHE_BYTES = 256 * 1024 ** 2
-
 
 @dataclass
 class _PointTerms:
@@ -77,12 +71,9 @@ class _PointTerms:
     sigma   (N, q) the posterior standard deviation at every point.
     R       per coordinate, (N, m_c) the affine-mean residual r_i =
             h(x_i) - Hb^T A_c^-1 k_i (`bin_posterior_variance`'s R is a
-            row sum of it); None on the constant path.
-    K       per coordinate, (N, M_c) kernel rows k(x_i, w_j) against
-            that coordinate's own design -- the SAME array object for
-            every coordinate sharing a design; None when the total
-            would exceed `_KERNEL_CACHE_BYTES` (re-formed in chunks
-            instead, to bit-identical values) and on the constant path.
+            row sum of it); None on the constant path. Kernel rows
+            k(x_i, w_j) themselves are never cached (E4): every
+            consumer re-forms its own rows in bounded chunks.
     """
 
     Z: np.ndarray
@@ -90,7 +81,6 @@ class _PointTerms:
     psi0: np.ndarray
     sigma: np.ndarray
     R: List[Optional[np.ndarray]]
-    K: List[Optional[np.ndarray]]
 
 
 @dataclass
@@ -376,10 +366,77 @@ def _lambda_floor(z: np.ndarray, Lambda: np.ndarray, M_minus_m: int, n_c2: float
     return math.exp(root)
 
 
+def _width_grid_candidate(
+    log_param: float, gpwidth: str, D_full_g: np.ndarray, h_design_g: Optional[np.ndarray],
+    d_z: int, W_g: np.ndarray, tau_g: float, M_minus_m: int,
+    cols_g: Sequence[int], psi_proj: Dict[int, np.ndarray], n_c2_g: Dict[int, float],
+) -> Tuple[dict, float]:
+    """
+    One width/c-grid candidate's outer objective (method_notes section
+    3): kernel, mean basis projected out, one shared `eigh`, then each
+    coordinate's profiled REML search over lam. Called directly or
+    through `_grid_task` (a pool task): same operations, same order
+    either way, so the grid's numbers do not depend on the pool.
+    Returns the trace entry (log_param, param, K, per_c, nll) and this
+    call's own wall time.
+    """
+    t0 = time.perf_counter()
+    param = math.exp(log_param)
+    if gpwidth == 'global':
+        K = _matern32(D_full_g, param)
+    else:
+        ell_vec = param * h_design_g
+        K = _matern32_nonstationary(D_full_g, ell_vec, ell_vec, d_z)
+
+    C = W_g.T @ K                      # (m_g, M_g)
+    E = C @ W_g                        # (m_g, m_g)
+    E[np.diag_indices_from(E)] += tau_g
+    WC = W_g @ C                       # (M_g, M_g)
+    A = K - WC - WC.T + W_g @ (E @ W_g.T)
+    Lambda, V = np.linalg.eigh(A)
+    Lambda = np.maximum(Lambda[:M_minus_m], 0.0)
+    V = V[:, :M_minus_m]
+
+    per_c: Dict[int, dict] = {}
+    total_nll = 0.0
+    for c in cols_g:
+        z = V.T @ psi_proj[c]
+
+        def inner(log_lam: float, _z=z, _Lambda=Lambda) -> float:
+            denom = _Lambda + math.exp(log_lam)
+            s2_val = np.sum(_z ** 2 / denom) / M_minus_m
+            s2_val = max(s2_val, 1e-300)
+            return (M_minus_m / 2.0) * math.log(s2_val) + 0.5 * np.sum(np.log(denom))
+
+        # lam_c is bounded below by lam_floor,c at THIS candidate width.
+        lam_floor_c = _lambda_floor(z, Lambda, M_minus_m, n_c2_g[c])
+        lo_bound = max(math.log(lam_floor_c), _LOG_LAM_LO)
+        if lo_bound >= _LOG_LAM_HI:
+            # The floor already pins lam_c at the ceiling: nothing to search.
+            log_lam_star = _LOG_LAM_HI
+            nll_c = inner(log_lam_star)
+        else:
+            ir = minimize_scalar(inner, bounds=(lo_bound, _LOG_LAM_HI), method='bounded')
+            log_lam_star = float(ir.x)
+            nll_c = float(ir.fun)
+        per_c[c] = dict(log_lam=log_lam_star, nll=nll_c, lam_floor=lam_floor_c)
+        total_nll += nll_c
+
+    entry = dict(log_param=log_param, param=param, K=K, per_c=per_c, nll=total_nll)
+    return entry, time.perf_counter() - t0
+
+
+def _grid_task(T, case, X, task):
+    """Pool wrapper matching `Pool`'s task signature; the width grid
+    needs none of T, case or X -- `task`'s order matches `_width_grid_
+    candidate`'s own positional arguments, at most one M x M array."""
+    return _width_grid_candidate(*task)
+
+
 def fit_influence_model(
     Z: np.ndarray, xvq, I_proto: np.ndarray, theta_Q: np.ndarray, eta: float,
-    gptrend: str = 'affine', gpwidth: str = 'global',
-) -> InfluenceModel:
+    gptrend: str = 'affine', gpwidth: str = 'global', pool=None,
+) -> Tuple[InfluenceModel, float]:
     """
     The initial influence estimate for every estimand coordinate
     (spec/method_notes.md section 3): Gaussian-process regression with
@@ -401,6 +458,11 @@ def fit_influence_model(
     coordinates; whitened here with the SAME transform derived from Z,
     so a coordinate's design lands in the space `psi0`/`uncertainty`
     query in. Cost: O(M_X_used^3), independent of N.
+
+    With a `pool`, every group's five grid candidates run as pool tasks
+    submitted together (the bounded refinement stays serial: method_
+    notes section 3). Returns (model, busy_delta); busy_delta is 0.0
+    with `pool=None`, else the grid tasks' wall time less `pool.map`'s.
     """
     p = np.asarray(xvq.p, dtype=float)
     I_proto = np.asarray(I_proto, dtype=float)
@@ -490,6 +552,11 @@ def fit_influence_model(
     # cannot support it (method_notes section 3).
     m_full = (d_z + 1) if gptrend == 'affine' else (1 + d_z + d_z * (d_z + 1) // 2)
 
+    # Each group's static context, built first so every group's five
+    # grid candidates can go to the pool together in one batch below.
+    group_ctx = []
+    tasks = []
+    task_group = []
     for idx_key, cols_g in groups.items():
         idx_g = np.asarray(idx_key, dtype=np.intp)
         M_g = idx_g.size
@@ -501,25 +568,16 @@ def fit_influence_model(
         conn_g = xvq.conn[idx_g, :][:, idx_g]
         ell_min, ell_max = _length_scale_bounds(conn_g, D_full_g)
 
-        # The outer search runs over ell directly under 'global'
-        # (`kernel_at` an exact alias of `_matern32`), or over c under
-        # 'local': its bounds carried from ell_min,
-        # ell_max via this group's own prototypes' CONN spacing, so
-        # c_min is about 1 (spec section 3).
+        # The outer search runs over ell under 'global', or over c under
+        # 'local' (bounds converted through the group's CONN spacing, so
+        # c_min is about 1; method_notes section 3).
         if gpwidth == 'global':
             param_min, param_max = ell_min, ell_max
             h_design_g = None
-
-            def kernel_at(param: float, _D=D_full_g) -> np.ndarray:
-                return _matern32(_D, param)
         else:
             h_design_g = h_full[idx_g]
             param_min = ell_min / float(np.median(h_design_g))
             param_max = ell_max / float(np.min(h_design_g))
-
-            def kernel_at(param: float, _D=D_full_g, _h=h_design_g, _dz=d_z) -> np.ndarray:
-                ell_vec = param * _h
-                return _matern32_nonstationary(_D, ell_vec, ell_vec, _dz)
 
         grid_log_param = np.linspace(math.log(param_min), math.log(param_max), _N_WIDTH_GRID)
 
@@ -527,80 +585,66 @@ def fit_influence_model(
         Q = Qfull[:, m_g:]
         M_minus_m = M_g - m_g
 
-        Qt_psi = {c: Q.T @ I_proto[idx_g, c] for c in cols_g}
-
         # A_param = (I-P) K_param (I-P) + tau*P, P = W W^T, gives the
-        # same spectrum as Q^T K_param Q in O(m_g M_g^2) rather than
-        # two M_g x M_g matmuls, with the m_g structural eigenvalues
-        # shifted above the kernel's own (derivation: spec/method_notes.md
-        # section 3).
+        # same spectrum as Q^T K_param Q in O(m_g M_g^2), not O(M_g^3)
+        # (derivation: spec/method_notes.md section 3).
         W_g = Qfull[:, :m_g]
         tau_g = 2.0 * float(M_g)
-        psi_proj = {c: Q @ Qt_psi[c] for c in cols_g}
+        psi_proj = {c: Q @ (Q.T @ I_proto[idx_g, c]) for c in cols_g}
 
-        # Declared noise floor, per coordinate in this group: n_c^2 =
-        # 2*eta^2*theta_Q,c^2 * median_j(1/t_j^2) over the group's own
-        # finite design, independent of the width so computed once per group.
+        # n_c^2 = 2*eta^2*theta_Q,c^2*median_j(1/t_j^2), independent of
+        # width so computed once per group (method_notes section 3).
         p_g = p[idx_g]
         t_g = delta_f * p_g / (1.0 - p_g)
         inv_t2_median_g = float(np.median(1.0 / t_g ** 2))
         n_c2_g = {c: 2.0 * eta ** 2 * float(theta_Q[c]) ** 2 * inv_t2_median_g for c in cols_g}
 
-        # Joint outer search over log(width), within this group: one
-        # kernel and one eigendecomposition of Q^T K Q per candidate,
-        # shared across the group; each coordinate profiles its own
-        # lam_c from that shared eigendecomposition, and the outer
-        # objective is the SUM of the group's per-coordinate profiled
-        # restricted NLLs.
+        gi = len(group_ctx)
+        group_ctx.append((idx_g, M_g, centers_g, m_g, Hb_g, D_full_g, h_design_g,
+                           param_min, param_max, grid_log_param, W_g, tau_g, M_minus_m,
+                           cols_g, psi_proj, n_c2_g))
+        for lp in grid_log_param:
+            tasks.append((float(lp), gpwidth, D_full_g, h_design_g, d_z, W_g, tau_g,
+                          M_minus_m, cols_g, psi_proj, n_c2_g))
+            task_group.append(gi)
+
+    # Every group's five grid candidates -- independent of each other
+    # and of every other group's (method_notes section 3) -- go to the
+    # pool as one batch, or run serially with no pool.
+    model_busy = 0.0
+    if not tasks:
+        grid_results = []  # every coordinate is on the constant path
+    elif pool is None:
+        grid_results = [_width_grid_candidate(*task) for task in tasks]
+    else:
+        t_map0 = time.perf_counter()
+        grid_results = pool.map(_grid_task, tasks)
+        model_busy = -(time.perf_counter() - t_map0) + sum(wall for _entry, wall in grid_results)
+
+    traces: List[List[dict]] = [[] for _ in group_ctx]
+    for gi, (entry, _wall) in zip(task_group, grid_results):
+        traces[gi].append(entry)
+
+    # Per group, the bounded refinement between the grid's neighbours
+    # (always serial: method_notes section 3) and the final
+    # per-coordinate solve. One kernel and one eigendecomposition of
+    # Q^T K Q per candidate, shared across the group; each coordinate
+    # profiles its own lam_c from that shared eigendecomposition, and
+    # the outer objective is the SUM of the group's per-coordinate
+    # profiled restricted NLLs.
+    for gi, (idx_g, M_g, centers_g, m_g, Hb_g, D_full_g, h_design_g, param_min, param_max,
+             grid_log_param, W_g, tau_g, M_minus_m, cols_g, psi_proj, n_c2_g) in enumerate(group_ctx):
         t_shared0 = time.perf_counter()
-        trace: List[dict] = []
+        trace = traces[gi]
 
         def outer_obj(log_param: float, _trace=trace, _cols_g=cols_g,
-                       _psi_proj=psi_proj, _W=W_g, _tau=tau_g,
-                       _M_minus_m=M_minus_m, _n_c2=n_c2_g, _kernel_at=kernel_at) -> float:
-            param = math.exp(log_param)
-            K = _kernel_at(param)
-            C = _W.T @ K                      # (m_g, M_g)
-            E = C @ _W                        # (m_g, m_g)
-            E[np.diag_indices_from(E)] += _tau
-            WC = _W @ C                       # (M_g, M_g)
-            A = K - WC - WC.T + _W @ (E @ _W.T)
-            Lambda, V = np.linalg.eigh(A)
-            Lambda = np.maximum(Lambda[:_M_minus_m], 0.0)
-            V = V[:, :_M_minus_m]
-
-            per_c: Dict[int, dict] = {}
-            total_nll = 0.0
-            for c in _cols_g:
-                z = V.T @ _psi_proj[c]
-
-                def inner(log_lam: float, _z=z, _Lambda=Lambda) -> float:
-                    denom = _Lambda + math.exp(log_lam)
-                    s2_val = np.sum(_z ** 2 / denom) / _M_minus_m
-                    s2_val = max(s2_val, 1e-300)
-                    return (_M_minus_m / 2.0) * math.log(s2_val) + 0.5 * np.sum(np.log(denom))
-
-                # The search for lam_c is bounded below by lam_floor,c
-                # at THIS candidate width (Lambda, z both depend on it).
-                lam_floor_c = _lambda_floor(z, Lambda, _M_minus_m, _n_c2[c])
-                lo_bound = max(math.log(lam_floor_c), _LOG_LAM_LO)
-                if lo_bound >= _LOG_LAM_HI:
-                    # The declared floor already pins lam_c at the
-                    # ceiling: no interval left to search.
-                    log_lam_star = _LOG_LAM_HI
-                    nll_c = inner(log_lam_star)
-                else:
-                    ir = minimize_scalar(inner, bounds=(lo_bound, _LOG_LAM_HI), method='bounded')
-                    log_lam_star = float(ir.x)
-                    nll_c = float(ir.fun)
-                per_c[c] = dict(log_lam=log_lam_star, nll=nll_c, lam_floor=lam_floor_c)
-                total_nll += nll_c
-
-            _trace.append(dict(log_param=log_param, param=param, K=K, per_c=per_c, nll=total_nll))
-            return total_nll
-
-        for lp in grid_log_param:
-            outer_obj(float(lp))
+                       _psi_proj=psi_proj, _W=W_g, _tau=tau_g, _M_minus_m=M_minus_m,
+                       _n_c2=n_c2_g, _gpwidth=gpwidth, _D=D_full_g, _h=h_design_g,
+                       _dz=d_z) -> float:
+            entry, _wall = _width_grid_candidate(
+                log_param, _gpwidth, _D, _h, _dz, _W, _tau, _M_minus_m, _cols_g, _psi_proj, _n_c2)
+            _trace.append(entry)
+            return entry['nll']
 
         grid_nlls = [t['nll'] for t in trace[:_N_WIDTH_GRID]]
         best_idx = int(np.argmin(grid_nlls))
@@ -737,7 +781,7 @@ def fit_influence_model(
             model.median_sigma[c] = float(np.median(sigma_full[:, c]))
             model.p95_sigma[c] = float(np.percentile(sigma_full[:, c], 95))
 
-    return model
+    return model, model_busy
 
 
 def _coordinate_groups(model: InfluenceModel) -> List[List[int]]:
@@ -757,17 +801,16 @@ def _coordinate_groups(model: InfluenceModel) -> List[List[int]]:
 def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     """
     The one pass of the posterior over the N rows of Z, cached on the
-    model and keyed on the identity of `Z`. Returns psi0, sigma, the
-    per-point affine-mean residuals r_i and -- within the memory
-    budget -- the kernel rows themselves, all of which `psi0`,
-    `uncertainty` and `bin_posterior_variance` read instead of
-    recomputing. psi0 and sigma are produced together because they
-    share the kernel rows k(x_i, w_j), which every caller asks for on
-    every draw. Under `gpwidth='local'` those rows come from
-    `_matern32_nonstationary` at each query row's own length scale
-    c*h[bmu_i] (`model.bmu`, set at fit time) against the design's
-    c*h_design; under 'global' from `_matern32` at the group's shared
-    ell.
+    model and keyed on the identity of `Z`. Returns psi0, sigma and the
+    per-point affine-mean residuals r_i, which `psi0`, `uncertainty` and
+    `bin_posterior_variance` read instead of recomputing. psi0 and
+    sigma are produced together because they share the kernel rows
+    k(x_i, w_j), formed in row chunks of at most `_UNCERTAINTY_BATCH_
+    CAP` and never held beyond the chunk that used them (E4). Under
+    `gpwidth='local'` those rows come from `_matern32_nonstationary` at
+    each query row's own length scale c*h[bmu_i] (`model.bmu`, set at
+    fit time) against the design's c*h_design; under 'global' from
+    `_matern32` at the group's shared ell.
     """
     cached = model._points
     if cached is not None and cached.Z is Z:
@@ -785,26 +828,16 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     psi0_out = np.empty((N, q), dtype=float)
     sigma_out = np.zeros((N, q), dtype=float)
     R_out: List[Optional[np.ndarray]] = [None] * q
-    K_out: List[Optional[np.ndarray]] = [None] * q
 
     for c in range(q):
         if model.constant_path[c]:
             psi0_out[:, c] = model.const_value[c]
 
     groups = _coordinate_groups(model)
-
-    # The kernel-row cache is all-or-nothing across the groups: one
-    # budget, so a draw either keeps every group's rows or re-forms
-    # every group's rows, and no group's numbers depend on how another
-    # group's memory came out.
-    cache_bytes = sum(N * model.centers[g[0]].shape[0] for g in groups) * 8
-    cache_rows = cache_bytes <= _KERNEL_CACHE_BYTES
-
     batch = _UNCERTAINTY_BATCH_CAP
     for cols in groups:
         c0 = cols[0]
         centers_g = model.centers[c0]
-        M_g = centers_g.shape[0]
         m_g = int(model.m[c0])
         V_K = model.k_eigvec[c0]
         Lambda_K = model.k_eigval[c0]
@@ -827,10 +860,6 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
             B_by_c[c] = HbV_g * w_c[:, None]
             R_out[c] = np.empty((N, m_g), dtype=float)
 
-        K_g = np.empty((N, M_g), dtype=float) if cache_rows else None
-        for c in cols:
-            K_out[c] = K_g
-
         for start in range(0, N, batch):
             sl = slice(start, start + batch)
             Zc = Zw[sl]
@@ -843,9 +872,6 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
 
             for c in cols:
                 psi0_out[sl, c] = Hc @ model.beta[c] + Kc @ model.alpha[c]
-
-            if K_g is not None:
-                K_g[sl] = Kc
 
             Pc = Kc @ V_K  # (nb, M_g); ONE product for every output
             for c in cols:
@@ -865,8 +891,7 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
                 sigma2 = np.maximum(sigma2, 0.0)
                 sigma_out[sl, c] = np.sqrt(sigma2)
 
-    terms = _PointTerms(Z=Z, Zw=Zw, psi0=psi0_out, sigma=sigma_out,
-                        R=R_out, K=K_out)
+    terms = _PointTerms(Z=Z, Zw=Zw, psi0=psi0_out, sigma=sigma_out, R=R_out)
     model._points = terms
     return terms
 
@@ -935,9 +960,10 @@ def bin_posterior_variance(
 
     `R` is a row sum of the per-point residuals `_point_terms` already
     cached; `s` is accumulated over the group's rows in chunks of at
-    most 2048, from the cached kernel rows when available. `SS_k` is
-    the one term no cache removes -- a sum of raw kernel values between
-    the bin's OWN points. Under `gpwidth='global'` in one dimension,
+    most 2048, from kernel rows formed fresh in each chunk (E4: no
+    N x M array, cached or not). `SS_k` is the one term chunking alone
+    does not shrink -- a sum of raw kernel values between the bin's OWN
+    points. Under `gpwidth='global'` in one dimension,
     `_matern32_self_sum_1d` gets it in O(n_k log n_k) (a shortcut valid
     only for that stationary kernel); otherwise, and always under
     `gpwidth='local'` (the kernel is non-stationary, so no running-sum
@@ -963,7 +989,6 @@ def bin_posterior_variance(
     Zw_full = terms.Zw
     d_z = Zw_full.shape[1]
     R_full = terms.R[c]
-    K_full = terms.K[c]
     sigma_c = np.asarray(sigma_c, dtype=float)
 
     s2_c = float(model.s2[c])
@@ -1006,9 +1031,7 @@ def bin_posterior_variance(
             sl = slice(start, start + _BPV_CHUNK)
             Zc = Zw_k[sl]
 
-            if K_full is not None:
-                Kc = K_full[idx[sl]]  # (nb, M), the rows already formed
-            elif is_local:
+            if is_local:
                 Kc = _matern32_nonstationary(cdist(Zc, centers_c), ell_row_bin[sl], h_col, d_z)
             else:
                 Kc = _matern32(cdist(Zc, centers_c), ell_c)  # (nb, M)

@@ -5,11 +5,11 @@ the full data (spec/method_notes.md sections 1 and 4).
 
 `build_bins` runs 1-D k-means on the raw psi0_c values at the initial
 count M_init = min(ceil(sqrt(2.7/eps)), n_distinct). `bin_differences`
-measures the resulting bins on the full data (`core.differences.
-difference`), giving each bin's finite-differenced influence U_k.
-`between_terms` reduces those to V_btw. `kmeans_1d` lives here, not in
-`refine.py`, because `build_bins` and `refine.py`'s level split both
-use the same one-dimensional quantizer.
+measures the resulting bins on the full data, serially or as pool tasks
+(method_notes section 4), giving each bin's finite-differenced
+influence U_k. `between_terms` reduces those to V_btw. `kmeans_1d`
+lives here, not in `refine.py`, because `build_bins` and `refine.py`'s
+level split both use the same one-dimensional quantizer.
 
 A failed evaluation of an initial bin (spec section 5) makes the whole
 draw's QIJ result for this coordinate a write-off: `bin_differences`
@@ -21,11 +21,14 @@ and `U` all NaN; `refine.run_refinement` turns that into a NaN
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, replace
+from typing import Tuple
 
 import numpy as np
 
-from .differences import central_step, difference, perturbed_weights
+from ..parallel import prepared
+from .differences import central_step, difference, perturbed_weights, step_parameter
 
 __all__ = ["BinSet", "kmeans_1d", "within_share", "build_bins", "bin_differences", "between_terms"]
 
@@ -178,46 +181,96 @@ def build_bins(values: np.ndarray, eps: float) -> BinSet:
     )
 
 
-def bin_differences(X: np.ndarray, counter, theta_hat: np.ndarray, binset: BinSet, eta: float) -> BinSet:
+def _bin_failed(binset: BinSet, M_used: int, q: int) -> BinSet:
+    """Failed measurement: U/centering_residual NaN, failed=True."""
+    return replace(binset, U=np.full((M_used, q), np.nan), centering_residual=np.full(q, np.nan), failed=True)
+
+
+def _bin_done(binset: BinSet, U: np.ndarray, p: np.ndarray) -> BinSet:
+    """Completed measurement: U centered by sum_k p_k U_k."""
+    cr = p @ U
+    return replace(binset, U=U - cr, centering_residual=cr, failed=False)
+
+
+def _bin_task(T, case, X: np.ndarray, task):
+    """One stencil evaluation on the pool (spec section 4): `task` is
+    (bin k, signed step t, member mask); `T.prepare(X)` cached per
+    worker by identity. Returns (k, t, evaluation, failure flag, this
+    call's own wall time)."""
+    k, t, mask = task
+    prep = prepared(T, X)
+    omega = perturbed_weights(np.ones(len(X)), mask, t)
+    t0 = time.perf_counter()
+    try:
+        result = T(X, omega, prep=prep) if prep is not None else T(X, omega)
+        result = np.asarray(result, dtype=float)
+        failed = bool(np.any(np.isnan(result)))
+    except Exception:
+        result = np.full(len(T.outputs), np.nan)
+        failed = True
+    return k, t, result, failed, time.perf_counter() - t0
+
+
+def bin_differences(
+    X: np.ndarray, counter, theta_hat: np.ndarray, binset: BinSet, eta: float, pool=None,
+) -> Tuple[BinSet, float]:
     """
     Measure one coordinate's I-VQ on the full data (spec section 4):
-    for each bin k, in order, the central stencil against the bin's
-    own mass (`differences.difference`, step delta = central_step(eta)).
-    A NaN in any U_k stops the loop at that bin and returns
-    `failed=True` with U/centering_residual all NaN. Otherwise U is
-    centered by the bin-mass-weighted residual centering_residual =
-    sum_k p_k U_k, kept on the returned `BinSet` for `refine.
-    run_refinement` to reuse. At most M_used evaluations of `counter`,
-    never a Python loop over the N data points.
+    for each bin k, in order, the central stencil against the bin's own
+    mass. A NaN in any U_k stops the loop at that bin, returning
+    `failed=True` with U/centering_residual all NaN; otherwise U is
+    centered by centering_residual = sum_k p_k U_k, kept on the `BinSet`
+    for `refine.run_refinement` to reuse.
+
+    With a `pool`, every bin's +t/-t evaluations run as pool tasks
+    against X (shared by the caller); `pool.map` returns them in task
+    order, so `results[2k]`/`results[2k+1]` are bin k's own pair,
+    assembled into the same U above. Counted evaluations match the
+    serial loop exactly (every bin before the first failure, plus that
+    bin's own two -- `difference` always evaluates both); a later bin's
+    task still ran and its wall time is in `busy_delta` regardless.
+    Returns (binset, busy_delta); busy_delta is 0.0 with `pool=None`.
     """
     N = binset.labels.size
     theta_hat = np.asarray(theta_hat, dtype=float)
     q = theta_hat.size
     M_used = binset.M_used
-
     delta = central_step(eta)
     p = binset.p
+
+    if pool is None:
+        U = np.empty((M_used, q))
+        for k in range(M_used):
+            mask = binset.labels == k
+
+            def evaluate(t: float, _mask=mask) -> np.ndarray:
+                return counter(X, perturbed_weights(np.ones(N), _mask, t))
+
+            U_k = difference(float(p[k]), delta, evaluate)
+            if np.any(np.isnan(U_k)):
+                return _bin_failed(binset, M_used, q), 0.0
+            U[k] = U_k
+        return _bin_done(binset, U, p), 0.0
+
+    t_bin = [step_parameter(delta, float(pk)) for pk in p]
+    tasks = [(k, sign * t_bin[k], binset.labels == k)
+             for k in range(M_used) for sign in (+1.0, -1.0)]
+    t_map0 = time.perf_counter()
+    results = pool.map(_bin_task, tasks)
+    busy_delta = sum(r[4] for r in results) - (time.perf_counter() - t_map0)
+
     U = np.empty((M_used, q))
-
     for k in range(M_used):
-        mask = binset.labels == k
-
-        def evaluate(t: float, _mask=mask) -> np.ndarray:
-            omega = perturbed_weights(np.ones(N), _mask, t)
-            return counter(X, omega)
-
-        U_k = difference(float(p[k]), delta, evaluate)
+        _, _, result_p, failed_p, _ = results[2 * k]
+        _, _, result_m, failed_m, _ = results[2 * k + 1]
+        counter.add(1, N, int(failed_p))
+        counter.add(1, N, int(failed_m))
+        U_k = (result_p - result_m) / (2.0 * t_bin[k])
         if np.any(np.isnan(U_k)):
-            return replace(
-                binset, U=np.full((M_used, q), np.nan),
-                centering_residual=np.full(q, np.nan), failed=True,
-            )
+            return _bin_failed(binset, M_used, q), busy_delta
         U[k] = U_k
 
-    centering_residual = p @ U
-    U = U - centering_residual
-
-    return replace(binset, U=U, centering_residual=centering_residual, failed=False)
+    return _bin_done(binset, U, p), busy_delta
 
 
 def between_terms(binset: BinSet, coordinate: int) -> float:

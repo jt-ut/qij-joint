@@ -52,7 +52,11 @@ which the X-VQ degrades toward a subsample jackknife -- the X-VQ is
 given the same row budget as the finite differences of stage 2.
 
 The quantizer (`vqlp.VQFitter`, Euclidean, two best-matching units) is
-fit with no estimator evaluation. The prototype survey then evaluates
+fit with no estimator evaluation, at `workers` FAISS OpenMP threads
+(the pipeline's own worker count, 1 without a pool): the codebook fit
+and recall give identical centers, bmu and bmu2 at 1, 4 and 8 threads,
+so this is bit-identical, and the process's previous thread count is
+restored afterward. The prototype survey then evaluates
 T once on the prototypes, weights M_used*p, for theta_Q; for each
 prototype j, one forward difference at t_j = step_parameter(delta_f,
 p_j) gives I_j = [T(omega(t_j)) - theta_Q] / t_j. A failed prototype
@@ -75,6 +79,19 @@ rows and failure to the counter, so I_proto and every count are the same
 at any worker count. A worker computes `T.prepare(W_X)` once per draw.
 `busy_time_total` replaces the pool's elapsed time within the survey by
 the tasks' summed wall times; without a pool it equals the elapsed total.
+
+**theta_hat on a pool.** The full-data base evaluation theta_hat =
+T(X, ones(N)), used in stage 2, does not depend on stage 1's result. With
+a pool, X is shared once and theta_hat is submitted as a pool task
+immediately, before stage 1 runs, and collected once stage 1 finishes;
+the collecting call adds its evaluation, rows and failure to the counter
+at that point, so counts are the same as the serial call regardless of
+worker count. `wall_time_full_data` becomes the time spent waiting for
+the already-running task after stage 1, rather than the time to run it;
+its task time is added to `busy_time_total`. A draw whose stage 1 fails
+never collects this task: it is left uncounted, exactly as the serial
+code never reaches its own theta_hat call on that path. With `pool=None`
+the call is made in place, as before.
 
 ## 3. The influence model: trend, width search and noise floor
 
@@ -148,6 +165,8 @@ first M-m pairs are the ones profiling needs. This search (and the
 per-candidate eigendecomposition it shares across the group's outputs)
 is the same one `gpwidth='global'` runs over ell; over c it is the
 identical procedure with the non-stationary kernel in place of k_ell.
+The grid's five candidates, across every group, run as pool tasks when
+a pool is given; the bounded refinement between neighbours stays serial.
 
 **Noise floor.** The prototype influences are finite differences of
 accuracy eta, so I_proto carries real evaluation noise: noise sd
@@ -176,14 +195,18 @@ Lambda V^T instead of a per-output Cholesky solve of A_c = K +
 (lam_c+jit_c) I: P = K_n V is formed once per group and every output
 in it takes its own weighted row sums from it -- an equivalent
 factorisation of the same quantity, agreeing with the Cholesky form to
-rounding, not bit for bit, but never touching psi0 itself. v_k =
+rounding, not bit for bit, but never touching psi0 itself. No N x M
+array of kernel rows k(x_i, w_j) is ever formed, cached or not: K_n's
+rows are formed fresh in row chunks of bounded size (both here and at
+`bin_posterior_variance`'s own s = sum_{i in bin} k_i below), used
+within the chunk that formed them, and never held past it. v_k =
 mean(diag Sigma_k) - mean(Sigma_k) is formed from bin-summed vectors,
 never an n_k x n_k matrix: mean(diag Sigma_k) is read from the
 already-computed sigma; mean(Sigma_k) needs s^T A^-1 s (through the
 shared eigendecomposition, kept on the same side of the subtraction as
 sigma's own factorisation, since v_k is a difference of two nearly
 equal quantities) and SS_k = sum_{i,j in bin} k(x_i,x_j), the one term
-no caching removes. Under `gpwidth='global'`, for a one-dimensional
+no chunking shrinks the cost of. Under `gpwidth='global'`, for a one-dimensional
 design, SS_k comes from running sums over the sorted points
 (O(n_k log n_k)) rather than the pairwise double sum: with
 c = sqrt(3)/ell and u_i = x_i - o against a local origin o,
@@ -211,6 +234,20 @@ assignment against prototype midpoints, update by two `bincount`s
 `bin_differences` then central-stencils each bin (section 1) against
 the shared base value theta_hat; a NaN stops the loop at the failing
 bin. V_btw = (1/N) sum_k p_k U_k^2 over the initial bins.
+
+**Initial bins on a pool.** With a pool, every bin's +t and -t stencil
+evaluations run as pool tasks against X (shared once, before this
+coordinate's stencils run); each task carries its bin index, its signed
+step, and the bin's own membership mask, and returns its evaluation, a
+failure flag and its own wall time. The parent assembles them in bin
+order into the same U the serial loop computes, and counts the same
+evaluations the serial loop would have: every bin before the first
+failure, plus that failing bin's own two evaluations (the central
+stencil always evaluates both +t and -t, never stopping between them).
+A later bin's task still ran on the pool and its wall time is added to
+`busy_time_total` regardless, since the work was done; it is simply not
+counted as an evaluation the draw needed. The refinement loop's own
+split evaluations below always stay serial.
 
 **Split rule.** Each open leaf is priced once at creation (its
 Var(psi0) and mean of centered psi0 depend only on its own fixed point
@@ -273,7 +310,7 @@ mean of centered psi0 over the bin. V_tot_hat = V_btw + V_win_hat.
 ## 5. GMM2D
 
 `gmm.py`'s 2-D Gaussian-mixture estimator: K components, free full
-covariances, fit by multi-start weighted EM, polished with an exact
+covariances, fit by multi-start weighted EM, polished with a damped
 Newton step, with an analytic influence via Louis's (1982) identity.
 `GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500)`; `T(X, w) ->
 ndarray(p,)` never raises (a failed fit is NaN); no state between
@@ -296,11 +333,19 @@ in a single matmul (`_log_density_coeffs`, `_e_step_fast`). `Q`'s first
 five columns, in the same order, are the M-step's `(N,5)` moment matrix
 `XP = Q[:, :5]`, a view, not a second array built over the same data.
 
-**Multi-start**, drawn once from `X` alone (K distinct data points as
-means, the unweighted data covariance scaled by `1/K` as every
-component's start, equal mixing weights) via
-`np.random.default_rng(seed)`, deliberately blind to `w` so a weight
-perturbation cannot move the starting points.
+**Multi-start**, drawn once from `X` alone, deliberately blind to `w` so
+a weight perturbation cannot move the starting points. Each of the
+`n_starts` starts is a k-means clustering of `X` into `K` clusters
+(`scipy.cluster.vq.kmeans2`, `minit='++'` seeding, Lloyd iterations run
+well past the point the assignments stop changing): a start's means are
+the cluster centroids, its mixing weights the cluster fractions, and
+each component's covariance is that cluster's own population covariance.
+A cluster with fewer than three distinct points, or whose points are
+collinear, has a singular covariance; that component's start covariance
+falls back to the unweighted data covariance scaled by `1/K` instead, so
+no start is degenerate at birth. Successive starts draw their k-means
+seeding from the same `np.random.default_rng(seed)`, so they differ from
+each other and the whole sequence is reproducible in `(X, seed)` alone.
 
 Two phases, shaped differently on purpose. Phase 1 (`_phase1_batch`)
 runs every start for a short, fixed `_SHORT_ITERS` budget in lockstep,
@@ -329,18 +374,27 @@ same optimum with swapped labels would make `T` discontinuous in `w`.
 taste): validated to not move the winning start or `theta_hat` relative
 to running every start to full budget.
 
-**Newton polish** (`_fit`) takes up to `_MAX_NEWTON = 20` steps
-`theta <- theta + A^-1 (weighted mean score)`, using the same analytic
-score/information the influence needs. A step is accepted only if the
-weighted log-likelihood does not decrease and every component's
-covariance stays positive-definite; otherwise the polish stops and the
-current point is kept. The loop stops on either of two conditions: the
-weighted mean score's norm falling below `_NEWTON_SCORE_TOL` (~1e-14,
-the machine floor), or that norm no longer improving by a clear factor
-(`_NEWTON_PROGRESS_FACTOR`) once it is already below
-`_NEWTON_PROGRESS_FLOOR` -- a residual already at the noise floor can
-otherwise spend several more full information-matrix assemblies
-bouncing in place for no further change in theta.
+**Newton polish** (`_fit`) takes up to `_MAX_NEWTON = 20` damped Newton
+steps `theta <- theta + t * A^-1 (weighted mean score)`, using the same
+analytic score/information the influence needs. At each iteration the
+full step (`t = 1`) is tried first; it is accepted if the new point is
+valid (every mixing weight positive, every component's covariance
+positive-definite, log-likelihood finite) and the weighted
+log-likelihood does not decrease, otherwise `t` is halved and the trial
+repeated, up to `_MAX_HALVINGS = 30` halvings (`t` as small as
+`2^-30 ~ 1e-9`). A full step from an unconverged EM point is a step from
+outside the region the Newton model is locally accurate in, and
+routinely overshoots a small mixing weight past zero or a covariance
+past positive-definiteness; damping recovers a usable step there while
+leaving a polish that already accepts the full step at every iteration
+identical to before. If no step at any damping level is admissible, the
+polish stops and the current point is kept. The loop otherwise stops on
+either of two conditions: the weighted mean score's norm falling below
+`_NEWTON_SCORE_TOL` (~1e-14, the machine floor), or that norm no longer
+improving by a clear factor (`_NEWTON_PROGRESS_FACTOR`) once it is
+already below `_NEWTON_PROGRESS_FLOOR` -- a residual already at the
+noise floor can otherwise spend several more full information-matrix
+assemblies bouncing in place for no further change in theta.
 
 **Residual and `eta`.** After the polish loop exits, `resid =
 norm(A^-1 s_bar) / (1 + norm(theta_hat))` at the final point -- a

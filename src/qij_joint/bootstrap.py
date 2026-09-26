@@ -12,13 +12,8 @@ from typing import Optional
 
 import numpy as np
 
-from .parallel import Pool
+from .parallel import Pool, prepared
 from .result import BootstrapResult
-
-# Single-slot, per-process cache: `T.prepare(X)` recomputed only when this
-# worker sees a new draw's X, reused for every chunk of that draw.
-_prep_X = None
-_prep_value = None
 
 
 def _boot_task(T, case, X: np.ndarray, counts: np.ndarray):
@@ -27,13 +22,7 @@ def _boot_task(T, case, X: np.ndarray, counts: np.ndarray):
     failing evaluation is caught here, the one place an estimator's
     exception is allowed to turn into a NaN replicate rather than
     aborting the chunk."""
-    global _prep_X, _prep_value
-    prep = None
-    if hasattr(T, 'prepare'):
-        if X is not _prep_X:
-            _prep_value = T.prepare(X)
-            _prep_X = X
-        prep = _prep_value
+    prep = prepared(T, X)
     m, q = counts.shape[0], len(T.outputs)
     out = np.empty((m, q), dtype=float)
     t0 = time.perf_counter()

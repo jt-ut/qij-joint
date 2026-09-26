@@ -63,6 +63,10 @@ class CoordinateResult:
                         this output; `qij.py` voids every coordinate's
                         variance quantities on the draw when any one
                         coordinate's failed is True.
+    busy_delta          wall time this coordinate's initial-bin pool
+                        tasks spent beyond `bin_differences`'s own
+                        elapsed time (method_notes section 4); 0.0
+                        without a pool.
     """
 
     coordinate: int
@@ -81,6 +85,7 @@ class CoordinateResult:
     M_used: int
     n_refine_evals: int
     failed: bool = False
+    busy_delta: float = 0.0
 
 
 def _variance(values: np.ndarray) -> float:
@@ -153,7 +158,8 @@ def _degenerate_result(coordinate: int, name: str, N: int, bins0: BinSet, M_X_us
     )
 
 
-def _failed_result(coordinate: int, name: str, N: int, bins0: BinSet, M_X_used: int) -> CoordinateResult:
+def _failed_result(coordinate: int, name: str, N: int, bins0: BinSet, M_X_used: int,
+                    busy_delta: float = 0.0) -> CoordinateResult:
     """Stage 2's initial-bin measurement failed (`ivq.bin_differences`):
     every per-output variance quantity is NaN; the bins stage 2
     genuinely built before the failure (`bins0.labels`/`M_used`) are
@@ -166,7 +172,7 @@ def _failed_result(coordinate: int, name: str, N: int, bins0: BinSet, M_X_used: 
         L=bins0.M_used, n_level_splits=0, n_adjacency_splits=0,
         rho=float('nan'), gain_ratio=float('nan'),
         M_X=M_X_used, M_used=bins0.M_used, n_refine_evals=0,
-        failed=True,
+        failed=True, busy_delta=busy_delta,
     )
 
 
@@ -188,6 +194,7 @@ def run_refinement(
     constant_path: bool,
     Z: np.ndarray,
     model,
+    pool=None,
 ) -> CoordinateResult:
     """
     Refinement for one estimand coordinate (spec/method_notes.md
@@ -201,7 +208,10 @@ def run_refinement(
     (resolved) second-BMU indices, shared across every coordinate.
     `Z` and `model` (the fitted `InfluenceModel`) price v_k, the
     within-bin posterior variance, via
-    `influence_model.bin_posterior_variance`.
+    `influence_model.bin_posterior_variance`. `pool`, when given, runs
+    the initial-bin stencils of `ivq.bin_differences` as pool tasks
+    (method_notes section 4); the refinement loop's own split
+    evaluations below stay serial regardless.
     """
     N = len(X)
 
@@ -210,9 +220,9 @@ def run_refinement(
     if constant_path or bins0.M_used <= 1:
         return _degenerate_result(coordinate, name, N, bins0, M_X_used)
 
-    bins0 = bin_differences(X, counter, theta_hat, bins0, eta)
+    bins0, busy_delta = bin_differences(X, counter, theta_hat, bins0, eta, pool)
     if bins0.failed:
-        return _failed_result(coordinate, name, N, bins0, M_X_used)
+        return _failed_result(coordinate, name, N, bins0, M_X_used, busy_delta)
 
     V_btw0 = between_terms(bins0, coordinate)
 
@@ -452,4 +462,5 @@ def run_refinement(
         L=L, n_level_splits=n_level_splits, n_adjacency_splits=n_adjacency_splits,
         rho=float(rho), gain_ratio=float(gain_ratio),
         M_X=M_X_used, M_used=bins0.M_used, n_refine_evals=n_refine_evals,
+        busy_delta=busy_delta,
     )

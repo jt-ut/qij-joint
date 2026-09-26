@@ -1,8 +1,8 @@
 """
-The X-VQ: quantize the data, then measure the influence at each
-prototype by forward differences (spec/method_notes.md section 2),
-`prototype_influences`' per-prototype step run through `pool` when
-given (method_notes section 2). `run_xvq` is stage 1 in full.
+The X-VQ: quantize the data (`fit_xvq`, at `workers` FAISS threads),
+then measure the influence at each prototype by forward differences
+(spec/method_notes.md section 2), `prototype_influences`' per-prototype
+step run through `pool` when given. `run_xvq` is stage 1 in full.
 """
 
 from __future__ import annotations
@@ -12,20 +12,17 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Tuple
 
+import faiss
 import numpy as np
 from vqlp import VQFitter
 
+from ..parallel import prepared
 from .differences import forward_step, perturbed_weights, step_parameter
 
 _KAPPA_REF = 2.7
 # Row batch for the second-BMU repair: bounds the (rows, M_used)
 # distance block at tens of megabytes rather than gigabytes at large N.
 _BMU2_BATCH_CAP = 4096
-
-# Per-process, per-draw `prepare(W_X)` cache, keyed on identity --
-# `bootstrap._boot_task`'s pattern, since every survey task shares W_X.
-_prep_W_X = None
-_prep_value = None
 
 
 @dataclass
@@ -48,16 +45,23 @@ def cost_rule_M(N: int, q: int, eps: float) -> int:
     return min(max(M_X, 20), N // 2)
 
 
-def fit_xvq(Z: np.ndarray, M: int, seed: int) -> XVQ:
+def fit_xvq(Z: np.ndarray, M: int, seed: int, workers: int = 1) -> XVQ:
     """k-means on Z via `vqlp.VQFitter`; empty receptive fields dropped
     (M_used <= M), BMUs and CADJ reindexed to the live prototypes. No
-    estimator evaluation."""
+    estimator evaluation. FAISS's OpenMP thread count is set to
+    `workers` for the fit and recall, then restored -- identical
+    centers/bmu/bmu2 at 1, 4 and 8 threads (method_notes section 2)."""
     Z = np.asarray(Z, dtype=float)
     N = Z.shape[0]
 
-    fitter = VQFitter(M=M, p=2, max_bmu=2, random_state=seed, verbose=False)
-    fitter.fit(Z)
-    fitter.recall(Z)
+    prev_threads = faiss.omp_get_max_threads()
+    faiss.omp_set_num_threads(workers)
+    try:
+        fitter = VQFitter(M=M, p=2, max_bmu=2, random_state=seed, verbose=False)
+        fitter.fit(Z)
+        fitter.recall(Z)
+    finally:
+        faiss.omp_set_num_threads(prev_threads)
     rec = fitter.recaller
 
     RFSize = rec.RFSize
@@ -111,14 +115,8 @@ def _survey_task(T, case, W_X: np.ndarray, task):
     section 2). A failing evaluation is caught here, this task's own
     declared failure boundary. Returns (j, raw evaluation, failure
     flag, this call's own wall time)."""
-    global _prep_W_X, _prep_value
     j, omega = task
-    prep = None
-    if hasattr(T, 'prepare'):
-        if W_X is not _prep_W_X:
-            _prep_value = T.prepare(W_X)
-            _prep_W_X = W_X
-        prep = _prep_value
+    prep = prepared(T, W_X)
     t0 = time.perf_counter()
     try:
         result = T(W_X, omega, prep=prep) if prep is not None else T(W_X, omega)
@@ -187,13 +185,13 @@ def prototype_influences(
 
 def run_xvq(
     Z: np.ndarray, inverse: Callable[[np.ndarray], np.ndarray], counter, eta: float,
-    M: int, seed: int, pool=None,
+    M: int, seed: int, pool=None, workers: int = 1,
 ) -> Tuple[XVQ, np.ndarray, np.ndarray, float]:
-    """Stage 1 in full: fit the codebook on Z, map its prototypes to
-    T's native coordinates with `inverse`, and survey them, on `pool`
-    when given (method_notes section 2). The only function in `core/`
-    that calls `inverse`."""
-    xvq = fit_xvq(Z, M, seed)
+    """Stage 1 in full: fit the codebook on Z (at `workers` FAISS
+    threads), map its prototypes to T's native coordinates with
+    `inverse`, and survey them, on `pool` when given (method_notes
+    section 2). The only function in `core/` that calls `inverse`."""
+    xvq = fit_xvq(Z, M, seed, workers)
     W_X = inverse(xvq.centers)
     theta_Q, I_proto, busy_delta = prototype_influences(W_X, counter, xvq.p, eta, pool)
     return xvq, theta_Q, I_proto, busy_delta

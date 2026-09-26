@@ -212,15 +212,16 @@ field equals the ported path bit for bit, on the audit draws of testing
 rule 2 and nothing else.
 
 Measurement (one agent, after the audit, no package change; testing rule 3
-applies). Chacon mixture 11, the K = 9 estimator with the reference labelling of
-A6, one draw at seed 0, N = 2000 at two explicit prototype counts, `M_X = 376`
-(the author's experience is that about that many resolve mixture 11's
-spikes) and `M_X = 188` (half of it), and N = 5000 at `M_X = 600` only if
-the timed call projects the whole measurement under the 20-minute budget.
-(The A4 rule itself gives the cap, 1000, for this 53-output estimator,
-which is why the counts are explicit.) Per (N, M_X): one 𝒳-VQ and one survey, shared by the
-four switch combinations (the survey does not depend on the switches);
-then four GP fits. Reported per combination and output: the mass-weighted
+applies). **Author's ruling, 26 September: a measurement of a property of
+the code uses a simple estimator already in the package, not the mixture.**
+(The first attempt on mixture 11 produced nothing: the K = 9 fit at defaults
+did not converge on the seed-0 draw at N = 2000 or 5000, so there was no
+reference fit and no oracle influence. Mixture 11 is the talk demo's
+estimand, not a test bench.) The measurement is therefore the Fundamental
+Plane, `fp all` (q = 4, d_x = 3, analytic influence), N = 2000, one draw at
+seed 0, at `M_X = 371` (the rule) and `M_X = 742` (twice it). Per M_X: one
+𝒳-VQ and one survey, shared by the four switch combinations (the survey
+does not depend on the switches); then four GP fits. Reported per combination and output: the mass-weighted
 mean squared error of ψ̂₀ against the analytic influence; the share of the
 output's oracle variance recovered by 17 level-set bins of ψ̂₀, built with
 the ported 1-D quantizer on ψ̂₀ and scored with the analytic influence, no
@@ -361,9 +362,13 @@ for bit at any worker count, on the audit draws of testing rule 2 and
 nothing else.
 
 Measurement (one agent, after the audit, no package change; testing rule 3
-applies). Mixture 11, N = 2000 only, one draw at seed 0, `M_X` at the count the
-author selects from A5 (188 or 376), `ivqbins=joint`, wave A's switches at
-the values the author selects from A5. Two runs of the joint path on that one draw, at 1 worker and at 8
+applies). By the same ruling as A5, the Fundamental Plane (`fp all`), N = 2000, one
+draw at seed 0, `M_X` at the count the author selects from A5 (371 or 742),
+`ivqbins=joint`, wave A's switches at the values the author selects from
+A5. (At q = 4 the joint path is not expected to save evaluations over the
+marginal one, whose initial count is 1 + 2·4·17 = 137; this measurement is
+of the mechanism, growth, check and parallel rounds, not of the saving,
+which needs a large-q estimand and waits for the demo.) Two runs of the joint path on that one draw, at 1 worker and at 8
 workers, identical in every field but timing; plus growth alone, which
 spends no evaluations, repeated with and without the Lloyd pass. Reported:
 L0 with and without the Lloyd pass and S_pred for each; S_pred against the
@@ -372,8 +377,8 @@ evaluation); n_flagged, n_check_rounds, n_check_evals; V_btw against the
 oracle variance per output; wall time by stage at 1 and 8 workers.
 Evaluations spent: 1 + M_𝒳 on M_𝒳 rows, then 1 + 2·L0 + n_check_evals on
 the full data, twice. The marginal path is NOT run; its initial count
-1 + 2·q·17 = 1803 is stated as arithmetic beside the joint count. No
-bootstrap. One table. Report as found.
+1 + 2·q·17 = 137 for the Fundamental Plane is stated as arithmetic beside
+the joint count. No bootstrap. One table. Report as found.
 
 ---
 

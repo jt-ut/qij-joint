@@ -3,8 +3,8 @@ covariances) with an analytic influence function via Louis's (1982)
 identity.
 
 `GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`
-fits by multi-start weighted EM, polishes the winning start with an
-exact Newton step on the mixture log-likelihood, and reports the score
+fits by multi-start weighted EM, polishes the winning start with a
+damped Newton step on the mixture log-likelihood, and reports the score
 and observed information at the fit for `influence`. Follows
 `estimators.py`'s conventions: `T(X, w) -> ndarray(p,)` never raises (a
 failed fit is NaN); no state between calls. With `reference`, every
@@ -23,14 +23,17 @@ otherwise rebuilt on every evaluation of the same X.
 """
 
 from collections import namedtuple
+import warnings
 
 import numpy as np
+from scipy.cluster.vq import kmeans2
 from scipy.optimize import linear_sum_assignment
 
 _LOG2PI = float(np.log(2.0 * np.pi))
 _ACCEPT_TOL = 1e-9
 _COND_MAX = 1e12
 _MAX_NEWTON = 20
+_MAX_HALVINGS = 30
 _NEWTON_SCORE_TOL = 1e-14
 _NEWTON_PROGRESS_FLOOR = 1e-11
 _NEWTON_PROGRESS_FACTOR = 0.1
@@ -42,6 +45,13 @@ _ETA_DEFAULT = 1e-12
 # budget.
 _SHORT_ITERS = 25
 _PROMOTE_N = 3
+
+# scipy.cluster.vq.kmeans2 runs exactly this many Lloyd iterations (its
+# `thresh` argument is not implemented as a convergence test), so this is
+# set well past the point a k-means run on data of this scale has any
+# label left to reassign; further iterations after that point are exact
+# no-ops, not a source of nondeterminism or extra failure.
+_KMEANS_ITER = 300
 
 _D = {
     'S11': np.array([[1.0, 0.0], [0.0, 0.0]]),
@@ -101,18 +111,44 @@ def _unpack(K: int, theta: np.ndarray):
 # ======================================================================
 
 def _starts(X: np.ndarray, K: int, n_starts: int, seed: int):
-    """Deterministic in (X, seed) only -- never sees w."""
+    """Deterministic in (X, seed) only -- never sees w (the estimator
+    must stay continuous in w, which is why the starts cannot depend on
+    it). Each of the `n_starts` starts is a standard k-means clustering
+    of X into K clusters (`scipy.cluster.vq.kmeans2`, `minit='++'`,
+    already a package dependency so no new one is added): a start's
+    means are the cluster centroids, its mixing weights the cluster
+    fractions, and each component's covariance is that cluster's own
+    population covariance. Successive starts draw their k-means seeding
+    from the same generator, so they differ from each other and the
+    whole sequence is reproducible in (X, seed) alone."""
     rng = np.random.default_rng(seed)
     N = X.shape[0]
     data_cov = np.cov(X.T, bias=True)
-    cov0 = data_cov / K
-    S0 = np.array([cov0[0, 0], cov0[0, 1], cov0[1, 1]])
+    S0 = np.array([data_cov[0, 0], data_cov[0, 1], data_cov[1, 1]]) / K
     out = []
     for _ in range(n_starts):
-        idx = rng.choice(N, size=K, replace=False)
-        mus0 = X[idx].astype(float).copy()
-        Ss0 = np.tile(S0, (K, 1))
-        pis0 = np.full(K, 1.0 / K)
+        with warnings.catch_warnings():
+            # A cluster left empty by ++ seeding is not a failure here:
+            # its covariance below is not finite/PD and falls back to
+            # S0, or (if that leaves the start unusable) phase 1 drops
+            # the whole start, exactly as any other degenerate start.
+            warnings.simplefilter('ignore')
+            centroids, labels = kmeans2(X, K, iter=_KMEANS_ITER, minit='++', seed=rng)
+        pis0 = np.bincount(labels, minlength=K).astype(float) / N
+        mus0 = centroids.astype(float).copy()
+        Ss0 = np.empty((K, 3))
+        for k in range(K):
+            pts = X[labels == k]
+            if pts.shape[0] == 0:
+                Ss0[k] = S0
+                continue
+            c = np.cov(pts.T, bias=True)
+            a, b, cc = c[0, 0], c[0, 1], c[1, 1]
+            det = a * cc - b * b
+            # A covariance from fewer than 3 distinct points, or from
+            # collinear points, is singular (det <= 0): fall back to S0
+            # so no start is degenerate at birth.
+            Ss0[k] = (a, b, cc) if (np.isfinite(det) and det > 0.0) else S0
         out.append((pis0, mus0, Ss0))
     return out
 
@@ -583,16 +619,31 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
             delta = np.linalg.solve(A, psi_bar)
         except np.linalg.LinAlgError:
             break
-        theta_new = theta + delta
-        pis_new, mus_new, Ss_new = _unpack(cfg.K, theta_new)
-        if np.any(pis_new <= 0.0):
+
+        # Backtracking (damped) Newton: try the full step first, then
+        # halve it on rejection. A full step from an unconverged EM point
+        # is a step from OUTSIDE the local quadratic region the Newton
+        # model is accurate in, and routinely overshoots a small mixing
+        # weight past zero or a covariance past positive-definiteness; a
+        # fit that is already close enough for the full step to be valid
+        # takes it on the first trial, so a clean polish is unaffected.
+        accepted = False
+        for n_halvings in range(_MAX_HALVINGS + 1):
+            theta_new = theta + delta * (0.5 ** n_halvings)
+            pis_new, mus_new, Ss_new = _unpack(cfg.K, theta_new)
+            if np.any(pis_new <= 0.0):
+                continue
+            try:
+                psi_new, A_new, ll_new = _score_info(X, Q, w, cfg.K, pis_new, mus_new, Ss_new)
+            except np.linalg.LinAlgError:
+                continue
+            if not np.isfinite(ll_new) or ll_new < ll - _ACCEPT_TOL:
+                continue
+            accepted = True
             break
-        try:
-            psi_new, A_new, ll_new = _score_info(X, Q, w, cfg.K, pis_new, mus_new, Ss_new)
-        except np.linalg.LinAlgError:
+        if not accepted:
             break
-        if not np.isfinite(ll_new) or ll_new < ll - _ACCEPT_TOL:
-            break
+
         theta, pis, mus, Ss = theta_new, pis_new, mus_new, Ss_new
         psi, A, ll = psi_new, A_new, ll_new
         polished = True

@@ -142,8 +142,9 @@ repo at build time).
 * E3. Linear algebra by factorization: Cholesky (`cho_factor`/`cho_solve`)
   or `solve`, never an explicit inverse; factor once, reuse for every
   right-hand side; exploit structure (diagonal, low rank, Woodbury).
-* E4. Memory is bounded: N x M kernel blocks are batched; nothing forms an
-  N x N or B x N array.
+* E4. Memory is bounded: no array with N rows and M (prototype) or N
+  columns is ever formed, cached or not; kernel products over the points
+  are computed in row chunks of bounded size; nothing forms a B x N array.
 * E5. Compute once, pass down: per-draw invariants are computed by the
   caller and passed in, never recomputed per call and never held in
   module-level caches (which break process parallelism and reproducibility).
@@ -188,21 +189,21 @@ qij_joint/
   src/qij_joint/
     __init__.py                10     exports QIJ, Bootstrap
     core/
-      counter.py               60     Counter: counts evaluations, rows, failures; holds prepare() state
+      counter.py               65     Counter: counts evaluations, rows, failures; holds prepare() state
       differences.py           80     step sizes, perturbed weights, the central stencil
-      xvq.py                  150     data quantizer, prototype survey
-      influence_model.py      900     the GP influence model (psi0, sigma, bin posterior variance)
-      ivq.py                  250     1-D influence quantizer, initial bins, bin differences, V_btw
+      xvq.py                  200     data quantizer, prototype survey
+      influence_model.py     1060     the GP influence model (psi0, sigma, bin posterior variance)
+      ivq.py                  285     1-D influence quantizer, initial bins, bin differences, V_btw
       refine.py               520     gain-driven refinement, V_win_hat, rho, psi_hat
-    qij.py                    145     QIJ.fit
+    qij.py                    240     QIJ.fit
     bootstrap.py              100     Bootstrap.fit, serial or on a pool
-    result.py                 105     QIJResult, BootstrapResult (.variance, .interval)
-    parallel.py               150     the one module that touches a process pool
+    result.py                 115     QIJResult, BootstrapResult (.variance, .interval)
+    parallel.py               165     the one module that touches a process pool
     estimators.py             650     pareto_shape, pareto_tail, mvt_nu, mvt_tail, fp, Chabrier
-    gmm.py                    680     GMM2D (not registered as a study case yet)
+    gmm.py                    800     GMM2D (not registered as a study case yet)
     datasets.py                90     data draws, mvt_vq_transform, population loaders
     registry.py                80     (dataset, estimator) -> Case; truth()
-    pipeline.py               300     the four methods' draw loops
+    pipeline.py               230     the four methods' draw loops
     products.py               130     the only module that knows the product layout
     check.py                   50     the one check
     data/
@@ -210,7 +211,7 @@ qij_joint/
       truth/pareto.json, mvt.json, fp.json, imf.json
 ```
 
-Total budget about 4,600 lines (budgets raised to the built sizes after the build, where the interface or an exact port set the size), against 7,600 in `qij` outside the
+Total budget about 5,000 lines (budgets raised to the built sizes where the interface, an exact port, or a later wave set the size), against 7,600 in `qij` outside the
 paper-only tables and figures.
 
 ### 6.2 Pinned interfaces (the three builders code against these)
