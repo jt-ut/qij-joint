@@ -516,11 +516,12 @@ selected for splitting has w_kc > 0 for some c and therefore at least
 two distinct rows. Growth also stops, `growth_capped` recorded, once L
 reaches M_X_used -- checked only after confirming the tolerance is
 still unmet, so a round that both converges and reaches the cap counts
-as converged, not capped. An optional Lloyd pass (`lloyd`, a `grow`
-argument the driver does not yet expose) then reassigns every point to
+as converged, not capped. A Lloyd pass then reassigns every point to
 its nearest of the L centroids at once, to convergence or 100
-iterations, dropping any centroid this empties; S_pred is read after
-this pass, S_pred_pre_lloyd before (NaN when the pass is not run).
+iterations, dropping any centroid this empties; it lowers the predicted
+within share at no evaluation cost and brings it close to the within
+share the true influence has on the same bins. S_pred is read after
+this pass, S_pred_pre_lloyd before.
 Growth spends no evaluations and never runs on `pool`.
 
 **Measurement.** The grown partition is measured by the existing

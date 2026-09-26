@@ -35,11 +35,9 @@ _CHUNK = 2048  # row chunk for the full-partition Lloyd reassignment (E4)
 class Growth:
     """The shared partition built by growth, before any evaluation.
     labels (N,) bin index per point, contiguous 0..L0-1; L0 the bin
-    count after growth (and the Lloyd pass, if kept); std (q,) =
-    sqrt(V_hat), so that Ψ̃ = psi0_all/std throughout; S_pred,
-    S_pred_pre_lloyd (q,) the predicted within share after / before the
-    optional Lloyd pass (S_pred_pre_lloyd all NaN when the pass was not
-    run)."""
+    count after growth and its Lloyd pass; std (q,) = sqrt(V_hat), so
+    that Ψ̃ = psi0_all/std throughout; S_pred, S_pred_pre_lloyd (q,) the
+    predicted within share after / before the Lloyd pass."""
 
     labels: np.ndarray
     L0: int
@@ -232,7 +230,7 @@ def _lloyd_all(psi_tilde: np.ndarray, labels: np.ndarray, L: int):
     return labels, L
 
 
-def grow(psi0_all: np.ndarray, eps: float, M_X_used: int, lloyd: bool = False) -> Growth:
+def grow(psi0_all: np.ndarray, eps: float, M_X_used: int) -> Growth:
     """
     Grow one shared partition of the N points from a single bin to the
     tolerance (spec/method_notes.md section 6), no evaluations. A round splits,
@@ -240,9 +238,10 @@ def grow(psi0_all: np.ndarray, eps: float, M_X_used: int, lloyd: bool = False) -
     max_c w_kc > eps/L; stops when every output's predicted within
     share S_c <= eps, or when L reaches M_X_used (`growth_capped`,
     checked only once tolerance is confirmed unmet, so a round that
-    both converges and reaches the cap counts as converged). `lloyd`
-    runs one extra Lloyd pass of all L centroids over every row
-    afterward; S_pred is taken after that pass, S_pred_pre_lloyd before.
+    both converges and reaches the cap counts as converged). Then one
+    Lloyd pass of all L centroids over every row, which lowers the
+    predicted within share at no evaluation cost; S_pred is taken after
+    that pass, S_pred_pre_lloyd before.
     """
     N, q = psi0_all.shape
     std = np.std(psi0_all, axis=0)
@@ -265,7 +264,7 @@ def grow(psi0_all: np.ndarray, eps: float, M_X_used: int, lloyd: bool = False) -
             break
         room = M_X_used - L  # each split adds one bin (1 -> 2)
         if to_split.size >= room:
-            # Cap (B2 step 5): every flagged split is feasible (w_kc > 0
+            # The cap: every flagged split is feasible (w_kc > 0
             # implies >= 2 distinct rows), so the `room` largest max_c
             # w_kc bins fill to M_X_used exactly, deterministically.
             order = np.argsort(-w[to_split].max(axis=1), kind='stable')
@@ -276,12 +275,9 @@ def grow(psi0_all: np.ndarray, eps: float, M_X_used: int, lloyd: bool = False) -
         if growth_capped:
             break
 
-    if lloyd:
-        S_pre = S
-        labels, L = _lloyd_all(psi_tilde, labels, L)
-        _, S = _predicted_share(psi0_all, V_hat, labels, L)
-    else:
-        S_pre = np.full(q, np.nan)
+    S_pre = S
+    labels, L = _lloyd_all(psi_tilde, labels, L)
+    _, S = _predicted_share(psi0_all, V_hat, labels, L)
 
     return Growth(labels=labels, L0=L, n_growth_rounds=n_rounds, growth_capped=growth_capped,
                   S_pred=S, S_pred_pre_lloyd=S_pre, std=std)
@@ -366,7 +362,7 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
 def run_joint(
     X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
     sigma_all: np.ndarray, model, Z: np.ndarray, xvq, eta: float, eps: float,
-    pool=None, lloyd: bool = False, I_proto: Optional[np.ndarray] = None,
+    pool=None, I_proto: Optional[np.ndarray] = None,
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -382,7 +378,7 @@ def run_joint(
     if np.any(model.constant_path):
         return _failed_result(N, q)
 
-    growth = grow(psi0_all, eps, M_X_used, lloyd=lloyd)
+    growth = grow(psi0_all, eps, M_X_used)
     L0 = growth.L0
     binset0 = BinSet(labels=growth.labels, n=np.bincount(growth.labels, minlength=L0),
                       U=np.zeros((L0, 0)), centering_residual=np.zeros(0),
