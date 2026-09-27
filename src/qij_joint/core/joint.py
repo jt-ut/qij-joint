@@ -20,10 +20,10 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..parallel import prepared
+from ..parallel import call_T
 from .differences import forward_step, perturbed_weights, step_parameter
 from .influence_model import bin_posterior_variance
-from .ivq import BinSet, between_terms, bin_differences
+from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences
 from .refine import adjacency_gain_value, adjacency_split_gain, level_gain_value
 
 __all__ = ["Growth", "JointResult", "grow", "run_joint", "two_means_split"]
@@ -51,8 +51,12 @@ class Growth:
 @dataclass
 class JointResult:
     """The joint second stage's complete result (spec/method_notes.md
-    section 6). Per output (q,): V_btw, V_win_hat, V_tot_hat, S_pred, a,
-    gain_ratio. Shared: L0, L (final), n_growth_rounds, growth_capped,
+    section 6). Per output (q,): V_btw, V_win_hat, V_tot_hat, S_pred, a
+    (the check's scale factor, B4), gain_ratio, B_hat and a_bca
+    (`ivq.bias_and_acceleration`'s ABC bias/acceleration, spec A10, from
+    the shared bins as measured before any check split -- named `a_bca`
+    to avoid colliding with the unrelated check scale factor `a`).
+    Shared: L0, L (final), n_growth_rounds, growth_capped,
     S_pred_pre_lloyd (q,), n_flagged (bins flagged in the first check),
     n_check_rounds, n_check_evals, n_level_splits, n_adjacency_splits,
     check_capped, failed (a failed output, or a failed initial
@@ -67,6 +71,8 @@ class JointResult:
     S_pred: np.ndarray
     a: np.ndarray
     gain_ratio: np.ndarray
+    B_hat: np.ndarray
+    a_bca: np.ndarray
     L0: int
     L: int
     n_growth_rounds: int
@@ -317,14 +323,14 @@ def _flag_mask(p, U, m, a, V_hat, u, L: int, eps: float) -> np.ndarray:
 def _split_task(T, case, X: np.ndarray, task):
     """One check-round split's one-shot forward evaluation, the
     same failure boundary as `ivq._bin_task`: `task` is (split id,
-    signed step t, member mask); returns (id, evaluation, failure flag,
-    this call's own wall time)."""
-    sid, t, mask = task
-    prep = prepared(T, X)
+    signed step t, member mask, start); `call_T` applies the
+    estimator's prepared state and the start-continuation rule (A9).
+    Returns (id, evaluation, failure flag, this call's own wall time)."""
+    sid, t, mask, start = task
     omega = perturbed_weights(np.ones(len(X)), mask, t)
     t0 = time.perf_counter()
     try:
-        result = T(X, omega, prep=prep) if prep is not None else T(X, omega)
+        result = call_T(T, X, omega, start)
         result = np.asarray(result, dtype=float)
         failed = bool(np.any(np.isnan(result)))
     except Exception:
@@ -351,6 +357,7 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
         mass = np.bincount(labels, minlength=L0).astype(float) / N
     return JointResult(
         V_btw=nan_q, V_win_hat=nan_q, V_tot_hat=nan_q, S_pred=S_pred, a=nan_q, gain_ratio=nan_q,
+        B_hat=nan_q, a_bca=nan_q,
         L0=L0, L=L0, n_growth_rounds=n_rounds, growth_capped=capped, S_pred_pre_lloyd=S_pre,
         n_flagged=0, n_check_rounds=0, n_check_evals=0, n_level_splits=0, n_adjacency_splits=0,
         check_capped=False, failed=True,
@@ -362,7 +369,7 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
 def run_joint(
     X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
     sigma_all: np.ndarray, model, Z: np.ndarray, xvq, eta: float, eps: float,
-    pool=None, I_proto: Optional[np.ndarray] = None,
+    pool=None, I_proto: Optional[np.ndarray] = None, start: np.ndarray = None,
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -370,7 +377,10 @@ def run_joint(
     `ivq.bin_differences`, then a measured check that splits a flagged
     bin, all a round's evaluations on `pool`. `I_proto` (M_X_used, q),
     the prototype influence from stage 1, feeds the check's adjacency
-    split.
+    split. `start` (A9's continuation rule, spec/QIJ_mods_waves.md A9)
+    is passed to every full-data evaluation here -- the initial bin
+    measurement and every check split; None reproduces today's
+    evaluations bit for bit.
     """
     N, q = psi0_all.shape
     M_X_used = xvq.M_used
@@ -381,12 +391,13 @@ def run_joint(
     growth = grow(psi0_all, eps, M_X_used)
     L0 = growth.L0
     binset0 = BinSet(labels=growth.labels, n=np.bincount(growth.labels, minlength=L0),
-                      U=np.zeros((L0, 0)), centering_residual=np.zeros(0),
+                      U=np.zeros((L0, 0)), centering_residual=np.zeros(0), D2=np.zeros((L0, 0)),
                       M_init=L0, M_used=L0, within_share=0.0, failed=False)
-    bins, busy_delta = bin_differences(X, counter, theta_hat, binset0, eta, pool)
+    bins, busy_delta = bin_differences(X, counter, theta_hat, binset0, eta, pool, start=start)
     if bins.failed:
         return _failed_result(N, q, growth=growth, busy_delta=busy_delta)
 
+    B_hat, a_bca = bias_and_acceleration(bins, N)
     V_btw = np.array([between_terms(bins, c) for c in range(q)])
     V_hat = growth.std ** 2
     psi_tilde = psi0_all / growth.std
@@ -468,11 +479,11 @@ def run_joint(
         if not proposals:
             continue
 
-        tasks = [(k, meta['t_small'], meta['mask']) for k, meta in proposals.items()]
+        tasks = [(k, meta['t_small'], meta['mask'], start) for k, meta in proposals.items()]
         if pool is None:
             evaluated = []
-            for k, t, mask in tasks:
-                val = np.asarray(counter(X, perturbed_weights(np.ones(N), mask, t)), dtype=float)
+            for k, t, mask, _start in tasks:
+                val = np.asarray(counter(X, perturbed_weights(np.ones(N), mask, t), start=_start), dtype=float)
                 evaluated.append((k, val, bool(np.any(np.isnan(val)))))
         else:
             t_map0 = time.perf_counter()
@@ -546,6 +557,7 @@ def run_joint(
     return JointResult(
         V_btw=V_btw, V_win_hat=V_win_hat, V_tot_hat=V_tot_hat,
         S_pred=growth.S_pred, a=a, gain_ratio=gain_ratio,
+        B_hat=B_hat, a_bca=a_bca,
         L0=L0, L=L_final, n_growth_rounds=growth.n_growth_rounds,
         growth_capped=growth.growth_capped, S_pred_pre_lloyd=growth.S_pred_pre_lloyd,
         n_flagged=n_flagged, n_check_rounds=n_check_rounds, n_check_evals=n_check_evals,

@@ -1,12 +1,13 @@
-"""The four paper draws (pareto, mvt, fp, imf), the MVT VQ transform, and
-the `mix11` demo mixture (spec/method_notes.md section 5; not one of
-the paper's four).
+"""The four paper draws (pareto, mvt, fp, imf), the MVT VQ transform, the
+`mix11` demo mixture (spec/method_notes.md section 5), and the
+`cloudfil_G_B6_P3_v1` demo (spec/QIJ_mods_waves.md A11); neither demo is
+one of the paper's four.
 
-Parametric draws (`pareto`, `mvt`, `mix11`) sample the named law
-directly. Population draws (`fp`, `imf`) resample with replacement from
-the pool files shipped under `data/`, loaded once per process (E5's
-named exception for constant data read from the package's own files)
-and never re-read per draw.
+Parametric draws (`pareto`, `mvt`, `mix11`, `cloudfil_G_B6_P3_v1`) sample
+the named law directly. Population draws (`fp`, `imf`) resample with
+replacement from the pool files shipped under `data/`, loaded once per
+process (E5's named exception for constant data read from the package's
+own files) and never re-read per draw.
 """
 
 import functools
@@ -67,6 +68,34 @@ def mix11(N: int, seed: int) -> np.ndarray:
     gen = ChaconMixGenerator(MIX11_MIXNUM)
     gen.weights = MIX11_WEIGHTS
     X, _ = gen.sample(N, random_state=seed)
+    return X
+
+
+@functools.lru_cache(maxsize=1)
+def _cloudfil_G_B6_P3_v1_pop() -> dict:
+    """The packaged `cloudfil_G_B6_P3_v1.npz` (weights, means, covs),
+    loaded once per process (E5's named exception for constant data read
+    from the package's own files)."""
+    with np.load(_DATA_DIR / 'cloudfil_G_B6_P3_v1.npz', allow_pickle=True) as data:
+        return dict(weights=data['weights'].astype(float),
+                    means=data['means'].astype(float),
+                    covs=data['covs'].astype(float))
+
+
+def cloudfil_G_B6_P3_v1(N: int, seed: int) -> np.ndarray:
+    """N draws from the `cloudfil_G_B6_P3_v1` mixture (spec/QIJ_mods_waves.md
+    A11): a multinomial component count from the file's weights, then a
+    multivariate normal draw per component. Returns (N, 2)."""
+    rng = np.random.default_rng(seed)
+    pop = _cloudfil_G_B6_P3_v1_pop()
+    counts = rng.multinomial(N, pop['weights'])
+    X = np.empty((N, 2))
+    start = 0
+    for k, n_k in enumerate(counts):
+        if n_k == 0:
+            continue
+        X[start:start + n_k] = rng.multivariate_normal(pop['means'][k], pop['covs'][k], size=n_k)
+        start += n_k
     return X
 
 

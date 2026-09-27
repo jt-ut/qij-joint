@@ -2,7 +2,19 @@
 seed).fit(X, T, pool=None)` draws `B` multinomial resamples of `X` and
 evaluates `T` on each. Identical at any worker count: the parent draws
 every replicate's counts, in replicate order, from one RNG stream --
-workers only evaluate `T` on rows the parent already drew.
+workers only evaluate `T` on rows the parent already drew. It also
+evaluates `theta_hat = T(X, ones(N))` once, outside that RNG stream, so
+`BootstrapResult.bc_interval` has the point estimate its z0 needs
+(spec/QIJ_mods_waves.md A10) without touching the replicates themselves.
+When `T.takes_start`, every replicate is warm-started from `theta_hat`
+(spec/QIJ_mods_waves.md A11), so `theta_hat` is awaited before the first
+replicate chunk is dispatched; an estimator without `takes_start` is
+bit-identical to before, `theta_hat`'s own evaluation still overlapping
+the first replicate chunks. When warm, `eta_full` is also measured from
+`theta_hat` on the full data (spec/QIJ_mods_waves.md A15) and every
+replicate's polish is held to it instead of `T`'s own declared `eta`,
+which the Newton cap (`gmm.py`'s `_MAX_NEWTON`) can otherwise reach
+before a fit at this scale has actually stalled.
 """
 from __future__ import annotations
 
@@ -12,23 +24,42 @@ from typing import Optional
 
 import numpy as np
 
-from .parallel import Pool, prepared
+from .core.eta import measure_eta_full
+from .parallel import Pool, call_T
 from .result import BootstrapResult
 
 
-def _boot_task(T, case, X: np.ndarray, counts: np.ndarray):
-    """Evaluate `T` at each row of `counts` against the shared `X`;
-    returns the chunk's replicates and this call's own wall time. A
-    failing evaluation is caught here, the one place an estimator's
-    exception is allowed to turn into a NaN replicate rather than
-    aborting the chunk."""
-    prep = prepared(T, X)
+def _theta_hat_task(T, case, X: np.ndarray, _task):
+    """T(X, ones(N)) on the shared draw: the bootstrap's own full-data
+    point estimate (spec/QIJ_mods_waves.md A10), submitted to the pool
+    at the start of `fit` so it overlaps with the first replicate
+    chunks rather than blocking them, and computed outside the resample
+    loop's own RNG stream. A failing evaluation is caught here, this
+    task's own declared failure boundary. Returns (evaluation, this
+    call's own wall time)."""
+    t0 = time.perf_counter()
+    try:
+        result = np.asarray(call_T(T, X, np.ones(len(X))), dtype=float)
+    except Exception:
+        result = np.full(len(T.outputs), np.nan)
+    return result, time.perf_counter() - t0
+
+
+def _boot_task(T, case, X: np.ndarray, task):
+    """Evaluate `T` at each row of `counts`, warm-started from `start`
+    at polish tolerance `eta` (`call_T` applies the `T.takes_start` gate
+    to both, so an estimator without it never sees either); returns the
+    chunk's replicates and this call's own wall time. A failing
+    evaluation is caught here, the one place an estimator's exception is
+    allowed to turn into a NaN replicate rather than aborting the
+    chunk."""
+    counts, start, eta = task
     m, q = counts.shape[0], len(T.outputs)
     out = np.empty((m, q), dtype=float)
     t0 = time.perf_counter()
     for i in range(m):
         try:
-            out[i] = T(X, counts[i], prep=prep) if prep is not None else T(X, counts[i])
+            out[i] = call_T(T, X, counts[i], start=start, eta=eta)
         except Exception:
             out[i] = np.nan
     return out, time.perf_counter() - t0
@@ -46,7 +77,11 @@ class Bootstrap:
         about `B / (4 * workers)` replicates; up to `workers` chunks run
         on `pool` at once (an in-process `Pool(1)` when none is given),
         each replaced by a freshly drawn chunk as soon as it finishes, so
-        no worker idles behind another chunk's evaluation."""
+        no worker idles behind another chunk's evaluation. When
+        `T.takes_start`, `theta_hat` is awaited up front, `eta_full`
+        (spec/QIJ_mods_waves.md A15) is measured from it once, and every
+        chunk carries both as the replicates' warm start and polish
+        tolerance."""
         X = np.asarray(X)
         N, q = len(X), len(T.outputs)
         own_pool = pool is None
@@ -56,9 +91,20 @@ class Bootstrap:
         rng = np.random.default_rng(self.seed)
         probs = np.full(N, 1.0 / N)
         pool.share(X)
+        theta_future = pool.submit(_theta_hat_task, None)
+
+        warm = getattr(T, 'takes_start', False)
+        busy_time = 0.0
+        theta_hat = None
+        eta_full = T.eta
+        if warm:
+            theta_hat, theta_wall = theta_future.result()
+            busy_time += theta_wall
+            t_eta0 = time.perf_counter()
+            eta_full, _ = measure_eta_full(T, X, theta_hat)
+            busy_time += time.perf_counter() - t_eta0
 
         replicates = np.empty((self.B, q), dtype=float)
-        busy_time = 0.0
         t_start = time.perf_counter()
 
         def draw(m: int) -> np.ndarray:
@@ -75,7 +121,7 @@ class Bootstrap:
         while next_b < self.B or inflight:
             while next_b < self.B and len(inflight) < workers:
                 m = min(chunk, self.B - next_b)
-                inflight[pool.submit(_boot_task, draw(m))] = (next_b, m)
+                inflight[pool.submit(_boot_task, (draw(m), theta_hat, eta_full))] = (next_b, m)
                 next_b += m
             done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
             for fut in done:
@@ -83,12 +129,17 @@ class Bootstrap:
                 out, wall = fut.result()
                 replicates[offset:offset + m] = out
                 busy_time += wall
+
+        if not warm:
+            theta_hat, theta_wall = theta_future.result()
+            busy_time += theta_wall
         wall_time = time.perf_counter() - t_start
         if own_pool:
             pool.close()
 
-        n_failed = int(np.any(np.isnan(replicates), axis=1).sum())
+        n_degenerate = int(np.any(np.isnan(replicates), axis=1).sum())
         return BootstrapResult(
-            outputs=T.outputs, replicates=replicates, n_failed=n_failed,
-            wall_time=wall_time, busy_time=busy_time, workers=workers,
+            outputs=T.outputs, theta_hat=theta_hat, replicates=replicates,
+            n_degenerate=n_degenerate, wall_time=wall_time, busy_time=busy_time,
+            workers=workers, eta_full=eta_full,
         )

@@ -8,10 +8,34 @@ winning start with a damped Newton step gated on the observed
 information's positive-definiteness, and reports the score and observed
 information at the fit for `influence`. Follows `estimators.py`'s
 conventions: `T(X, w) -> ndarray(p,)` never raises (a failed fit is
-NaN); no state between calls. With `reference`, every evaluation labels
-its components by the assignment to it minimizing total Bhattacharyya
-distance (method_notes section 5); without one, components are ordered
-by ascending first-mean coordinate.
+NaN); no state between calls. Without `start` (see below), `reference`
+labels every evaluation's components by the assignment to it minimizing
+total Bhattacharyya distance (method_notes section 5); without either,
+components are ordered by ascending first-mean coordinate.
+
+`GMM2D.takes_start = True`: `T`, `influence` and `fit_and_influence` all
+accept an optional `start` (theta in `T`'s own output layout and
+labelling). With `start` given, the multi-start search is skipped and a
+single accelerated-EM run continues from it at the given weights, then
+the same Newton gate, polish and acceptance rule run as always; without
+`start` the fit is unchanged (bit-identical). This makes a finite
+difference of `T` well-defined: the perturbed fit is the continuation of
+the base fit, not a fresh multi-start winner that can differ from it by
+more than the perturbation itself (method_notes section 5). With
+`start`, the continued fit's components are labelled by the same
+minimum-Bhattacharyya assignment, but against `start`'s OWN components,
+never `reference` and never the canonical sort: a co-located pair (e.g.
+a point source and the structure it sits on) can otherwise swap labels
+between the start and the continuation under a sort or a fixed external
+reference, which breaks the continuation's whole point -- the same
+component keeping the same label across a perturbed or resampled
+evaluation.
+
+The observed information `A` and the score `psi_bar` are both normalized
+by `sum(w)`, so `T` is invariant to a common rescaling of the weights
+regardless of what a caller's own convention for `sum(w)` is (method_notes
+section 5); at `sum(w) == N`, the row count, this is the same number as
+normalizing by `N`.
 
 The estimand is the maximizer of the penalized log-likelihood ell_p =
 ell - a * sum_k[tr(S Sigma_k^-1) + log det Sigma_k] (Chen and Tan 2009,
@@ -30,6 +54,14 @@ exactly as described there.
 `prepare(X)` holds the unweighted centering shift and the `(N, 6)`
 feature buffer built from the centered X, both independent of `w` and
 otherwise rebuilt on every evaluation of the same X.
+
+The multi-start's start set is `n_starts` k-means starts plus greedy-EM
+starts from `seeding.py` (spec/QIJ_mods_waves.md A12 round 5, A15): a
+component grown to K by residual-driven insertion after Verbeek,
+Vlassis and Kroese (2003), one at 50*K over-segmentation cells and a
+second at 25*K cells, the second contributing its own ×1/2 and ×2
+covariance variants alongside it. Every kind of start goes through the
+same two-phase screen.
 """
 
 from collections import namedtuple
@@ -39,10 +71,12 @@ import numpy as np
 from scipy.cluster.vq import kmeans2
 from scipy.optimize import linear_sum_assignment
 
+from .seeding import greedy_em_start, scaled_variants
+
 _LOG2PI = float(np.log(2.0 * np.pi))
 _ACCEPT_TOL = 1e-9
 _COND_MAX = 1e12
-_MAX_NEWTON = 20
+_MAX_NEWTON = 40
 _MAX_HALVINGS = 30
 # Declared from the score norm the polish reliably reaches on the demo
 # mixture's multi-start (module report), rounded up to a power of ten.
@@ -54,6 +88,12 @@ _ETA = 1e-12
 # budget.
 _SHORT_ITERS = 25
 _PROMOTE_N = 3
+
+# The second greedy-EM start's over-segmentation resolution
+# (spec/QIJ_mods_waves.md A15), beside `seeding.py`'s own 50*K default,
+# and the covariance factors of its two scaled variants (A12 item 6).
+_GREEDY_CELL_FACTOR_2 = 25
+_GREEDY_VARIANT_FACTORS = (0.5, 2.0)
 
 # scipy.cluster.vq.kmeans2 runs exactly this many Lloyd iterations (its
 # `thresh` argument is not implemented as a convergence test), so this is
@@ -597,8 +637,24 @@ def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter, Scov, a_pe
     likelihood (ell_p/W), via the two-phase screen: phase 1 runs
     every start's short budget in lockstep (`_phase1_batch`); the best
     few are carried, one at a time, to `max_iter` (phase 2, sequential
-    `_run_em`)."""
+    `_run_em`). Starts are the `n_starts` k-means starts (`_starts`),
+    the greedy-EM insertion start of A12 at `seeding.py`'s own 50*K
+    cells, a second at `_GREEDY_CELL_FACTOR_2`*K cells (A15), and that
+    second start's own `_GREEDY_VARIANT_FACTORS` covariance-scaled
+    variants (A12 item 6) -- appended after the k-means starts and the
+    50*K one, so their presence never reorders or drops any start the
+    ported pool already had. `seeding.greedy_em_start` takes this module's own
+    `_em_accelerated`/`_penalized_ll` as arguments rather than importing
+    this module (seeding.py must not import gmm.py, which already
+    imports it)."""
     starts = _starts(X, K, n_starts, seed)
+    starts += greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, tol, max_iter,
+                               em_accelerated=_em_accelerated, penalized_ll=_penalized_ll)
+    greedy2 = greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, tol, max_iter,
+                               em_accelerated=_em_accelerated, penalized_ll=_penalized_ll,
+                               cell_factor=_GREEDY_CELL_FACTOR_2)
+    if greedy2:
+        starts += greedy2 + scaled_variants(greedy2[0], _GREEDY_VARIANT_FACTORS)
     phase1_budget = min(_SHORT_ITERS, max_iter)
 
     screened = _phase1_batch(Q, XP, w, starts, K, phase1_budget, Scov, a_pen)
@@ -671,9 +727,13 @@ def reference_from_theta(theta: np.ndarray, K: int) -> tuple:
 
 def _score_info(X: np.ndarray, Q: np.ndarray, w: np.ndarray, K: int,
                  pis: np.ndarray, mus: np.ndarray, Ss: np.ndarray):
-    """(psi (N, p), A (p, p), ll) at (pis, mus, Ss). Raises
-    np.linalg.LinAlgError if any component's covariance is not PD."""
+    """(psi (N, p), A (p, p), ll) at (pis, mus, Ss); A = Louis's-identity
+    information / sum(w) (the same normalization `ll` and `psi_bar` use
+    downstream, so a common rescaling of `w` leaves `T` unchanged).
+    Raises np.linalg.LinAlgError if any component's covariance is not
+    PD."""
     N = X.shape[0]
+    W = float(w.sum())
     p = (K - 1) + 5 * K
 
     a, b, c, det = _sigma_terms(Ss)
@@ -688,7 +748,7 @@ def _score_info(X: np.ndarray, Q: np.ndarray, w: np.ndarray, K: int,
         PDP.append(pdpk)
 
     r, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det)
-    ll = float(np.dot(w, log_norm) / w.sum())
+    ll = float(np.dot(w, log_norm) / W)
 
     psi = np.zeros((N, p))
     for j in range(K - 1):
@@ -780,7 +840,7 @@ def _score_info(X: np.ndarray, Q: np.ndarray, w: np.ndarray, K: int,
 
     term3 = (w[:, None] * psi).T @ psi
 
-    A = (term1 - term2 + term3) / N
+    A = (term1 - term2 + term3) / W
 
     return psi, A, ll
 
@@ -794,16 +854,16 @@ def _score_info_penalized(X, Q, w, K, pis, mus, Ss, Scov, a_pen, W):
     raw per-observation Louis's-identity score `psi_raw` (unpenalized,
     `_score_info`), and the penalized observed information `A`,
     penalized log-likelihood `ll` (= ell_p/W) and penalized weighted-
-    mean score `psi_bar` (= d(ell_p/W)/dtheta) -- the raw `A/N` and
-    `psi_bar_raw/W` each get the closed-form penalty Hessian/gradient
-    added (method_notes section 5). Raises np.linalg.LinAlgError if any
+    mean score `psi_bar` (= d(ell_p/W)/dtheta) -- the raw `A_raw` (itself
+    /W) and `psi_bar_raw/W` each get the closed-form penalty
+    Hessian/gradient added, both scaled by the same `W = sum(w)`
+    (method_notes section 5). Raises np.linalg.LinAlgError if any
     Sigma_k is not PD."""
-    N = X.shape[0]
     psi_raw, A_raw, ll_raw = _score_info(X, Q, w, K, pis, mus, Ss)
     penalty_sum, g, H = _penalty_terms(Ss, Scov, a_pen)
     ll = ll_raw - a_pen * penalty_sum / W
     psi_bar = np.dot(w, psi_raw) / W + g / W
-    A = A_raw - H / N
+    A = A_raw - H / W
     return psi_raw, A, ll, psi_bar
 
 
@@ -818,7 +878,7 @@ def _cholesky_ok(A: np.ndarray) -> bool:
 
 
 def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
-         eta: float, reference=None):
+         eta: float, reference=None, start: np.ndarray = None):
     """None on failure; else dict(theta, pis, mus, Ss, psi, A, ll,
     score_history, polished, resid) -- the penalized-likelihood
     estimand (method_notes section 5). `ll` is ell_p/W; `A` is the
@@ -826,8 +886,17 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     the per-point sensitivity of the penalty to that point's own
     weight. Operates in the caller's own (already-centered) coordinates
     with the caller's own (X-only) `Q`, `XP`. Components are labelled
-    by `reference` when given, else ordered by ascending first-mean
-    coordinate.
+    against `start`'s own components (min-Bhattacharyya assignment)
+    when `start` is given; otherwise by `reference` when given, else
+    ordered by ascending first-mean coordinate.
+
+    With `start` (theta (p,) in this function's own centered, packed
+    layout) given, a single accelerated-EM run (`_run_em`) from `start`
+    at the given `w` replaces the multi-start search below; everything
+    after (labelling against `start`, Newton gate, polish, acceptance)
+    is unchanged, so the perturbed fit is the continuation of `start`,
+    never a fresh multi-start winner, and never relabelled away from
+    it. Without `start`, unchanged (bit-identical).
 
     Newton gate: the polish only runs once -H (`A`) is PD (a Cholesky
     succeeds); otherwise one more block of accelerated EM (the same
@@ -836,13 +905,30 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     score norm under `eta`."""
     W, a_pen, Scov, d = _weighted_cov(X, w)
 
-    best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
-                               cfg.tol, cfg.max_iter, Scov, a_pen)
+    if start is None:
+        best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
+                                   cfg.tol, cfg.max_iter, Scov, a_pen)
+    else:
+        pis0, mus0, Ss0 = _unpack(cfg.K, start)
+        best = _run_em(Q, XP, w, pis0, mus0, Ss0, cfg.tol, cfg.max_iter,
+                        Scov, a_pen)
     if best is None:
         return None
     pis, mus, Ss = best['pis'], best['mus'], best['Ss']
 
+    # A continuation is labelled against START's own components (min
+    # Bhattacharyya assignment, A6's machinery), never the canonical
+    # sort: two co-located components can swap under ascending-mu_x
+    # sorting from a tiny perturbation, which breaks the continuation's
+    # whole point (the same component keeping the same label across a
+    # perturbed or resampled evaluation). This takes priority over
+    # `reference` too, since `start` (when given) is the more specific,
+    # already-correctly-labelled anchor for this particular evaluation.
+    start_reference = reference_from_theta(start, cfg.K) if start is not None else None
+
     def _label(pis, mus, Ss):
+        if start_reference is not None:
+            return _reference_sort(pis, mus, Ss, start_reference)
         if reference is None:
             return _canonical_sort(pis, mus, Ss)
         return _reference_sort(pis, mus, Ss, reference)
@@ -925,17 +1011,41 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
                 score_history=score_history, polished=polished, resid=resid)
 
 
+def _center_start(start, K: int, xmean: np.ndarray):
+    """A caller's `start` (theta (p,) in `T`'s own OUTPUT layout, means
+    in data coordinates) shifted into `_fit`'s centered frame -- the
+    inverse of the `+= xmean` a public method applies to its own result
+    -- so a continuation from a previous `T(...)` return lands where
+    `_fit` would place it unshifted. None if `start` is None."""
+    if start is None:
+        return None
+    start_c = np.array(start, dtype=float, copy=True)
+    for k in range(K):
+        mx, my = _idx_mu(K, k)
+        start_c[mx] -= xmean[0]
+        start_c[my] -= xmean[1]
+    return start_c
+
+
 class GMM2D:
     """See module docstring. `T(X, w) -> ndarray(p,)`, `T.influence(X,
     w) -> ndarray(N, p)`, `T.fit_and_influence(X, w) -> (ndarray(p,),
     ndarray(N, p))`; all three accept `K`, `n_starts`, `seed`, `tol`,
-    `max_iter` as per-call keyword overrides, and an optional `prep`
-    from `T.prepare(X)`; all three label components against
-    `self.reference` (method_notes section 5) when it is not None.
-    `self.name`, `self.outputs`, `self.eta`, `self.p` are fixed at
-    construction from the constructor's own `K`."""
+    `max_iter` as per-call keyword overrides, an optional `prep` from
+    `T.prepare(X)`, an optional `start` (theta (p,) in `T`'s own
+    output layout: a continuation of a previous fit, see module
+    docstring), and an optional `eta`: when given, it replaces
+    `self.eta` in the polish's acceptance rule for that call alone
+    (spec/QIJ_mods_waves.md A15's measured eta_full), leaving `self.eta`
+    itself untouched for every other call. With `start` given, all three
+    label components against `start`'s own components (never
+    `self.reference`, and never the canonical sort); without it, against
+    `self.reference` (method_notes section 5) when it is not None, else
+    the canonical sort. `self.name`, `self.outputs`, `self.eta`,
+    `self.p` are fixed at construction from the constructor's own `K`."""
 
     name = 'gmm2d'
+    takes_start = True
 
     def __init__(self, K: int, n_starts: int = 20, seed: int = 0,
                  tol: float = 1e-8, max_iter: int = 500, reference=None):
@@ -972,12 +1082,14 @@ class GMM2D:
         return xmean, Xc, Q, XP
 
     def __call__(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
-                 **kwargs) -> np.ndarray:
+                 start: np.ndarray = None, eta: float = None, **kwargs) -> np.ndarray:
         cfg = self._resolve(kwargs)
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP, self.eta, self.reference)
+            start_c = _center_start(start, cfg.K, xmean)
+            eta_use = self.eta if eta is None else eta
+            fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
             if fit is None:
                 return np.full(cfg.p, np.nan)
             theta = fit['theta']
@@ -990,13 +1102,15 @@ class GMM2D:
             return np.full(cfg.p, np.nan)
 
     def influence(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
-                  **kwargs) -> np.ndarray:
+                  start: np.ndarray = None, eta: float = None, **kwargs) -> np.ndarray:
         cfg = self._resolve(kwargs)
         N = len(X)
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP, self.eta, self.reference)
+            start_c = _center_start(start, cfg.K, xmean)
+            eta_use = self.eta if eta is None else eta
+            fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
             if fit is None:
                 return np.full((N, cfg.p), np.nan)
             A = fit['A']
@@ -1010,7 +1124,7 @@ class GMM2D:
             return np.full((N, cfg.p), np.nan)
 
     def fit_and_influence(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
-                           **kwargs):
+                           start: np.ndarray = None, eta: float = None, **kwargs):
         """(theta (p,), psi (N,p)) from a single fit -- for a caller that
         wants both (`ij`, always), `T(X,w)` then `T.influence(X,w)` pays
         for the multi-start search twice."""
@@ -1021,7 +1135,9 @@ class GMM2D:
         try:
             w = np.asarray(w, dtype=float)
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            fit = _fit(Xc, w, cfg, Q, XP, self.eta, self.reference)
+            start_c = _center_start(start, cfg.K, xmean)
+            eta_use = self.eta if eta is None else eta
+            fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
             if fit is None:
                 return nan_theta, nan_psi
             theta = fit['theta'].copy()

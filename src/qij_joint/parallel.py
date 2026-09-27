@@ -49,6 +49,28 @@ def prepared(T, A: np.ndarray):
     return _prepared_value
 
 
+def call_T(T, X: np.ndarray, w: np.ndarray, start: Optional[np.ndarray] = None,
+           eta: Optional[float] = None) -> np.ndarray:
+    """Evaluate T(X, w) worker-side: `prepared(T, X)` supplies `prep`
+    when `T` has one, and `start`/`eta` are each passed to T only when
+    given and `T.takes_start` -- the Counter's start rule (spec A9 item
+    1), extended to the per-call `eta` override (spec/QIJ_mods_waves.md
+    A15) by the same rule. Every task function that evaluates T in a
+    worker (the prototype survey, the bin stencils, the bootstrap
+    replicates) calls this rather than T directly, so the rule is
+    applied once."""
+    prep = prepared(T, X)
+    takes_start = getattr(T, 'takes_start', False)
+    kwargs = {}
+    if start is not None and takes_start:
+        kwargs['start'] = start
+    if eta is not None and takes_start:
+        kwargs['eta'] = eta
+    if prep is not None:
+        return T(X, w, prep=prep, **kwargs)
+    return T(X, w, **kwargs)
+
+
 def _init_worker(T, case_key: Optional[Tuple[str, str]]) -> None:
     """Pool initializer: pin the five BLAS thread variables, then build
     this process's estimator, either the object `Pool` was given directly

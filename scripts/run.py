@@ -25,7 +25,7 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('dataset')
     p.add_argument('estimator')
-    p.add_argument('method', choices=['oracle', 'ij', 'boot', 'qij'])
+    p.add_argument('method', choices=['oracle', 'ij', 'boot', 'qij', 'ijfd'])
     p.add_argument('--N', type=int, required=True)
     p.add_argument('--draws', type=_range, required=True)
     p.add_argument('--seed', type=int, default=0)
@@ -41,6 +41,15 @@ def main(argv=None) -> None:
     p.add_argument('--M-X', dest='M_X', type=int, default=None)
     p.add_argument('--ivqbins', choices=['marginal', 'joint'], default='marginal')
     p.add_argument('--survey', choices=['points', 'moments'], default='points')
+    p.add_argument('--quantized-start', dest='quantized_start',
+                    choices=['multistart', 'full-data'], default='multistart')
+    p.add_argument('--refine-schedule', dest='refine_schedule',
+                    choices=['queue', 'rounds'], default='queue')
+    p.add_argument('--refine-trigger', dest='refine_trigger',
+                    choices=['gain', 'measured'], default='gain')
+    p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
+                    help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
+                         'coordinator extension); off by default (planner ruling)')
     args = p.parse_args(argv)
 
     md = products.method_dir(args.out, args.dataset, args.estimator, args.N, args.method)
@@ -60,17 +69,26 @@ def main(argv=None) -> None:
         written, skipped = pipeline.run_boot(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.workers, args.B, args.force)
-    else:
+    elif args.method == 'qij':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
             if args.diag_draws else []
         params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
-                      ivqbins=args.ivqbins, survey=args.survey)
+                      ivqbins=args.ivqbins, survey=args.survey,
+                      quantized_start=args.quantized_start,
+                      refine_schedule=args.refine_schedule,
+                      refine_trigger=args.refine_trigger)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
             workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
-            ivqbins=args.ivqbins, survey=args.survey)
+            ivqbins=args.ivqbins, survey=args.survey, quantized_start=args.quantized_start,
+            refine_schedule=args.refine_schedule, refine_trigger=args.refine_trigger)
+    else:
+        params['point_curvature'] = args.point_curvature
+        written, skipped = pipeline.run_ijfd(
+            args.dataset, args.estimator, args.N, args.draws, args.seed,
+            args.out, args.workers, args.point_curvature, args.force)
 
     products.append_log(md, sys.argv, params, written, skipped)
 

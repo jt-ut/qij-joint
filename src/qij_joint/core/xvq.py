@@ -3,10 +3,11 @@ The X-VQ: quantize the data (`fit_xvq`, at `workers` FAISS threads),
 then measure the influence at each prototype by forward differences
 (spec/method_notes.md section 2), `prototype_influences`' per-prototype
 step run through `pool` when given. `run_xvq` is stage 1 in full.
-`survey='moments'` (spec/method_notes.md section 2) replaces a receptive
-field's one row by a representation matching its native mean and
-covariance exactly, for the fields too small or too rare for a single
-quantized row to stand in for the data.
+`survey='moments'` replaces a receptive field's one row by a
+representation matching its native mean and covariance exactly, for
+fields too small or rare for a single quantized row to stand in for
+the data; A9 (spec/QIJ_mods_waves.md) makes every perturbed evaluation
+a continuation of theta_Q and adds its reproducibility self-checks.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import faiss
 import numpy as np
 from vqlp import VQFitter
 
-from ..parallel import prepared
+from ..parallel import call_T
 from .differences import forward_step, perturbed_weights, step_parameter
 
 _KAPPA_REF = 2.7
@@ -39,6 +40,20 @@ class XVQ:
     conn: object             # (M_used, M_used) CADJ adjacency, sparse
     M_requested: int
     M_used: int
+
+
+@dataclass
+class SurveyRows:
+    """The survey's own rows and its A9 self-checks (spec/QIJ_mods_
+    waves.md A9 items 3-4); `eta_Q` and `step_ratio` are NaN when T
+    lacks `takes_start` (no extra evaluation, so its audited count is
+    unchanged)."""
+    rows: np.ndarray          # (R, d_x) the survey rows
+    row_field: np.ndarray     # (R,) field/prototype index of each row
+    omega0: np.ndarray        # (R,) base weights, summing to R
+    eta_Q: float              # A9 item 3
+    step_ratio: np.ndarray    # (5, q) A9 item 4
+    quantized_start: str
 
 
 def cost_rule_M(N: int, q: int, eps: float) -> int:
@@ -167,22 +182,15 @@ def _align_first_vertex(V: np.ndarray) -> np.ndarray:
 def _moments_survey_rows(
     X: np.ndarray, bmu: np.ndarray, p: np.ndarray, M_used: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The `survey='moments'` rows (spec/method_notes.md section 2): field j
-    keeps its own n_j native rows when n_j <= d_x+1; otherwise it is
+    """The `survey='moments'` rows (spec/method_notes.md section 2):
+    field j keeps its own n_j native rows when n_j <= d_x+1; otherwise
     the d_x+1 vertices of a regular simplex reproducing the field's
-    native mean and covariance exactly, mapped through the
-    eigendecomposition-based factor V*sqrt(Lambda) of its covariance
-    (so a rank-deficient field, collinear points, needs no
-    regularization: a zero eigenvalue maps every vertex's component
-    along it to zero) with the first vertex along the field's leading
-    eigenvector. Every field's rows carry R*p_j in total, split evenly
-    over its own rows, R the stacked row count, so the weights sum to the
-    number of rows as they do for every other call of T (an estimator
-    may normalize its score by the weight total and its information by
-    the row count, which agree only then). Vectorized over fields: the field
-    moments, the eigendecomposition and the simplex map are one batched
-    call each, over every large field at once. Returns (rows, row of
-    each row's field, that row's base weight)."""
+    mean and covariance exactly, via the eigendecomposition factor
+    V*sqrt(Lambda) (a zero eigenvalue needs no regularization), first
+    vertex along the leading eigenvector. Each field's rows carry
+    R*p_j in total, R the stacked row count, so weights sum to the row
+    count as for every call of T. Vectorized over every large field at
+    once. Returns (rows, row's field, row's base weight)."""
     d_x = X.shape[1]
     n, mean, cov = _field_moments(X, bmu, M_used)
     small = n <= (d_x + 1)
@@ -236,16 +244,15 @@ def _field_step_weights(
 def _survey_task(T, case, rows: np.ndarray, task):
     """One task: evaluate T at prototype j's perturbed weights against
     the shared survey rows (the prototypes under 'points', the stacked
-    field rows under 'moments'), `T.prepare` cached per process
-    (method_notes section 2). A failing evaluation is caught here, this
-    task's own declared failure boundary. Returns (j, raw evaluation,
-    failure flag, this call's own wall time)."""
-    j, omega = task
-    prep = prepared(T, rows)
+    field rows under 'moments'), through `parallel.call_T` (`T.prepare`
+    cached per process, `start` passed under the same rule as a
+    Counter). A failing evaluation is caught here, this task's own
+    declared failure boundary. Returns (j, raw evaluation, failure
+    flag, this call's own wall time)."""
+    j, omega, start = task
     t0 = time.perf_counter()
     try:
-        result = T(rows, omega, prep=prep) if prep is not None else T(rows, omega)
-        result = np.asarray(result, dtype=float)
+        result = np.asarray(call_T(T, rows, omega, start), dtype=float)
         failed = bool(np.any(np.isnan(result)))
     except Exception:
         result = np.full(len(T.outputs), np.nan)
@@ -262,32 +269,102 @@ def _step_prototype(omega0: np.ndarray, p: np.ndarray, delta_f: float, j: int) -
     return t_j, omega
 
 
+def _measure_eta_Q(
+    counter, rows: np.ndarray, omega0: np.ndarray, row_field: np.ndarray,
+    p: np.ndarray, theta_Q: np.ndarray,
+) -> float:
+    """A9 item 3: the rows' reproducibility of a continuation from
+    theta_Q -- two fits at the base weights and one at the largest-mass
+    prototype's weights perturbed by a relative 1e-6 and back; eta_Q is
+    the largest relative difference among the three fits (each pair
+    scaled by its own larger magnitude, floored against 0/0), floored
+    at T's declared eta (the polish residual)."""
+    f_a = counter(rows, omega0, start=theta_Q)
+    f_b = counter(rows, omega0, start=theta_Q)
+    j_max = int(np.argmax(p))
+    p_max = float(p[j_max])
+    omega_pert = _field_step_weights(omega0, row_field, j_max, p_max,
+                                      step_parameter(1e-6, p_max))
+    f_c = counter(rows, omega_pert, start=theta_Q)
+    scale_ab = np.maximum(np.abs(f_a), np.abs(f_b))
+    scale_ac = np.maximum(np.abs(f_a), np.abs(f_c))
+    diffs = np.concatenate([
+        np.abs(f_a - f_b) / np.where(scale_ab > 0, scale_ab, 1.0),
+        np.abs(f_a - f_c) / np.where(scale_ac > 0, scale_ac, 1.0),
+    ])
+    return float(max(np.nanmax(diffs), counter.eta))
+
+
+def _step_doubling(
+    counter, rows: np.ndarray, omega0: np.ndarray, row_field: np.ndarray,
+    p: np.ndarray, theta_Q: np.ndarray, delta_f: float, q: int,
+) -> np.ndarray:
+    """A9 item 4: on the five largest-mass prototypes, fresh raw
+    responses at step delta_f and 2*delta_f (ten evaluations), ratio
+    per output, expected near 2 for a differentiable T; rows past the
+    prototype count, or an output where a response is NaN, stay NaN."""
+    order = np.argsort(-p)[:5]
+    step_ratio = np.full((5, q), np.nan)
+    for row, j in enumerate(order):
+        p_j = float(p[j])
+        w1 = _field_step_weights(omega0, row_field, j, p_j, step_parameter(delta_f, p_j))
+        w2 = _field_step_weights(omega0, row_field, j, p_j, step_parameter(2.0 * delta_f, p_j))
+        r1 = counter(rows, w1, start=theta_Q) - theta_Q
+        r2 = counter(rows, w2, start=theta_Q) - theta_Q
+        step_ratio[row] = r2 / r1
+    return step_ratio
+
+
 def prototype_influences(
     W_X: np.ndarray, counter, p: np.ndarray, eta: float, pool=None,
     survey: str = 'points', X: Optional[np.ndarray] = None,
-    bmu: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """theta_Q = T(rows, base weights) once, then one forward difference
-    per prototype j at t_j = step_parameter(delta_f, p_j), on `pool`
-    when given, mass-centred over the finite prototypes (spec/method_
-    notes.md section 2). Under `survey='points'`
-    `rows` is one row per prototype, weight M_used*p_j.
-    Under `survey='moments'` `rows` is the
-    stacked field representation of `_moments_survey_rows`, `X` (native
-    coordinates) and `bmu` are required, and a forward step scales a
-    whole field's rows together. `busy_delta` is 0 with `pool=None`,
-    else the tasks' summed wall time less `pool.map`'s own wall clock."""
+    bmu: Optional[np.ndarray] = None, quantized_start: str = 'multistart',
+    theta_hat: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, SurveyRows]:
+    """theta_Q = T(rows, base weights) once -- the continuation of
+    theta_hat under `quantized_start='full-data'`, else today's
+    multistart fit -- then one forward difference per prototype j at
+    t_j = step_parameter(delta_f, p_j), on `pool` when given,
+    mass-centred over the finite prototypes (spec/method_notes.md
+    section 2; spec/QIJ_mods_waves.md A9). Under `survey='points'`
+    `rows` is one row per prototype, weight M_used*p_j; under
+    `survey='moments'` it is the stacked field representation of
+    `_moments_survey_rows` (`X`, `bmu` required), a forward step
+    scaling a whole field's rows together. Every perturbed evaluation
+    passes `start=theta_Q` (A9 item 2, a no-op without `takes_start`).
+    With `takes_start`, the survey step uses eta_Q (item 3, measured
+    here first) in place of `eta`, and the step-doubling self-check
+    (item 4) runs on the five largest-mass prototypes; without it,
+    neither extra evaluation is spent (eta_Q, step_ratio are NaN), so
+    the audited count and every value are unchanged. `busy_delta` is 0
+    with `pool=None`, else the tasks' summed wall time less `pool.map`'s
+    own wall clock."""
     M_used = len(p)
-    delta_f = forward_step(eta)
 
     if survey == 'points':
         rows = W_X
+        row_field = np.arange(M_used)
         omega0 = M_used * p
     else:
         rows, row_field, omega0 = _moments_survey_rows(X, bmu, p, M_used)
 
-    theta_Q = np.asarray(counter(rows, omega0), dtype=float)
+    if quantized_start == 'full-data':
+        theta_Q = np.asarray(counter(rows, omega0, start=theta_hat), dtype=float)
+    else:
+        theta_Q = np.asarray(counter(rows, omega0), dtype=float)
     q = theta_Q.shape[0]
+
+    if counter.takes_start:
+        eta_Q = _measure_eta_Q(counter, rows, omega0, row_field, p, theta_Q)
+        delta_f = forward_step(eta_Q)
+        step_ratio = _step_doubling(counter, rows, omega0, row_field, p, theta_Q, delta_f, q)
+    else:
+        eta_Q = float('nan')
+        delta_f = forward_step(eta)
+        step_ratio = np.full((5, q), np.nan)
+
+    sv = SurveyRows(rows=rows, row_field=row_field, omega0=omega0, eta_Q=eta_Q,
+                     step_ratio=step_ratio, quantized_start=quantized_start)
 
     I_proto = np.empty((M_used, q), dtype=float)
     busy_delta = 0.0
@@ -298,7 +375,7 @@ def prototype_influences(
             else:
                 t_j = step_parameter(delta_f, float(p[j]))
                 omega = _field_step_weights(omega0, row_field, j, float(p[j]), t_j)
-            I_proto[j] = (counter(rows, omega) - theta_Q) / t_j
+            I_proto[j] = (counter(rows, omega, start=theta_Q) - theta_Q) / t_j
     else:
         pool.share(rows)
         t_j = np.empty(M_used, dtype=float)
@@ -309,7 +386,7 @@ def prototype_influences(
             else:
                 t_j[j] = step_parameter(delta_f, float(p[j]))
                 omega = _field_step_weights(omega0, row_field, j, float(p[j]), t_j[j])
-            tasks.append((j, omega))
+            tasks.append((j, omega, theta_Q))
         t_map0 = time.perf_counter()
         results = pool.map(_survey_task, tasks)
         busy_delta = -(time.perf_counter() - t_map0)
@@ -327,24 +404,32 @@ def prototype_influences(
     mass = np.sum(np.where(finite, p[:, None], 0.0), axis=0)
     psi_bar = np.sum(np.where(finite, p[:, None] * I_proto, 0.0), axis=0) / mass
     I_proto -= psi_bar[None, :]
-    return theta_Q, I_proto, busy_delta
+    return theta_Q, I_proto, busy_delta, sv
 
 
 def run_xvq(
     Z: np.ndarray, inverse: Callable[[np.ndarray], np.ndarray], counter, eta: float,
     M: int, seed: int, pool=None, workers: int = 1,
     survey: str = 'points', X: Optional[np.ndarray] = None,
-) -> Tuple[XVQ, np.ndarray, np.ndarray, float]:
+    quantized_start: str = 'multistart', theta_hat: Optional[np.ndarray] = None,
+) -> Tuple[XVQ, np.ndarray, np.ndarray, float, SurveyRows]:
     """Stage 1 in full: fit the codebook on Z (at `workers` FAISS
     threads), map its prototypes to T's native coordinates with
     `inverse`, and survey them, on `pool` when given (method_notes
-    section 2). `survey='moments'` needs
-    `X`, the draw in T's native coordinates (the rows T is called on);
-    it is unused under `survey='points'`. The only function in `core/`
+    section 2; spec A9). `survey='moments'` needs `X`, the draw in T's
+    native coordinates; unused under `survey='points'`.
+    `quantized_start='full-data'` requires `theta_hat` (q,) and fits
+    theta_Q as its continuation onto the survey rows; `'multistart'`
+    fits theta_Q from scratch, as built. The only function in `core/`
     that calls `inverse`."""
+    if quantized_start not in ('multistart', 'full-data'):
+        raise ValueError(f"unknown quantized_start {quantized_start!r}")
+    if quantized_start == 'full-data' and theta_hat is None:
+        raise ValueError("quantized_start='full-data' requires theta_hat")
     xvq = fit_xvq(Z, M, seed, workers)
     W_X = inverse(xvq.centers)
-    theta_Q, I_proto, busy_delta = prototype_influences(
+    theta_Q, I_proto, busy_delta, sv = prototype_influences(
         W_X, counter, xvq.p, eta, pool, survey=survey, X=X, bmu=xvq.bmu,
+        quantized_start=quantized_start, theta_hat=theta_hat,
     )
-    return xvq, theta_Q, I_proto, busy_delta
+    return xvq, theta_Q, I_proto, busy_delta, sv

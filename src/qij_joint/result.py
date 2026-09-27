@@ -1,16 +1,36 @@
 """
 `QIJResult` (spec/method_notes.md section 4): one draw's QIJ fit, and
 the pinned user surface `.variance` (V_btw) / `.interval(level)` (the
-normal interval on V_btw). `BootstrapResult` carries the bootstrap
-comparator's replicates and the percentile interval.
+normal interval on V_btw) / `.abc_interval(level)` (the ABC_q interval,
+spec/QIJ_mods_waves.md A10). `BootstrapResult` carries the bootstrap
+comparator's replicates, theta_hat, the percentile interval and
+`.bc_interval(level)` (the bias-corrected percentile interval, A10).
 
-`ivqbins` picks the second stage: `'marginal'` (a per-output refinement
-queue, one partition per output) or `'joint'` (one partition shared by
-every output, method_notes joint section). `V_btw`/`V_win_hat`/`V_tot_hat`/`gain_ratio`
+`ivqbins` picks the second stage: `'marginal'` (a per-output refinement,
+one partition per output) or `'joint'` (one partition shared by every
+output, method_notes joint section). `V_btw`/`V_win_hat`/`V_tot_hat`/`gain_ratio`
 are populated by whichever stage ran; the marginal-only fields (`L`,
-`rho`, `psi_hat`, `bin_label`, the refinement counts) are NaN/0/-1
-under `'joint'`; the `joint_*` fields are NaN/0/False/empty under
-`'marginal'`.
+`rho`, `psi_hat`, `bin_label`, `bin_U`, the refinement counts) are
+NaN/0/-1/empty under `'joint'`; the `joint_*` fields are
+NaN/0/False/empty under `'marginal'`.
+
+`refine_schedule` picks the marginal path's own schedule
+(spec/QIJ_mods_waves.md A14): `'queue'` (ported, the default) or
+`'rounds'` (every measured output refined together in synchronized
+rounds); inert under `ivqbins='joint'`, whose own check already
+advances in rounds. `n_rounds` is the round count `'rounds'` actually
+ran; 0 under `'queue'` or `'joint'`.
+
+`quantized_start` picks the quantized base fit theta_Q's starting point
+(spec/QIJ_mods_waves.md A9 item 5): `'multistart'` (ported) or
+`'full-data'` (theta_Q continues theta_hat onto the survey rows). `a`,
+`b_hat`, `c_q` are the ABC interval's per-output acceleration, bias and
+curvature ingredients (A10); `eta_Q` and `survey_step_ratio` are the
+survey's own reproducibility diagnostics (A9 items 3-4). All five are
+populated for every estimator; for one without `takes_start` the
+curvature and bias/acceleration ingredients still cost their declared
+evaluations (a and b_hat from the deterministic optimizer's own bins),
+only `eta_Q`/`survey_step_ratio` stay NaN (no continuation to check).
 """
 from __future__ import annotations
 
@@ -19,6 +39,8 @@ from typing import Dict, Tuple
 
 import numpy as np
 from scipy.stats import norm
+
+from .core import abc as _abc
 
 
 @dataclass
@@ -59,6 +81,11 @@ class QIJResult:
     sigma: np.ndarray              # (N, q)
     psi_hat: np.ndarray            # (N, q); NaN under ivqbins='joint'
     bin_label: np.ndarray          # (N, q) int; -1 under ivqbins='joint'
+    bin_U: Tuple[np.ndarray, ...]  # per output (L_c, q); every measured output's
+                                    # derivative on this output's own final bins
+                                    # (spec/QIJ_mods_waves.md A14); empty under 'joint'
+    refine_schedule: str            # 'queue' or 'rounds' (A14); inert under 'joint'
+    n_rounds: int                   # rounds run under 'rounds'; 0 under 'queue' or 'joint'
     bmu: np.ndarray                # (N,) int
     prototype_p: np.ndarray        # (M,)
     prototype_w: np.ndarray        # (M,) or (M, d), native coordinates
@@ -86,6 +113,20 @@ class QIJResult:
     joint_bin_flagged: np.ndarray  # (L,) bool; empty under 'marginal'
     joint_bin_label: np.ndarray    # (N,) int; -1 under 'marginal'
     joint_busy_delta: float        # 0.0 under 'marginal'
+    a: np.ndarray                  # (q,) ABC acceleration (spec/QIJ_mods_waves.md A10)
+    b_hat: np.ndarray              # (q,) ABC second-order bias (A10)
+    c_q: np.ndarray                # (q,) ABC curvature-along-influence, survey-row evaluated (A10)
+    c_q_one_sided: np.ndarray      # (q,) bool: c_q fell back to the one-sided form (A10/A15)
+    eta_Q: float                   # A9 item 3; NaN for an estimator without `takes_start`
+    eta_full: float                # A15/A13 step 2; == the declared eta for an estimator
+                                    # without `takes_start`
+    survey_step_ratio: np.ndarray  # (5, q) A9 item 4; NaN rows/columns as eta_Q is
+    quantized_start: str           # 'multistart' or 'full-data' (A9 item 5)
+    refine_trigger: str            # 'gain' or 'measured' (A15); inert under 'joint'
+    a_c: np.ndarray                # (q,) A15 item 6's measured-trigger scale factor; NaN under 'gain'
+    n_flagged: np.ndarray          # (q,) int; initial bins flagged; 0 under 'gain'
+    n_flag_evals: np.ndarray       # (q,) int; evaluations on flagged lineages; 0 under 'gain'
+    n_geom_splits: np.ndarray      # (q,) int; GEOMETRIC splits taken; 0 under 'gain'
 
     @property
     def variance(self) -> np.ndarray:
@@ -100,18 +141,37 @@ class QIJResult:
         at 0; NaN in theta_hat or V_btw propagates to NaN."""
         return _normal_interval(self.theta_hat, self.V_btw, level)
 
+    def abc_interval(self, level: float) -> np.ndarray:
+        """(q, 2) [lo, hi]: the ABC_q interval (DiCiccio & Efron 1992;
+        Efron & Tibshirani 1993 ch. 22) from the stored `a`/`b_hat`/
+        `c_q` ingredients and sigma = sqrt(V_btw) (spec/QIJ_mods_waves.md
+        A10)."""
+        sigma = np.sqrt(np.maximum(self.V_btw, 0.0))
+        return _abc.abc_interval(self.theta_hat, sigma, self.a, self.b_hat, self.c_q, level)
+
 
 @dataclass
 class BootstrapResult:
-    """The bootstrap comparator's result: `outputs`, the (B, q)
-    replicate array, the failed-replicate count, and timing."""
+    """The bootstrap comparator's result: `outputs`, the full-data point
+    estimate `theta_hat` (spec/QIJ_mods_waves.md A10, one evaluation
+    outside the resample loop's own RNG stream), the (B, q) replicate
+    array, the degenerate-replicate count, and timing. `n_degenerate`
+    (spec/QIJ_mods_waves.md A11) is the number of replicates whose fit
+    failed the acceptance rule (NaN) -- for an estimator without
+    `takes_start` this is the same replicates today's `n_failed` counted,
+    under its new name. `eta_full` (A15/A13 step 2) is measured once,
+    after `theta_hat`, and used by every replicate in place of the
+    declared eta (`bootstrap.py`); == the declared eta for an estimator
+    without `takes_start`."""
 
     outputs: Tuple[str, ...]
+    theta_hat: np.ndarray    # (q,)
     replicates: np.ndarray   # (B, q)
-    n_failed: int
+    n_degenerate: int
     wall_time: float
     busy_time: float
     workers: int
+    eta_full: float
 
     @property
     def variance(self) -> np.ndarray:
@@ -127,6 +187,13 @@ class BootstrapResult:
         lo = np.nanquantile(replicates, alpha / 2.0, axis=0)
         hi = np.nanquantile(replicates, 1.0 - alpha / 2.0, axis=0)
         return np.stack([lo, hi], axis=-1)
+
+    def bc_interval(self, level: float) -> np.ndarray:
+        """(q, 2) [lo, hi]: the bias-corrected percentile interval
+        (Efron & Tibshirani 1993 ch. 14), z0 from `.replicates` against
+        `theta_hat`, at no cost beyond the one extra evaluation
+        `theta_hat` already is (spec/QIJ_mods_waves.md A10)."""
+        return _abc.bc_interval(self.replicates, self.theta_hat, level)
 
 
 def _normal_interval(theta_hat: np.ndarray, V_btw: np.ndarray, level: float) -> np.ndarray:

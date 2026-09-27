@@ -6,7 +6,7 @@ and stage 2's bin stencil (`ivq.bin_differences`).
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Tuple
 
 import numpy as np
 
@@ -55,16 +55,26 @@ def difference(
     p: float,
     delta: float,
     evaluate: Callable[[float], np.ndarray],
-) -> np.ndarray:
+    t0: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     The central three-point stencil U = [T(+t) - T(-t)] / (2*t), t =
-    step_parameter(delta, p) (spec/method_notes.md section 1). Always
+    step_parameter(delta, p) (spec/method_notes.md section 1), and
+    D2 = [T(+t) - 2*t0 + T(-t)] / t^2, t0 = T(0) -- the already-known
+    base full-data fit, so D2 costs no extra evaluation. D2 is the
+    ABC interval's bias ingredient (`ivq.bias_and_acceleration`): along
+    this stencil's own direction the raw second difference is ~ t^2 *
+    H_kk, H the bin-mass Hessian's diagonal, so dividing by t^2 recovers
+    H_kk itself, independent of how small t happens to be. Always
     central: every registered estimator's eta keeps delta =
     central_step(eta) <= 1, so the downward step never drives a member
     weight negative. Exactly two calls to `evaluate`, in order +t then
-    -t; exceptions from `evaluate` propagate uncaught.
+    -t; exceptions from `evaluate` propagate uncaught. Returns (U, D2),
+    both q-vectors.
     """
     t = step_parameter(delta, p)
     T_plus = np.asarray(evaluate(+t), dtype=float)
     T_minus = np.asarray(evaluate(-t), dtype=float)
-    return (T_plus - T_minus) / (2.0 * t)
+    U = (T_plus - T_minus) / (2.0 * t)
+    D2 = (T_plus - 2.0 * np.asarray(t0, dtype=float) + T_minus) / t ** 2
+    return U, D2

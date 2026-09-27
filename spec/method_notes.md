@@ -799,3 +799,114 @@ bin_flagged (true only for a bin still flagged when check_capped
 stopped the check, since a bin closed for any other reason is never
 revisited); per point, the shared bin_label. The q x q between-bin
 matrix is recoverable from bin_mass and bin_U and is not stored.
+
+## 7. Continuations and the ABC interval
+
+**The estimator protocol.** An estimator whose fit depends on restarts
+(a multi-start search, `gmm.GMM2D`) carries `takes_start = True` and
+accepts `T(X, w, start=theta)`, theta in its own output layout (q,):
+its usual iterative fit continued from `start` at the given weights,
+then its usual polish and acceptance rule, with no multi-start. Without
+`start`, T is unchanged. `Counter(X, w, start=None)` and
+`parallel.call_T(T, X, w, start=None)` both pass `start` to T only when
+it is given and `T.takes_start`; every other estimator (Pareto, MVT,
+the Fundamental Plane, Chabrier) never sees it and runs exactly as
+before.
+
+**Why a continuation.** A finite difference of T needs its two
+evaluations on ONE branch: for an estimator with restarts, "the best of
+n_starts starts" is a discontinuous function of the weights wherever
+the winning start changes, which on the quantized survey rows can
+happen at every perturbation. Every perturbed survey evaluation, and
+every full-data stencil evaluation of stage 2 (the initial bin
+measurement, a refinement split, a joint check split), therefore
+continues from a base fit rather than restarting: `start=theta_Q` on
+the survey and the curvature stage, `start=theta_hat` on the full data,
+passed down from `QIJ.fit` and threaded unchanged through
+`ivq.bin_differences`, `refine.run_refinement` and `joint.run_joint`.
+`start` is never passed to the base fits theta_Q/theta_hat themselves
+(both keep their own multi-start search) or to the bootstrap (not a
+derivative).
+
+**theta_Q's own starting point: `quantized_start`.** Two values.
+`'multistart'` (default): theta_Q is fit from scratch on the survey
+rows, as every other quantity. `'full-data'`: theta_hat is evaluated
+first (on `pool` when given, so it overlaps with the rest of stage 1's
+own work) and theta_Q is its continuation onto the survey rows,
+`start=theta_hat`. Either value leaves everything downstream of theta_Q
+-- I_proto, the influence model, stage 2 -- exactly as built; the
+switch only changes the point theta_Q's own fit starts from.
+
+**Reproducibility of the continuation.** Before the prototype survey
+runs, for an estimator with `takes_start`, eta_Q is measured directly
+on the survey rows: two fits from theta_Q at the base weights (which
+agree exactly for a deterministic continuation) and one at the
+largest-mass prototype's weights perturbed by a relative 1e-6 and back,
+`start=theta_Q` throughout; eta_Q is the largest relative difference
+among the three returned parameter vectors, floored at T's own declared
+eta. The survey's forward step then uses delta_f = 2*sqrt(eta_Q) in
+place of eta (section 1). A self-check, reported and not gated, repeats
+the step on the five largest-mass prototypes at delta_f and 2*delta_f
+(`survey_step_ratio`, (5,q)): the ratio of the two raw responses per
+output is near 2 for a response that is genuinely a derivative. For an
+estimator without `takes_start` neither eta_Q nor the self-check is
+measured (both NaN): the survey step stays exactly eta's own delta_f,
+and no extra evaluation is spent, so every count and value elsewhere is
+unaffected.
+
+**The curvature stage.** After stage 1, before the survey's shared rows
+are replaced by the full data for stage 2, `core.abc.curvature` prices
+the ABC interval's curvature ingredient c_q, for every estimator, in
+its own evaluation stage (2q evaluations, on the survey rows). It works
+entirely within the survey's own M_X-cell problem: sigma_Q,c =
+sqrt((1/M_X) sum_j p_j*I_jc^2), the least-favorable direction u_j =
+I_jc / (sqrt(M_X)*sigma_Q,c), a step eps_c = min(eta_Q^(1/4),
+0.5/max_j|u_j|), and two evaluations at weights omega0*(1 +/- eps_c*u_j)
+on every row of field j, `start=theta_Q`. The raw central second
+difference at that step, divided by (eps_c^2 * M_X), gives
+2*sigma_Q,c*c_q, so c_q = raw / (2*M_X*sigma_Q,c). Because this is a
+second-order correction (an error of a few percent moves an ABC
+endpoint by a few percent of a 1/sqrt(N) term) it is priced on the
+survey's cheaper problem rather than the full data.
+
+**Bias and acceleration.** `ivq.bias_and_acceleration(binset, N)` reads
+the ABC interval's other two ingredients off a measured `BinSet`'s
+centered U and its (uncentered) central-stencil second difference d2T:
+
+    B_hat_c = (1/(2N)) * sum_k p_k*(1-p_k)*d2T_k
+    a_c     = (1/(6*sqrt(N))) * sum_k p_k*U_kc^3 / (sum_k p_k*U_kc^2)^(3/2)
+
+(a_c NaN when an output's bins carry no between-bin variance). Computed
+once per draw and coordinate, right after the first full-data
+measurement of the relevant bins succeeds -- the marginal path's own
+initial bins, before any refinement split; the joint path's shared bins
+as measured right after growth, before any check split -- since only a
+central, three-point stencil has a genuine second difference: a later
+split measures only its smaller child by a one-shot forward evaluation
+and derives the other by mass balance, with no third point to
+difference against. `QIJResult.a`/`.b_hat` collect a_c/B_hat_c per
+output (from `CoordinateResult.a_bca`/`.B_hat` under
+`ivqbins='marginal'`, from `JointResult.a_bca`/`.B_hat` under
+`'joint'`); both are voided to NaN wherever V_btw/V_win_hat/V_tot_hat
+are (a failed coordinate, output, or draw).
+
+**The ABC_q interval.** `QIJResult.abc_interval(level)` calls
+`core.abc.abc_interval(theta_hat, sqrt(V_btw), a, b_hat, c_q, level)`:
+per output, z0 = a + c_q - b_hat/sigma; at each tail's standard-normal
+quantile z_alpha, w = z0+z_alpha, lambda = w/(1-a*w^2), xi = lambda +
+c_q*lambda^2, endpoint = theta_hat + sigma*xi. At a = b_hat = c_q = 0
+this reduces exactly to the normal interval `QIJResult.interval`
+already computes from theta_hat and V_btw alone.
+
+**The bootstrap's bias-corrected intervals.** `Bootstrap.fit` evaluates
+theta_hat = T(X, ones(N)) once, on the pool when given, outside the
+replicate loop's own RNG stream, and stores it on `BootstrapResult`.
+`.bc_interval(level)` calls `core.abc.bc_interval(replicates, theta_hat,
+level)`: z0 = Phi^-1(share of replicates below theta_hat, per output),
+and the endpoint at tail z_alpha is the replicates' own
+Phi(2*z0+z_alpha) quantile. `core.abc.bca_interval(replicates,
+theta_hat, a, level)` is the same construction with a GIVEN
+acceleration in place of 0 (endpoint percentile Phi(z0 + w/(1-a*w)),
+w = z0+z_alpha); it never estimates its own acceleration (no jackknife
+runs anywhere in this package) and is used only by a caller that
+already has one, such as an analytic influence's own a_c.

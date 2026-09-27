@@ -27,6 +27,15 @@ items marked ⇒ and refers to the rest by number):
 | 10 | mixture estimator: component labelling by assignment to a reference fit | ⇒ wave A (A6) |
 | 11 | the `ij` method stores the q × q oracle covariance | coordinator, outside these waves |
 | 12 | parallel structure | coordinator's plan |
+| 13 | `survey=moments`: receptive fields as d_x + 1 moment-matching rows | built, A8 |
+| 14 | ABC interval: skew and bias correction from derivatives, no resampling | ⇒ A10 |
+| 15 | survey reproducibility: stencils as continuations, η measured on the survey rows, step-doubling self-check | ⇒ A9 (prerequisite for everything on the demo) |
+| 16 | the demo dataset `cloudfil_G_B6_P3_v1`, its six estimands as wrapper outputs, the TACC study settings | ⇒ A11 |
+| 17 | mixture estimator initialization: peak-seeded starts beside the k-means starts | ⇒ A12 |
+| 18 | `ijfd`, the finite-difference infinitesimal jackknife as a fifth method (the cost reference, S = 1) | ⇒ A13 |
+| 19 | refinement in synchronized rounds across the measured outputs (`refine_schedule`), for 100-CPU nodes | ⇒ A14 |
+| 20 | the consolidated repair round: measured trigger in the marginal refinement, zero-level closing, local width for the demo, measured η_full, failed-curvature rule | ⇒ A15 |
+| 21 | deterministic annealing as the mixture estimator's search, replacing the start apparatus; the per-draw search audit against the truth | ⇒ A16 |
 
 **Switches.** Three, each a plain argument of the fit with exactly two
 values. With every switch at its first value the package reproduces the
@@ -362,6 +371,705 @@ constant path; (iii) timings: one converged fit at 600 rows and at the
 `moments` row count, and the survey's wall time on the workers used.
 Nothing else. If (ii) is still failing, the fallback is M_𝒳 = 2500 with
 `points`, priced beforehand from (iii).
+
+### A9. Survey reproducibility: stencils as continuations (author's ruling, 27 September)
+
+**The defect, measured.** On the demo mixture (set B, N = 5000, M_𝒳 = 600,
+`survey=moments`) every surveyed prototype influence was noise: the
+reconstructed raw responses T(ω(t_j)) − θ_Q had median magnitude 3 × 10⁻⁵
+and reached 1.0, against a step t_j ≈ 3 × 10⁻⁹ and a true response of
+about 10⁻¹⁰; 31% of responses were jumps above 10⁻³; corr(ψ̂₀, ψ) ≈ 0 on
+all 53 outputs. Cause: each survey evaluation ran a fresh 20-start fit, and
+the winner, or its convergence point, differed between the base and the
+perturbed weights by far more than the perturbation's effect. A derivative
+of "the best of 20 starts" is undefined where the winner changes, and on
+the quantized rows it changes everywhere. The declared η = 10⁻¹² described
+the full-data polish, not the quantized fit's reproducibility. Assumption
+A1 failed for T on the survey rows. The paper's estimators are
+deterministic optimizers and did not have this problem.
+
+**The rule.** A finite difference of T is taken between two fits on ONE
+branch: the perturbed fit is the continuation of the base fit under the
+weight change.
+
+1. `GMM2D` (and any estimator with restarts) accepts an optional `start`:
+   initial parameters. With `start` given the fit runs EM (accelerated)
+   from those parameters with the given weights, then the polish and the
+   acceptance rule as built; no multi-start. Without `start` the behaviour
+   is unchanged (bit-identical for every audited path).
+   **Labels of a continuation (ruled 28 September).** A continued fit is
+   labelled by the minimum-Bhattacharyya assignment to the START's
+   components (A6's machinery), never by the canonical sort: a derivative
+   is taken along one branch and its labels must follow the branch. As
+   first built, `_fit` re-sorted every output by the first mean
+   coordinate, and a co-located pair with Δμ_x ≈ 0.01 (P2 and its bead,
+   the cloud and its blend) swapped between θ̂ and θ_Q, which made the raw
+   parameters of those components anti-correlate with the analytic
+   influence (−0.99) while the derived P2 outputs, which re-identify P2
+   per call, were unaffected. Verified on the demo: flagged raw outputs
+   fell from 24 to 8, every cloud and P2-raw failure fixed; what remains is
+   the blended θ̂-component 4 and p2_pa (small-sample noise, see A9's
+   acceptance record). Mixture 11's mu6x anomaly (−0.90) is NOT closed by
+   this: that estimator already labelled continuations by assignment, and
+   the rerun is bit-identical; it stays open and separate. Cold fits keep
+   the canonical sort, or the reference when given. Applies to every use of `start`: the survey (to θ_Q), stencils
+   and bootstrap replicates (to θ̂), the population continuation (to the
+   truth), ijfd's per-point fits.
+2. The survey passes `start = θ_Q` to every perturbed prototype
+   evaluation; the full-data stencils (bin measurement, check splits) pass
+   `start = θ̂`; the curvature evaluations of A10 pass `start = θ_Q`. The
+   base fits θ̂ (full data) and θ_Q (quantized rows) keep the multi-start.
+   The bootstrap does not use `start`; it is not a derivative.
+3. **Declared accuracy on the survey rows.** Before the survey, the
+   reproducibility of T on the survey rows is measured: fit twice from
+   θ_Q at the base weights, and once from θ_Q at weights perturbed by a
+   relative 10⁻⁶ on the largest-mass prototype and back; η_Q = the largest
+   relative difference among the returned parameters, floored at the
+   polish residual. The survey's step uses η_Q in the ported rule
+   δ_f = 2√η_Q. η_Q is a product. (P) If η_Q exceeds 10⁻⁶ the survey is
+   still run and the value is reported; no gate.
+4. **Self-check, reported not gated.** On the five largest-mass prototypes
+   the survey also evaluates at step 2δ_f; the ratio of the two responses,
+   per output, is stored as `survey_step_ratio` (expected ≈ 2 for a
+   differentiable T; far from 2 means the response is not a derivative).
+   Ten extra evaluations of survey size.
+5. **The quantized base fit's start (pending the planner's pre-flight).**
+   An option `quantized_start` with values `multistart` (default, as built)
+   and `full-data` (θ_Q is the continuation of θ̂ onto the quantized rows).
+   The pre-flight on the filament mixture decides which the demo uses;
+   both stay available.
+
+**Acceptance for the build.** On the Fundamental Plane at N = 2000 (audit
+draw s = 0) nothing changes bit for bit (the FP estimator has no
+restarts). On the demo mixture, one draw, the A2 comparison: the surveyed
+I_j against the analytic influence's mass-centred receptive-field means,
+per output; corr above 0.9 on every output whose component holds at least
+five prototypes; `survey_step_ratio` within 10% of 2 on the tested
+prototypes; and the fraction of NaN survey fits reported. One survey, no
+bootstrap, no second stage.
+
+### A10. The ABC interval (mods item 14: skew and bias correction; author's ruling, 27 September)
+
+**What it is.** DiCiccio and Efron's approximate bootstrap confidence
+interval (Efron and Tibshirani 1993, chapter 22, the nonparametric ABC and
+its quadratic form ABC_q; DiCiccio and Efron 1992): the BCa interval's
+second-order accuracy obtained from derivatives of T in the weight space
+instead of from resampling. The coder takes the formulas from the book,
+not from this document, and names the equations used in the code comments.
+QIJ supplies the ingredients:
+
+| ingredient | ABC's definition | QIJ's source |
+|---|---|---|
+| σ̂_c | root of the influence energy | √V_btw,c |
+| a_c (acceleration) | (1/6) Σ_i ψ_i³ / (Σ_i ψ_i²)^{3/2} | with the bin-level influence: (1/(6√N)) Σ_k p_k U_kc³ / (Σ_k p_k U_kc²)^{3/2} |
+| b_c (second-order bias) | Σ_i T̈_i / (2N²) | **(ruled 28 September)** b = (1/2N) Σ_k p_k D²_k with D²_k = [T(ω_k⁺) − 2T(ω⁰) + T(ω_k⁻)] / t_k², the second derivative of T in the RELATIVE step along the stencil's own direction. Derivation: along that direction the bin masses move as q_k = p_k + t(1 − p_k), q_l = p_l(1 − t); with the scale identity (Σ_l p_l H_kl = 0, pᵀHp = 0) the second derivative in t equals H_kk exactly, and the plug-in bias ½ tr(H · Cov(p̂)) with the multinomial Cov(p̂) = (diag p − ppᵀ)/N is (1/2N) Σ_k p_k H_kk. At point level (ijfd) this is the book's Σ T̈_i/(2N²). The paper's B̂ used the RAW second difference (≈ t², i.e. ≈ 4η ≈ 10⁻¹⁶) and a (1 − p_k) factor; it was reported and never applied, so no interval depends on it, but the product was wrong. Δ²T_k is stored again. |
+| c_c (curvature along the influence) | second difference of T along the direction of ψ_c, scaled by σ̂ | two evaluations on the SURVEY rows (not the full data), along the field-level influence I_j^(c): weights (1 ± ε u_j) on every row of field j; `start = θ_Q`; ε = min(η_Q^{1/4}, ½ / max_j|u_j|). **Normalization (ruled 28 September):** the resampling-vector scale in ABC's curvature is the DATA size N, not M_𝒳; built with M_𝒳 it came out √(N/M_𝒳) too large on the Pareto shape (0.0724 against the delta-method value σ̂/α̂ = 0.0222). The check that fixed it, c_q against the delta-method quadratic coefficient on an estimator where that is closed form, is the acceptance for any future change to c. |
+| z₀, endpoints | ABC's closed forms in a, b, c, σ̂ | computed on demand like the normal interval; never stored |
+
+**A failed curvature evaluation (ruled 28 September).** Nothing is
+retried. If one side of the ± ε pair returns NaN, c is the one-sided
+second difference on the surviving side with ONE additional evaluation at
+2ε on that side, [T(1 ∓ 2εu) − 2T(1 ∓ εu) + T(1)]/ε², flagged in the
+products as one-sided (O(ε) instead of O(ε²), acceptable for a
+second-order term); if both sides fail, c is NaN, the ABC interval for
+that output is NaN, the normal interval stands, and the failure is
+counted. Non-finite prototype rows are excluded from the direction and
+the scale per output, with the mass renormalized over the finite rows,
+the convention the influence model already uses.
+
+The quantized rows are used for c because it is a second-order correction:
+an error of a few percent in c moves an endpoint by a few percent of a
+1/√N term, below what the interval resolves, and the field-level direction
+differs from ψ̂ by the within-field variation, a few percent of its norm.
+a and b are likewise bin-level approximations of point sums, the same
+approximation V_btw makes. Cost: 2q evaluations of survey size per draw.
+
+**Products.** Per output: `a`, `b_hat`, `c_q`, `eta_Q` (shared), and the
+endpoints of the ABC interval at the study's levels alongside the normal
+interval's, computed by the comparison layer from the stored ingredients.
+The bootstrap method gains the bias-corrected percentile interval (BC),
+using z₀ from the replicates, at no evaluation cost; BCa with a jackknife
+acceleration is NOT run (N refits) and its cost is stated as arithmetic.
+
+**Acceptance for the build (restated 28 September).** One draw of the
+Pareto shape at N = 2000 (a cheap estimator with an analytic influence):
+the BCa reference computed ONCE at B = 20 000 with the ANALYTIC influence
+as the acceleration and each endpoint's Monte Carlo sd estimated by
+resampling the replicates; ABC passes when each 0.95 endpoint lies within
+2 of those sds of the BCa endpoint. (The first form, 0.6/√B of the width at
+B = 2000, held the reference to a tolerance below its own noise.) Also:
+c_q equals the delta-method quadratic coefficient σ̂/α̂ to 1% on that draw,
+for the qij path AND for ijfd's point-level c; b̂ near the Pareto MLE's
+known bias α/n; the step-doubling check on c (ε and 2ε give the same c to
+1%). Results of the first rerun, for the record: c_q = 0.02220 (delta
+method 0.0222), b̂ = 0.00098 (α/n = 0.0010), ABC [1.9173, 2.0910] against
+BCa at B = 2000 [1.9142, 2.0920]; the endpoint formula's λ was corrected
+to the book's w/(1 − a·w)². ijfd's c_q was 10³–10⁴ off and must pass the
+delta-method check before its demo runs. No other run.
+
+### A11. The demo dataset `cloudfil_G_B6_P3_v1` and its estimands (author's rulings, 27–28 September)
+
+**Supersedes mixture 11 as the talk's estimand.** Naming: `cloudfil` the
+family (cloud + filament); `G` a Gaussian cloud (`T` for a multivariate-t
+cloud, later); `B6` a filament of six Gaussian beads (`U` for a tube,
+later); `P3` three protostars; `v1` this parameter set. Parameters live in
+the file, never in the name; a different mass ratio or core weights is
+`v2`.
+
+**The file.** `cloudfil_G_B6_P3_v1.npz` (keys `weights`, `means`, `covs`,
+`role`, `name`, `N_design`, `subject`) with a readable `.txt` twin and the
+generating script `make_cloudfil_G_B6_P3_v1.py`, all in the planner's
+scratch at
+`/private/tmp/claude-501/-Users-jtaylor-Dropbox-Software-JT-Py-Pkgs-vqboot-fable/dc605e35-cf93-477e-a378-464032d7e1c0/scratchpad/cloudfil_v1/`;
+the coder copies all three into the package's `data/` and registers the
+dataset. K = 10 components, weights summing to one:
+
+| k | role | weight | mean | semi-axes | angle |
+|---|---|---|---|---|---|
+| 0 | cloud | 0.585 | (0, 0) | 2.0 × 1.2 | 30° |
+| 1–6 | filament beads at t = −1, −0.6, −0.2, 0.2, 0.6, 1 on x = 2.2t, y = 0.55 sin(πt/1.2) | 0.38/6 each | on the curve | 0.35 along the tangent × 0.08 across | local tangent |
+| 7 | P1 embedded | 0.02 | (0, 0) | 0.05 × 0.025 | 20° |
+| 8 | P2 on-filament | 0.01 | (1.32, 0.55) | 0.05 × 0.025 | −50° |
+| 9 | P3 off-filament | 0.005 | (−1.2, −1.1) | 0.05 × 0.025 | 70° |
+
+Design N = 10 000; expected points 200 / 100 / 50 in P1 / P2 / P3. Sampler:
+multinomial counts from the weights, then multivariate normals; draw s
+uses seed = master + s as for every dataset. The "STARFORGE reading": a
+point is a gas particle (or a photon); a source is a compact overdensity of
+points; the cloud and the filament are nuisance.
+
+**The estimator.** `GMM2D(K = 10)` as built (penalized likelihood, A9's
+`start`, A12's seeding), with the reference labelling of A6: within a draw
+every stencil and every bootstrap replicate labels against the full-data
+fit; across draws (oracle, coverage) against the true components.
+
+**The measured outputs: P2's six, on the scales below.** The estimator's
+raw outputs are the 59 mixture parameters; the demo's estimands are
+functions of them, exposed as ADDITIONAL outputs of T (a thin wrapper
+estimator around `GMM2D`, `outputs` naming the six), with their analytic
+influence by the chain rule, J_g · ψ_θ, where J_g is the 6 × 59 Jacobian of
+the functions below at θ̂. J_g may be formed by central finite differences
+of the deterministic functions in θ (they are cheap closed forms; the one
+integral, if completeness is ever added, by fixed quadrature); the
+perturbation check of the influence applies to the six as to any output.
+With s the P2 component, λ₁ ≥ λ₂ its covariance's eigenvalues, v₁ the
+major-axis eigenvector, b the cloud, F_j the filament beads:
+
+| estimand | definition |
+|---|---|
+| position x, y | μ_s |
+| log effective radius | ¼ log det Σ_s |
+| log axis ratio | log(λ₂/λ₁) |
+| position angle | ½ atan2(2Σ_s,xy, Σ_s,xx − Σ_s,yy), mod π |
+| logit weight | log(π_s / (1 − π_s)) |
+| log peak contrast | log π_s − ½ log det Σ_s − log Σ_{k≠s} π_k φ(μ_s; μ_k, Σ_k) + const, the source's density at its own centre over the sum of every other component's density there (cloud and all six beads); the constant −log(2π) cancels in the ratio |
+
+Seven numbers if position counts as two; the slide shows six panels
+(position once). The rule's q for the prototype count is the number of
+MEASURED outputs, 6, giving M_𝒳 = ⌈√((1 + 2·6·17)·N/2)⌉ = 1013 at N = 10 000;
+the fit must therefore take the measured subset as an argument and the
+rule must read its length. Completeness, contamination and the
+Bhattacharyya overlap are NOT measured in v1.
+
+**Study settings for the TACC run.** N = 10 000; S = 500 draws; bootstrap
+B = 5000 per draw with the replicate parameters STORED as one sequential
+stream (so every B′ ≤ 5000 is available afterwards by truncation, and the
+interval-accuracy-against-B curve is analysis, not a rerun); the bootstrap
+replicates warm-started from the full-data fit (A9 rule 2 extended to the
+bootstrap: `start = θ̂`; the coder's bootstrap method), with the fraction
+of degenerate replicates reported; the bootstrap's percentile and BC
+intervals, BCa with a jackknife acceleration stated as arithmetic only;
+the oracle at 10 000 draws, cold fits with A12's seeding and the truth
+labelling; `ivqbins = marginal` (the joint path is NOT used on this
+estimand: on the true influence a joint partition at 1% needs point-level
+bins, while the six marginal partitions need about 20 groups each);
+`survey = moments`; `quantized_start = full-data` (ruled from the
+pre-flight: the cold quantized fit failed in five of six settings, the
+warm one sat within 0.1–2.4 standard errors in five of six);
+`gptrend = quadratic`, `gpwidth = local` (changed from `global` in the
+consolidated repair round, A15: the diagnosis named one global width
+against a 0.05-wide core as the cause of the posterior's overconfidence
+inside P2), `refine_trigger = measured` (A15), `refine_schedule = rounds`
+(A14); ε = 0.01; the ABC interval (A10) beside the normal one.
+
+### A12. Mixture estimator initialization: peak-seeded starts (author's ruling, 28 September)
+
+**The finding.** On `cloudfil` (both overlaps) the 20 k-means starts never
+found the truth's basin: the penalized log-likelihood at the true
+parameters exceeds the winner's by about 190 nats; the winner collapsed
+the cloud's slot to 1.5% weight and put the cloud's mass on a filament slot
+and on P1's and P3's slots; only 1 of 20 starts reached even that winner;
+96% of initial centres lay inside the cloud's 2σ contour, 0 of 20 starts
+had a centre near P3 and 3 of 20 near P2. A search seeded by mass does not
+see a fifty-point core among ten thousand points. This is the estimator's
+problem, shared by every interval method, and it is fixed in the
+estimator.
+
+**The rule.** The multi-start's start set gains peak-seeded starts beside
+the k-means starts, and the best final likelihood wins as now:
+
+1. Over-segment: k-means on X (never the weights) with 10·K centres
+   (k-means++ seeding, fixed seed as now).
+2. Density at each centre: its count divided by the area of its Voronoi
+   cell, approximated as π r_j² with r_j the median distance from the
+   centre to its members (deterministic, no bandwidth).
+3. Adjacency among centres from the second-best assignment of the points
+   (the CADJ construction the package already has).
+4. Peaks: centres denser than every adjacent centre. Prominence of a peak:
+   its density minus the highest saddle density on any adjacency path to a
+   denser peak (standard topographic prominence on the graph; the global
+   maximum's prominence is its density).
+5. The peak-seeded start: the K most prominent peaks as initial means; each
+   component's initial covariance from the members of its own cell and its
+   adjacent cells; initial weights from the same members' share. If fewer
+   than K peaks exist, fill with the highest-count non-peak centres.
+   **Amended 28 September (two resolutions).** As built at one resolution
+   the seeding missed the basin: only six peaks exist among 100 cells, and
+   P1 and P2 sit exactly on the cloud's and a bead's density peaks, one
+   peak in position but two components in scale. Steps 1–4 are therefore
+   run at TWO resolutions, 10·K cells and 50·K cells (about 20 points per
+   cell at N = 10 000), each with its own densities, adjacency, peaks and
+   prominence (single-member cells count as density 0). The candidates of
+   both levels are POOLED, each carrying its own level's cell mean,
+   covariance and mass share, ranked by prominence together, and the K
+   most prominent become the seeds. Co-located candidates are NOT
+   de-duplicated: a coarse peak and a fine cusp at the same place are the
+   bead-plus-core pair, entering with different initial covariances. At
+   the fine level a 100-point core in an area of 0.004 has density of
+   order 25 000 against about 7 000 for the bead under it, so its
+   prominence exceeds every coarse peak's; at the coarse level it is
+   diluted into a 100-point cell and vanishes.
+   **Selection rule, amended again 28 September:** prominences at the two
+   levels are not on one scale (a fine-level noise cell can carry a few
+   thousand), and the pooled ranking dropped a coarse peak for a fine noise
+   peak, leaving the fit 19.5 nats short on a saddle. Levels seed different
+   structures: ALL coarse peaks are seeded first (the top K by coarse
+   prominence if there are more than K), and the remaining K − (coarse
+   count) seeds are the most prominent FINE peaks, co-located ones kept;
+   k-means centres fill only if fine peaks run out.
+   **Round 4 (ruled 28 September; supersedes the two selection rules
+   above).** Round 2 had the right seeds and lost P2 during EM; round 3
+   forced in two noise coarse peaks (an isolated far outlier's cell, a
+   straggler) and lost four bead seeds. Three fixes: (i) noise guard at
+   both levels, a peak candidate has at least 5 members and at least one
+   adjacent cell; (ii) fine peaks are kept only as CUSPS, a fine peak whose
+   density exceeds the mean density of the coarse cell containing it by
+   more than three standard errors of its own count, density_fine /
+   density_coarse > 1 + 3/√n_fine (a bead's tip is at about 1.3 and fails;
+   P2 at contrast 3.8 passes near 5, P1 near 9, P3 above 20); (iii) seeds =
+   all cusps + the top K − (cusp count) coarse peaks by coarse prominence,
+   k-means centres only if short; (iv) a fine seed's initial covariance
+   from its OWN cell's members only (round 2's P2 seed started at bead
+   scale from its adjacent cells and never shrank back); coarse seeds keep
+   own-plus-adjacent.
+   **Round 4 also missed** (28 September): 35 of 61 fine candidates passed
+   the cusp test, 32 of them noise cells in sparse background where the
+   containing coarse cell is nearly empty; the real cores came out at
+   ratios 1.44 (P2), 3.08 (P1) and 10.5 (P3) because the coarse cell already
+   holds the core's excess and a 20-point fine cell dilutes it. The
+   position-density seeding family is closed: four rounds of patches, each
+   with its own constant, and the fit still 198 nats short.
+
+   **Round 5, the rule that replaces rounds 1–4: residual-driven insertion
+   (greedy EM, Verbeek, Vlassis and Kröse 2003), ruled 28 September.**
+   One principle: a component is added where the data exceed what the
+   current model explains.
+
+   a. Cells: k-means on X with 50·K centres (seeded as now), counts n_j,
+      cell areas A_j = π r_j² (r_j the median member distance; cells with
+      fewer than 5 members carry no candidate), cell means c_j and member
+      covariances. One resolution; no adjacency is needed.
+   b. Start with one component, the sample mean and covariance, weight 1;
+      EM (accelerated) to convergence.
+   c. Insertion, repeated until K components: with the current model f,
+      the residual of cell j is the EXCESS COUNT e_j = n_j − N·A_j·f(c_j).
+      The candidate is the cell with the largest e_j. The new component's
+      mean is that cell's member mean, its covariance the cell's own
+      member covariance, its weight e_j/N (floored at 5/N); the existing
+      weights are scaled by 1 − e_j/N. Run a short accelerated EM, 20
+      steps, from the enlarged model; recompute the residuals; insert
+      again. (A co-located core appears as soon as its bead is in the
+      model: P2's excess is about 100·(1 − 1/3.8) ≈ 74 counts against a
+      noise cell's ±4.5; P3's about 48; P1's about 178. Before any bead is
+      fitted the largest excess lies on the filament, so the beads are
+      inserted first.)
+   d. The result is ONE start, run through the same full EM, gate and
+      polish as any other start, in the multi-start alongside the 20
+      k-means starts; the best final likelihood wins. No cusp test, no
+      guard beyond the 5-member floor, no second resolution.
+      **Start selection (ruled 28 September, after draw 3 converged 99
+      nats below the truth's continuation with P2 at six times its weight
+      because the 25K family's three variants took all three phase-2
+      slots):** every greedy-family start (both cell counts, 10·K and
+      25·K, each with its ×½ and ×2 variants; six starts) runs to full
+      convergence; the two-phase screen applies to the 20 k-means starts
+      only, and no family of variants may occupy more than one finalist
+      slot. The winner is the best final penalized likelihood among all
+      converged starts. Products per draw: the winning start's family, and
+      the spread (best minus second-best) of the converged starts' final
+      likelihoods per point, a per-draw measure of search reliability.
+   e. Rounds 1–4's seeding code is removed (no dead code, §5 R3); the
+      k-means starts stay.
+   f. **Weights in the seeding (ruled 28 September).** The cell "counts"
+      are weight sums, W_j = Σ_{i∈j} ω_i, and the residual is
+      e_j = W_j − (Σω)·A_j·f(c_j); identical to counts at unit weights, so
+      nothing changes on samples. Reason: on the population grid used to
+      define the coverage target (400 × 300 cells with cell probabilities
+      as weights) a count-based seeding is blind, every cell has the same
+      count and the density lives in the weights, and the population
+      multistart landed in round 1's pathology for that reason. The old
+      "X only, never the weights" rule protected the stencils' continuity
+      in ω; under A9 no stencil re-seeds, so the seeding may read ω.
+      **Coverage target rule:** the population penalized MLE is the higher
+      population penalized log-likelihood of (a) the continuation from
+      the truth and (b) the weight-aware multistart; if (b) exceeds (a),
+      the estimand differs from the truth in the central beads and (b) is
+      the study's target for all outputs; otherwise the truth's
+      continuation is.
+
+   Acceptance (amended 28 September after the round-5 result): winner ≥
+   penalized log-likelihood at the truth on the seed-0 draw, AND recovery
+   max |z| < ~4 over the MEASURED outputs; recovery over all raw outputs
+   and the insertion order (which true component each inserted candidate
+   landed on) are reported, not gated. **Round 5 result:** the greedy start
+   wins at 19.1 nats ABOVE the truth's likelihood; P1, P2, P3, the cloud
+   and four beads recover within 1–2σ, P2's seven outputs within 1σ; the
+   two central beads come out as one long component plus a small one, a
+   legitimate alternative optimum of the same objective on this sample,
+   in nuisance parameters, which is the weak identifiability of
+   overlapping beads. Accepted for the demo. A one-time population fit
+   (GMM2D on a fine grid of the true density with cell probabilities as
+   weights) decides the coverage target: the generating truth if it
+   reproduces the six-bead configuration, that population fit otherwise.
+   If greedy insertion had missed, the next step would have been a design
+   review of the mixture and estimator together, not a sixth seeding rule.
+6. (P) Two further starts from the same peaks with the initial covariances
+   scaled by ½ and by 2, so that a compact core is seeded compactly.
+   Total: 20 k-means starts + 3 peak-seeded starts, the same two-phase
+   screen as now.
+
+**Acceptance for the build**, one draw (seed 0) of `cloudfil_G_B6_P3_v1`
+at N = 10 000: the winner's penalized log-likelihood is at least the
+penalized log-likelihood at the true parameters; recovery max |z| over the
+59 raw outputs below about 4; the peak-seeded start is the winner or ties
+it; the number of starts within 10⁻⁶ per point of the winner reported. On
+the FP audit draw nothing changes bit for bit (the FP estimator has no
+starts). No other run.
+
+### A13. A fifth method, `ijfd`: the infinitesimal jackknife by finite differences (author's ruling, 28 September)
+
+**What it is.** The exact infinitesimal jackknife computed the only way a
+black box allows: one perturbed fit per observation. It is the reference
+QIJ approximates and the cost it avoids, and its time is to be measured,
+not multiplied. A method like the others: (dataset, estimator, method, N,
+draws), its own products folder, its own command-line call with any S (the
+demo uses S = 1 for the cost slide; nothing forbids more).
+
+**The draw.**
+1. θ̂ = T(X, 1), the full-data fit (cold, A12's seeding, the reference
+   labelling as for every method).
+2. η_full measured as A9 measures η_Q, on the full data: two fits from θ̂ at
+   the base weights and one at a 10⁻⁶ perturbation of the heaviest point,
+   largest relative parameter difference, floored at the polish residual;
+   the step δ_f = 2√η_full.
+3. For each observation i: weights ω(i) raising point i's weight by the
+   ported forward step (t_i = δ_f p_i/(1 − p_i) with p_i = 1/N, every other
+   weight lowered in proportion), the fit started from θ̂ (`start = θ̂`,
+   A9), ψ_i = [T(X, ω(i)) − θ̂] / t_i for all outputs; N evaluations of size
+   N, independent, through the pool. Mass-centre per output.
+4. V_ijfd,c = (1/N²) Σ_i ψ_ic² per output, the normal interval on it at any
+   level (computed on demand as for QIJ), and the ABC ingredients from the
+   point influences (a_c from Σψ³, b and c as A10 defines them, here with
+   point-level quantities; the curvature evaluations along ψ on the full
+   data, two per output).
+5. Self-check, reported: the step-doubling ratio on the ten heaviest
+   points, as A9 rule 4.
+6. **`point_curvature` option (ruled 28 September).** The forward draw has
+   no per-point second difference, so A10's b cannot be formed from it.
+   With `point_curvature` on, every point also gets the backward-step fit
+   (2N + 1 evaluations plus check and ABC), ψ_i is the central difference,
+   Δ²T_i the three-point second difference, and b_hat and the ABC interval
+   are point-level exact. With it off, b_hat and the ABC fields are NaN and
+   ψ_i is the forward difference. **Step (added 28 September):** with the
+   option on, the ± point stencil uses the CENTRAL step, t ~ η^{1/3}, the
+   same rule the bins' central stencil uses, not the forward step
+   t ~ 2√η; with the forward step the second difference over t² was
+   roundoff (errors up to 10⁵×). On the Pareto shape b̂ then equals the
+   closed form Σ(L − L̄)²/(N² L̄³) to 0.02%. Package default OFF; the demo's S = 1 run
+   is done BOTH ways, once each, so the cost slide carries the forward and
+   the central timings and the central run is the exact reference for
+   QIJ's bin-level b_hat. c_q is never broadcast into per-point Δ²T.
+
+**Products.** Per output V_ijfd, a, b_hat, c_q; shared: η_full, evaluations
+(N + 1 + the check's and ABC's), rows, wall time, busy time, workers, the
+step ratios; per point ψ_i for all outputs (the `ij` method's analytic ψ is
+stored the same way, so the comparison layer forms relMSE(ψ_ijfd, ψ_ij) per
+output and per point without a rerun); the fraction of perturbed fits that
+returned NaN. A NaN at any point fails the output's V (the identity needs
+every term); the draw's other outputs stand.
+
+**Cost, stated in advance so the measurement can be judged.** At
+N = 10 000 with warm-started fits at about 1.5 s: about 4 h serial per draw
+forward, twice that central, under 20 and 40 minutes on 14 workers. It is
+NOT run for the S = 500 study. **Where it runs (author's ruling, 28
+September):** the two demo runs, forward and central, S = 1, N = 10 000,
+go to TACC at the study's worker count (W = 100), in separate product
+folders, because they measure cost and must be timed on the same hardware
+as QIJ's and the bootstrap's runs. Locally only a one-draw smoke at
+N = 2000 with point curvature, to show the method runs on `cloudfil`, plus
+the S = 1 run on the paper's FP at N = 2000 (audit draw s = 0) as the cheap
+correctness point, where its V must equal the stored `ij` value to the
+step's accuracy.
+
+**Acceptance for the build.** On the FP audit draw, relMSE(ψ_ijfd, ψ_ij)
+per output below 10⁻⁴ and V_ijfd within 10⁻³ relative of the stored V_ij;
+the step ratios within 10% of 2. No other run.
+
+### A14. Refinement in rounds: `refine_schedule` (author's ruling, 28 September)
+
+**Why.** The marginal path's refinement is a queue: the open leaf with the
+largest expected gain is split, one evaluation, then τ and the flags are
+updated, then the next leaf. Running the measured outputs' queues
+concurrently gives at most q-way parallelism, 7 here, on nodes with about
+100 CPUs, and refinement was already the largest serial term at N = 2000.
+
+**The switch.** `refine_schedule` with two values: `queue` (ported, the
+default; bit-identical, the audit stands) and `rounds`.
+
+Under `rounds`, all measured outputs are refined together in synchronized
+rounds. A round: for every output, every open leaf whose stored expected
+gain is at or above that output's current τ is split, with the split kind
+by the ported rule and the child's evaluation as ported; all those
+evaluations, across all outputs, run through the pool at once; then, per
+output, V_btw, L and τ are updated from the realized gains, the closing
+flags set by the ported two-consecutive rule, and the children given
+their proposals. The next round begins. Stop when no output has an open
+leaf above its τ, or when an output's evaluation guard 1 + M_𝒳 is
+reached; a round is capped at the remaining budget in expected-gain order
+so the guard is never overshot. Leaves below τ are not touched and can
+qualify in a later round as τ falls, exactly as in the queue.
+
+**What differs from the queue.** τ is recomputed per round rather than per
+split, so a leaf late in a round is judged against a slightly larger τ
+than the queue would have used, and a round may split a few leaves the
+queue would have stopped before. Results are therefore not bit-identical
+to the queue (an E8-class difference); the tolerance's meaning and the
+closing rule are unchanged. The round count is about the tree's depth,
+a handful, and each round is as wide as the sum over outputs of their
+qualifying leaves, tens of evaluations, which is what a 100-CPU node can
+use. The demo passes `rounds`; the paper's cases keep `queue`.
+
+**Acceptance.** On the FP audit draw, `queue` bit-identical; `rounds`
+reported beside it: per output L, evaluations, V_btw (relative difference
+to `queue`, expected within the tolerance ε, since both schedules leave at
+most ε inside the bins and may differ by up to that; the first draft said
+"a few tenths of a percent", which holds at ε = 0.01 but not as a general
+statement), and the wall time at 1, 8 and the node's worker count.
+**Built and accepted 28 September:** queue bit-identical; on the FP draw
+rounds equals queue in L, evaluations and V_btw (the refinement there is
+too small to differ); on cloudfil at N = 2000, ε = 0.05, 14 workers,
+refinement wall time 10.3 → 3.6 s, evaluations 707 → 677, V_btw identical
+on five of seven outputs and different by 0.07% and 3.4% on the two
+most-split ones, inside ε. The dress rehearsal at N = 10 000, ε = 0.01
+reports the per-output difference and its sign. No other run.
+
+### A15. The consolidated repair round (author's instruction, 28 September): the marginal refinement gets a measured trigger
+
+**The finding it repairs (rehearsal + diagnostics, draws 0 and 1 of the
+demo).** QIJ's between-bin variance reached 57–93% of the analytic
+influence variance at ε = 0.01 on every measured output, with the position
+angle at its evaluation guard. The stencils are right: the final bins'
+true between-bin share equals V_btw/V_ij exactly, so the shortfall is the
+partition. The initial 17 bins recover almost nothing on some outputs
+(0.8% for the angle), refinement closes most of the gap but spends only
+2–13% of its evaluations on bins inside P2, and the reason is the model:
+on the bins holding P2's points the posterior's predicted within-bin
+variance is 0.2–9% of the true one, so the expected gains inside P2 are
+underestimated by one to two orders and the queue spends its budget
+outside. The point prediction inside P2 also fails for specific outputs
+(angle −0.61, logit weight 0.09 on draw 1). Cause: a global kernel width
+tuned to the cloud's and filament's scales, of order 0.3–1, cannot
+represent structure inside a 0.05-wide core sampled at nine fields, and
+the moments rows make the GP certain of what it cannot see. The refinement
+as published trusts the posterior's pricing; on this estimand that trust
+is misplaced exactly where it matters.
+
+**The repair, three parts, one round.**
+
+1. **A measured trigger in the marginal refinement** (switch
+   `refine_trigger`: `gain`, the ported queue, default and audited;
+   `measured`, the demo's setting). After the initial bins of output c
+   are measured: a_c = Σ_k p_k U_kc m_kc / Σ_k p_k m_kc² (B4's scale
+   factor); bin k is FLAGGED when
+   p_k (U_kc − a_c m_kc)² > ε V̂_c / L + p_k a_c² u_kc, with m_kc the bin's
+   mean of ψ̂₀ and u_kc the posterior variance of that bin mean (B4's test,
+   unchanged). Flagged bins enter the queue ahead of every predicted-gain
+   entry, ordered by their measured discrepancy p_k (U_kc − a_c m_kc)². A
+   flagged bin is split by the ported kind rule (level if Var_k(ψ̂₀) > v_k,
+   else adjacency) with one addition: when the bin lies inside a single
+   receptive field, or its level split's children have predicted means
+   closer than the bin's allowance, the split is GEOMETRIC, two-means on
+   the members' whitened data coordinates with the principal-axis
+   initialization (deterministic), because inside a core the prediction
+   has nothing left to say and the data's geometry does.
+   **Amended 28 September after the first draw-0 check** (ratios
+   0.90–0.98 with two outputs at the guard and 95% of evaluations in
+   flagged lineages): the flag test decides ENTRY into the queue only,
+   once, for the initial bins. Children of a flagged bin are NOT
+   re-flagged by the model test; they are governed by the ported
+   realized-gain rule like any refined leaf, a child re-enters if its
+   realized gain is at least τ and a lineage closes after two consecutive
+   below-τ splits. (Re-testing children against the model cannot
+   terminate where the model is wrong: the per-bin allowance ε·V̂/L shrinks
+   as L grows and demands that a wrong model be matched to ε/L, which is
+   the runaway the check measured.) The geometric override's criterion,
+   now specified: form the level split's children and their predicted
+   means m_a, m_b and bin-mean posterior variances u_a, u_b; the split is
+   LEVEL when |m_a − m_b| > √(u_a + u_b), the model separating the children
+   by more than its own uncertainty about them, and GEOMETRIC otherwise;
+   the adjacency split stays available as ported. Children are measured as
+   ported (one forward evaluation, the other by mass balance). Unflagged
+   bins keep the ported queue, closing rule and τ. The evaluation guard is
+   unchanged.
+   **Round 3 (28 September; round 2 regressed to 0.34–0.94 with zero
+   geometric splits, because the split-kind rule read the same
+   overconfident posterior the repair was meant to bypass, and the
+   zero-level closing starved refinement to 250 evaluations).** No
+   posterior quantity enters a flagged lineage: (i) entry by the measured
+   flag test on the initial bins only, as in round 2; (ii) flagged
+   lineages split GEOMETRICALLY, always, two-means on whitened data
+   coordinates with the principal-axis initialization, since the flag has
+   established by measurement that the model's mean is wrong there and its
+   within-bin ordering is not to be trusted; (iii) a flagged lineage's
+   children enter the queue with a MEASURED priority, half the parent
+   split's realized gain Δ = p_a U_a² + p_b U_b² − p_k U_k², flagged initial
+   bins with their measured discrepancy, unflagged bins with the ported
+   expected gain; (iv) closing by the ported two-strike rule everywhere;
+   (v) unflagged bins refined exactly as ported. Guard unchanged.
+2. ~~Zero-level closing.~~ **Removed in round 3.** One below-τ split
+   cannot distinguish a constant bin from an evenly divided one, which is
+   why the paper waits for two; round 2 showed what one strike costs.
+3. **The demo's GP width becomes local** (`gpwidth = local`, A2, already
+   built and audited): the diagnosis names the scale mismatch between one
+   global width and a 0.05-wide core as the cause of the overconfidence,
+   and the local width gives P2's fields a width of their own spacing.
+   On the Fundamental Plane it was identical to `global` under the
+   quadratic trend, so nothing already accepted changes. A11's study
+   settings are amended accordingly.
+
+Also in the round: the three bookkeeping fixes (curvature term excluding
+non-finite prototypes; the oracle's failure count including NaN returns;
+ijfd's ABC over the measured subset); and the seeding's second greedy
+start at 25·K cells with its scaled variants IF the attribution of draws
+3, 6, 7 shows the truth's continuation passing where the multistart
+failed (otherwise those are counted estimator failures and nothing is
+added).
+
+**Two additions from the attribution and the degenerate-replicate
+breakdown (28 September).**
+
+- The cold-fit failures on draws 6 and 7 were saddles that the truth's
+  continuation passes at a higher likelihood, so the starts are at fault:
+  the second greedy start at 25·K cells with its scaled variants goes in.
+  Draw 3 passed on rerun with a gate margin of +1.6 × 10⁻⁵, flipping with
+  summation order; the gate stays a sign test, and the rerun reports
+  whether the variants move that draw to the higher basin the k-means
+  winner missed by 18 nats.
+- Of the 11 degenerate bootstrap replicates, 6 were converged fits cut
+  off: the score norm at the Newton cap of 20 sat at 2 × 10⁻¹² to
+  3 × 10⁻¹¹, the float64 floor for K = 10, 59 parameters and N = 10 000,
+  against a declared η of 10⁻¹² carried over from mixture 11 at N = 5000.
+  Rule: **η_full is measured per draw on the full data**, as A9 measures
+  η_Q and as A13 prescribes for ijfd (two fits from θ̂ at the base weights
+  and one at a 10⁻⁶ perturbation of the heaviest point; the largest
+  relative parameter difference, floored at the polish residual, rounded
+  up to a power of ten), recorded as `eta_full`, and used by every
+  full-data evaluation in the draw: the polish's acceptance for stencils
+  and bootstrap replicates, and the stencils' step δ_f = 2√η_full. The
+  Newton cap becomes 40. The other 5 replicates are genuine stalls on the
+  resample's surface and stay counted as degenerate; the warm start stays,
+  since a cold multistart fails more of them.
+
+**Products added.** Per output: `n_flagged` (initial bins flagged),
+`n_flag_evals` (evaluations spent on flagged lineages), `n_geom_splits`,
+`a_c`; shared: `eta_full`; the trigger switch value in every row.
+
+**The gate for TACC: the rehearsal rerun** (same draws, same workers,
+demo settings with `refine_trigger = measured`, `gpwidth = local`,
+`refine_schedule = rounds`). Pass criteria, all required: V_btw/V_ij ≥ 0.97
+on every measured output on both draws; evaluations per output reported
+and no output at its guard; the queue/rounds difference within ε on
+draw 0; degenerate bootstrap replicates explained by component and cause;
+the three failed oracle draws attributed. If any criterion fails, the
+next step is the next diagnosis from the rerun's products and the next
+repair to the method; the estimand does not change.
+
+### A16. Deterministic annealing as the mixture estimator's search (author's ruling, 28 September)
+
+**Why.** Every cold fit in the study, and all ten thousand of the oracle's,
+must reach the right basin without knowing the truth, or the search's
+failure rate becomes coverage loss on P2. The multi-start with k-means and
+greedy starts reached the basin on draw 0 and missed it on draw 3 by 99
+nats through a screening accident; more starts and selection rules are
+patches on a search that descends into the nearest basin. Deterministic
+annealing EM (Ueda and Nakano 1998) descends into the deepest: it
+maximizes a free energy with a temperature, unimodal at high temperature,
+and tracks that maximum as the temperature falls to unity, where the
+objective is the penalized likelihood itself. Structures appear as the
+temperature falls, the largest first and compact cores last. It needs no
+seeds and replaces the whole start apparatus with one deterministic run.
+
+**The procedure** (switch `search`: `multistart`, the current apparatus,
+default until A16 is accepted; `anneal`).
+
+1. Inverse temperature β on a geometric schedule from 0.02 to 1 in 25
+   steps (factor ≈ 1.17), the standard schedule; the acceptance below
+   decides whether it is fine enough, and the only permitted change is a
+   finer factor.
+2. Start: all K components at the sample mean and covariance with equal
+   weights, with a deterministic symmetry break: component k's mean
+   displaced by (k − (K+1)/2) × 10⁻³ σ₁ along the data's first principal
+   axis (σ₁ its standard deviation). Symmetric EM would otherwise keep the
+   components identical forever.
+3. At each β: the E-step uses tempered responsibilities,
+   r_ik(β) ∝ [π_k φ(x_i; μ_k, Σ_k)]^β normalized over k; the M-step is the
+   penalized weighted M-step as built (SQUAREM allowed); iterate to the
+   ported convergence tolerance, warm from the previous β.
+4. At β = 1: the Newton gate and polish as built, acceptance at the
+   measured η_full.
+5. Under `anneal` there are no k-means starts, no greedy insertion, no
+   families and no screen. **Amended 28 September:** annealing is built as
+   the ONLY cold search from the start; seeding.py, the k-means starts and
+   the screen are removed with the build (git holds them), and the
+   multistart's already-recorded results on draws 0, 1, 3, 6 and 7 are the
+   comparison side of the acceptance. There is no `search` switch.
+   Continuations with `start` never anneal: they run EM from their start
+   on its branch, since annealing would erase the branch a derivative
+   depends on; that cold/warm distinction is the design.
+6. Products per cold fit: the β at which the effective number of
+   components (weights above 5/N) last changed, and the final penalized
+   likelihood; plus the search audit of A16.7.
+
+7. **Search audit, for every cold fit in the study (this dataset has a
+   known truth).** After the cold fit, one continuation from the TRUE
+   parameters on the same draw (start = truth, labels to the truth); the
+   product `search_gap` = (cold fit's penalized log-likelihood) − (truth
+   continuation's), per point, and `search_failed` = (search_gap < 0 by
+   more than the polish residual). The truth never enters any method's
+   estimate; it judges the search, as the analytic influence judges the
+   variance. The oracle runs FIRST on TACC and its audited failure count
+   over ten thousand draws is read before the bootstrap and QIJ runs start.
+
+**Acceptance.** On the demo at N = 10 000, draws 0, 1, 3, 6 and 7 (the
+known cases), `anneal` against `multistart` on the same draws: the
+annealed fit's penalized log-likelihood at or above the truth's
+continuation's on every one of the five (search_gap ≥ 0); P2's seven
+outputs recovered within ~4σ on each; wall time per cold fit reported
+beside the multistart's. On the FP audit draw nothing changes (the FP
+estimator has no search). If a draw fails, the schedule factor is refined
+once (to 1.10) and the five are rerun; if it still fails, the failing
+draw's β-trace (effective component count against β) is reported and the
+planner rules.
 
 ### A5. Wave A audit and measurement
 

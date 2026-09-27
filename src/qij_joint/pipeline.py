@@ -1,7 +1,9 @@
-"""The four methods' per-draw loops (Sections 2 and 4). `oracle` and `ij`
-run their draws across a process pool; `boot` and `qij` loop over draws
-in sequence, each parallel within a draw -- `boot` over replicate
-chunks, `qij` over its prototype survey (method_notes section 2).
+"""The five methods' per-draw loops (Sections 2 and 4; spec A13 for
+`ijfd`). `oracle` and `ij` run their draws across a process pool; `boot`,
+`qij` and `ijfd` loop over draws in sequence, each parallel within a
+draw -- `boot` over replicate chunks, `qij` over its prototype survey
+(method_notes section 2), `ijfd` over its N (or 2N under
+`point_curvature`) point-perturbed fits.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import pandas as pd
 
 from . import products, registry
 from .bootstrap import Bootstrap
+from .ijfd import IJFD
 from .parallel import Pool
 from .qij import QIJ
 
@@ -20,14 +23,16 @@ from .qij import QIJ
 def _oracle_task(T, case, X, task):
     """One draw's full-data estimate: `theta_hat = T(X, ones)`; `X` is
     drawn fresh in this worker since draws are shared only by (N, seed),
-    not by value, when the pool runs across draws."""
+    not by value, when the pool runs across draws. `failed` is also set
+    on a NaN return that raised no exception (a gate failing quietly),
+    not only on an exception."""
     s, N, base_seed = task
     seed = base_seed + s
     t0 = time.perf_counter()
     Xd = case.draw(N, seed)
     try:
         theta_hat = np.asarray(T(Xd, np.ones(N)), dtype=float)
-        failed = False
+        failed = bool(np.any(np.isnan(theta_hat)))
     except Exception:
         theta_hat = np.full(len(T.outputs), np.nan)
         failed = True
@@ -37,14 +42,16 @@ def _oracle_task(T, case, X, task):
 def _ij_task(T, case, X, task):
     """One draw's analytic variance: `psi = T.influence(X, ones)`,
     `V_ij = mean(psi**2, axis=0) / N`, the infinitesimal-jackknife
-    variance of theta_hat."""
+    variance of theta_hat. `failed` is also set on a NaN return that
+    raised no exception (a gate failing quietly), not only on an
+    exception."""
     s, N, base_seed = task
     seed = base_seed + s
     t0 = time.perf_counter()
     Xd = case.draw(N, seed)
     try:
         psi = np.asarray(T.influence(Xd, np.ones(N)), dtype=float)
-        failed = False
+        failed = bool(np.any(np.isnan(psi)))
     except Exception:
         psi = np.full((N, len(T.outputs)), np.nan)
         failed = True
@@ -79,7 +86,9 @@ def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed:
 def run_ij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
            out_dir: str, workers: int, force: bool) -> Tuple[int, int]:
     """`ij`: analytic influence and V_ij, parallel across draws; the
-    `psi` array is stored for every draw written."""
+    `psi` array is stored for every draw written; `ijfd` stores its own
+    under the same kind, mass-centred, so a comparison against it centres
+    this one first."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'ij')
     outputs = registry.case(dataset, estimator).make_T().outputs
@@ -116,9 +125,9 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
         X = case.draw(N, dseed)
         res = Bootstrap(B=B, seed=dseed).fit(X, T, pool=pool)
         row = {'dataset': dataset, 'estimator': estimator, 'N': N,
-               's': s, 'seed': dseed, 'n_failed': res.n_failed,
+               's': s, 'seed': dseed, 'n_degenerate': res.n_degenerate,
                'wall_time': res.wall_time, 'busy_time': res.busy_time,
-               'workers': res.workers}
+               'workers': res.workers, 'eta_full': float(res.eta_full)}
         rep_df = pd.DataFrame({f'theta_{o}': res.replicates[:, j]
                                 for j, o in enumerate(res.outputs)})
         products.write_draw(md, s, row, {'replicates': rep_df})
@@ -129,14 +138,29 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
 
 def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> dict:
     """One `qij` scalar row: `QIJResult`'s scalars flattened to columns
-    per stage and per output, plus `ivqbins`, `survey` and the joint
-    scalars from the joint second stage (spec/method_notes.md section 6)
-    -- the joint scalars inert under `ivqbins='marginal'`."""
+    per stage and per output, plus `ivqbins`, `survey`, `quantized_start`,
+    `refine_schedule`/`n_rounds` (the marginal path's own schedule,
+    spec/QIJ_mods_waves.md A14), `refine_trigger` and its own A15 item 6
+    products (`a_c_<o>`, `n_flagged_<o>`, `n_flag_evals_<o>`,
+    `n_geom_splits_<o>`), `eta_full` (A15), the ABC interval's
+    ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`, `eta_Q`,
+    spec/QIJ_mods_waves.md A10) and the joint scalars from the joint
+    second stage (spec/method_notes.md section 6) -- the joint scalars
+    inert under `ivqbins='marginal'`. The joint check's own scale factor
+    (B6, also lettered `a` in the spec) is `joint_a_<o>` here, kept
+    distinct from A10's `a_<o>` (the ABC acceleration, populated under
+    both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
+    measured trigger's own scale factor, B4's formula reused at one
+    output)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
-           'ivqbins': res.ivqbins, 'survey': res.survey}
-    for stage in ('prototype', 'full_data', 'refinement', 'total'):
+           'ivqbins': res.ivqbins, 'survey': res.survey,
+           'quantized_start': res.quantized_start, 'eta_Q': float(res.eta_Q),
+           'eta_full': float(res.eta_full),
+           'refine_schedule': res.refine_schedule, 'n_rounds': int(res.n_rounds),
+           'refine_trigger': res.refine_trigger}
+    for stage in ('prototype', 'full_data', 'refinement', 'curvature', 'eta_full', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
         row[f'wall_time_{stage}'] = float(res.wall_time_by_stage[stage])
@@ -168,8 +192,28 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'c_{o}'] = float(res.c[j])
         row[f'c_bound_{o}'] = bool(res.c_bound[j])
         row[f'S_pred_{o}'] = float(res.joint_S_pred[j])
-        row[f'a_{o}'] = float(res.joint_a[j])
+        row[f'joint_a_{o}'] = float(res.joint_a[j])
+        row[f'a_{o}'] = float(res.a[j])
+        row[f'b_hat_{o}'] = float(res.b_hat[j])
+        row[f'c_q_{o}'] = float(res.c_q[j])
+        row[f'c_q_one_sided_{o}'] = bool(res.c_q_one_sided[j])
+        row[f'a_c_{o}'] = float(res.a_c[j])
+        row[f'n_flagged_{o}'] = int(res.n_flagged[j])
+        row[f'n_flag_evals_{o}'] = int(res.n_flag_evals[j])
+        row[f'n_geom_splits_{o}'] = int(res.n_geom_splits[j])
     return row
+
+
+def _qij_step_ratio(res) -> pd.DataFrame:
+    """`step_ratio` for every `qij` draw (not gated behind `--diag-draws`):
+    the survey's step-doubling self-check on its five largest-mass
+    prototypes, per output (spec/QIJ_mods_waves.md A9 item 4); all-NaN
+    rows for an estimator without `takes_start`."""
+    step_ratio = np.asarray(res.survey_step_ratio, dtype=float)
+    data = {'i': np.arange(step_ratio.shape[0])}
+    for j, o in enumerate(res.outputs):
+        data[f'step_ratio_{o}'] = step_ratio[:, j]
+    return pd.DataFrame(data)
 
 
 def _qij_points(res) -> pd.DataFrame:
@@ -204,6 +248,31 @@ def _qij_bins(res) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _qij_bin_U(res) -> pd.DataFrame:
+    """`bin_U` for EVERY `qij` draw under `ivqbins='marginal'`
+    (spec/QIJ_mods_waves.md A14's bin_U product, not gated behind
+    `--diag-draws` -- the comparison layer needs it every draw to form
+    Cov_btw(c, c') = sum_k p_k U_kc U_kc' per draw over the S-draw
+    study): one long table keyed by `output`, `output, k, bin_mass,
+    U_<o>` for every measured output `o` -- each row is one of THAT
+    output's own final I-VQ bins, and `U_<o>` is every measured
+    output's derivative on it, mirroring `_qij_bins`'s joint-path
+    columns (kept under the distinct product name `bin_U` so the two
+    tables' gating -- this one always written, the joint `bins` table
+    diag-only -- stays independent). Bin mass is recovered from
+    `bin_label` (already stored per point) rather than stored again, no
+    new evaluation spent either way."""
+    frames = []
+    for j, o in enumerate(res.outputs):
+        L = res.bin_U[j].shape[0]
+        mass = np.bincount(res.bin_label[:, j], minlength=L) / res.N
+        data = {'output': o, 'k': np.arange(L), 'bin_mass': mass}
+        for j2, o2 in enumerate(res.outputs):
+            data[f'U_{o2}'] = res.bin_U[j][:, j2]
+        frames.append(pd.DataFrame(data))
+    return pd.concat(frames, ignore_index=True)
+
+
 def _qij_prototypes(res) -> pd.DataFrame:
     """`prototypes` for `--diag-draws`: `j, p, w_<d>, I_<o>, h`
     (method_notes section 3)."""
@@ -222,14 +291,22 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
             workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
             M_X: Optional[int] = None, ivqbins: str = 'marginal',
-            survey: str = 'points') -> Tuple[int, int]:
+            survey: str = 'points', quantized_start: str = 'multistart',
+            refine_schedule: str = 'queue', refine_trigger: str = 'gain') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
-    prototype survey (method_notes section 2) and, under
-    `ivqbins='joint'`, the shared bins' full-data stencils run in
-    parallel -- the rest of a draw is serial regardless of `workers`.
-    `survey` picks the prototype survey's receptive-field representation
-    (spec/method_notes.md section 2)."""
+    prototype survey (method_notes section 2), under `ivqbins='joint'`
+    the shared bins' full-data stencils, and under `refine_schedule=
+    'rounds'` (spec/QIJ_mods_waves.md A14) the marginal refinement's own
+    rounds run in parallel -- the rest of a draw is serial regardless of
+    `workers`. `survey` picks the prototype survey's receptive-field
+    representation (spec/method_notes.md section 2); `quantized_start`
+    picks theta_Q's starting point (spec/QIJ_mods_waves.md A9 item 5);
+    `refine_trigger` picks the marginal refinement's own leaf-selection
+    rule (spec/QIJ_mods_waves.md A15). Every draw also writes a
+    `step_ratio` array (A9 item 4) and, under `ivqbins='marginal'`, a
+    `bin_U` array (spec/QIJ_mods_waves.md A14), neither gated behind
+    `--diag-draws` like `points`/`prototypes`/`bins` are."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -244,13 +321,98 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         X = case.draw(N, dseed)
         res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
-                  survey=survey).fit(X, T, pool=pool)
+                  survey=survey, quantized_start=quantized_start,
+                  refine_schedule=refine_schedule, refine_trigger=refine_trigger).fit(
+                      X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
-        arrays = None
+        arrays = {'step_ratio': _qij_step_ratio(res)}
+        # `bin_U` (A14) is its own product name, distinct from the
+        # joint path's `bins`, so it can be written every draw while
+        # `bins` stays diag-gated below -- the comparison layer's
+        # per-draw Cov_btw needs it whether or not the draw is a
+        # `--diag-draws` one.
+        if ivqbins == 'marginal':
+            arrays['bin_U'] = _qij_bin_U(res)
         if s in diag:
-            arrays = {'points': _qij_points(res), 'prototypes': _qij_prototypes(res)}
+            arrays['points'] = _qij_points(res)
+            arrays['prototypes'] = _qij_prototypes(res)
             if ivqbins == 'joint':
                 arrays['bins'] = _qij_bins(res)
+        products.write_draw(md, s, row, arrays)
+        written += 1
+    if pool is not None:
+        pool.close()
+    return written, len(draws) - written
+
+
+def _ijfd_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> dict:
+    """One `ijfd` scalar row (spec A13's product list): `eta_full`,
+    `nan_fraction`, timing/workers, the evaluation/row breakdown by
+    stage ('backward' and 'abc' are 0 under `point_curvature=False`,
+    the planner's ruling), and per output `V_ijfd`/`a`/`b_hat`/`c_q`
+    (the latter three NaN under `point_curvature=False`), one column per
+    `res.outputs` -- the measured subset (spec A11), mirroring `qij`'s
+    own `_qij_row`; identity `measured` reproduces every output."""
+    row = {'dataset': dataset, 'estimator': estimator, 'N': N,
+           's': s, 'seed': seed, 'point_curvature': bool(res.point_curvature),
+           'eta_full': float(res.eta_full), 'nan_fraction': float(res.nan_fraction),
+           'wall_time_total': float(res.wall_time_total),
+           'busy_time_total': float(res.busy_time_total), 'workers': int(res.workers)}
+    for stage in ('cold', 'eta_full', 'forward', 'backward', 'abc', 'check', 'total'):
+        row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
+        row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
+    for j, o in enumerate(res.outputs):
+        row[f'V_ijfd_{o}'] = float(res.V[j])
+        row[f'a_{o}'] = float(res.a[j])
+        row[f'b_hat_{o}'] = float(res.b_hat[j])
+        row[f'c_q_{o}'] = float(res.c_q[j])
+    return row
+
+
+def _ijfd_step_ratio(res) -> pd.DataFrame:
+    """`step_ratio` for every `ijfd` draw (mirrors `_qij_step_ratio`):
+    A13's step-doubling self-check on the ten heaviest points, per
+    output (spec A9 item 4)."""
+    step_ratio = np.asarray(res.step_ratio, dtype=float)
+    data = {'i': np.arange(step_ratio.shape[0])}
+    for j, o in enumerate(res.outputs):
+        data[f'step_ratio_{o}'] = step_ratio[:, j]
+    return pd.DataFrame(data)
+
+
+def _ijfd_points(res) -> pd.DataFrame:
+    """`i, psi_<o>` for every point (mirrors `_qij_points`'s shape;
+    named like `ij`'s own stored `psi` array -- both use kind='psi' --
+    so the comparison layer reads the two side by side without a
+    rerun, spec A13). `psi` is at `res.outputs_full`'s width, not the
+    measured subset `res.outputs` (spec A11, `IJFDResult` docstring):
+    the comparison needs every output, not only the measured ones."""
+    N = res.psi.shape[0]
+    data = {'i': np.arange(N)}
+    for j, o in enumerate(res.outputs_full):
+        data[f'psi_{o}'] = res.psi[:, j]
+    return pd.DataFrame(data)
+
+
+def run_ijfd(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
+             out_dir: str, workers: int, point_curvature: bool, force: bool) -> Tuple[int, int]:
+    """`ijfd` (spec A13): a sequential draw loop, one pool shared across
+    the run (mirrors `run_qij`'s pattern) for each draw's N (or 2N under
+    `point_curvature`) point-perturbed fits."""
+    draws = list(draws)
+    md = products.method_dir(out_dir, dataset, estimator, N, 'ijfd')
+    case = registry.case(dataset, estimator)
+    T = case.make_T()
+    pool = Pool(workers, T=T) if workers > 1 else None
+    written = 0
+    for s in draws:
+        if not force and products.is_done(md, s):
+            continue
+        dseed = seed + s
+        X = case.draw(N, dseed)
+        res = IJFD(point_curvature=point_curvature).fit(X, T, pool=pool)
+        row = _ijfd_row(dataset, estimator, N, s, dseed, res)
+        arrays = {'step_ratio': _ijfd_step_ratio(res), 'psi': _ijfd_points(res)}
         products.write_draw(md, s, row, arrays)
         written += 1
     if pool is not None:

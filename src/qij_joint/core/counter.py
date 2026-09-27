@@ -7,7 +7,7 @@ section 1). Nothing else of T is reachable through a Counter.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -15,7 +15,8 @@ import numpy as np
 class Counter:
     """
     Counting wrapper around one estimator T, over N rows of the full
-    data. `outputs`/`name`/`eta` are copied from T at construction. If
+    data. `outputs`/`name`/`eta`/`takes_start` are copied from T at
+    construction (`takes_start` false when T has no such attribute). If
     T has `prepare`, `T.prepare(A)` is computed once per distinct array
     object A this Counter is called on and reused for that object,
     held by reference (keyed on identity) so its id cannot be reused
@@ -28,6 +29,7 @@ class Counter:
         self.outputs = T.outputs
         self.name = T.name
         self.eta = T.eta
+        self.takes_start = getattr(T, 'takes_start', False)
         self._has_prepare = hasattr(T, 'prepare')
         self._prep_cache = {}  # id(A) -> (A, prep); holds A alive
 
@@ -35,16 +37,28 @@ class Counter:
         self.rows = 0
         self.failed = 0
 
-    def __call__(self, X: np.ndarray, w: np.ndarray) -> np.ndarray:
+    def __call__(self, X: np.ndarray, w: np.ndarray,
+                 start: Optional[np.ndarray] = None,
+                 eta: Optional[float] = None) -> np.ndarray:
+        """T(X, w), passing `start`/`eta` on to T only when each is given
+        and `self.takes_start` (spec A9 item 1; the per-call `eta`
+        override, spec/QIJ_mods_waves.md A15, extended here by the same
+        rule as `parallel.call_T`); an estimator without `takes_start`
+        never sees either and is bit-identical to calling without them."""
+        kwargs = {}
+        if start is not None and self.takes_start:
+            kwargs['start'] = start
+        if eta is not None and self.takes_start:
+            kwargs['eta'] = eta
         if self._has_prepare:
             key = id(X)
             entry = self._prep_cache.get(key)
             if entry is None or entry[0] is not X:
                 entry = (X, self._T.prepare(X))
                 self._prep_cache[key] = entry
-            result = np.asarray(self._T(X, w, prep=entry[1]), dtype=float)
+            result = np.asarray(self._T(X, w, prep=entry[1], **kwargs), dtype=float)
         else:
-            result = np.asarray(self._T(X, w), dtype=float)
+            result = np.asarray(self._T(X, w, **kwargs), dtype=float)
         self.evaluations += 1
         self.rows += len(X)
         if np.any(np.isnan(result)):

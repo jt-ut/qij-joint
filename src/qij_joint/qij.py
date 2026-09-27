@@ -2,24 +2,74 @@
 section 4).
 
 `QIJ(eps=0.01, seed=0, vq_transform=None, gptrend='affine',
-gpwidth='global', M_X=None, ivqbins='marginal', survey='points').fit(X, T, pool=None)`
-runs stage 1 (the X-VQ, prototype influences, initial influence
-estimate) and stage 2 (the shared full-data evaluation, then
-`ivqbins`'s `'marginal'` per-output refinement or `'joint'` shared
-partition, method_notes joint section), returning a `QIJResult`.
-`gptrend`/`gpwidth` pass straight to `fit_influence_model` (method_notes
-section 3); `M_X` overrides the prototype-count rule when given
-(method_notes section 2); `survey` picks the prototype survey's
-receptive-field representation, `'points'` (one row per prototype) or `'moments'`
-(spec/method_notes.md section 2), passed to `run_xvq`. With a `pool`: the survey and stage 2's
-full-data stencils run on it, the full-data base evaluation is
-submitted at the start and collected after stage 1, the influence
-model's width-grid candidates run on it (method_notes section 3), and
-the codebook fit uses `pool.workers` FAISS threads (method_notes
-sections 2 and 4); a marginal split's own evaluation stays serial. A
-plain callable T is wrapped with outputs=('theta',) and machine-
-precision eta; the method sees T only through `Counter`, never an
-analytic influence.
+gpwidth='global', M_X=None, ivqbins='marginal', survey='points',
+quantized_start='multistart').fit(X, T, pool=None)` runs stage 1 (the
+X-VQ, prototype influences, initial influence estimate) and stage 2
+(the shared full-data evaluation, then `ivqbins`'s `'marginal'`
+per-output refinement or `'joint'` shared partition, method_notes joint
+section), returning a `QIJResult`. `gptrend`/`gpwidth` pass straight to
+`fit_influence_model` (method_notes section 3); `M_X` overrides the
+prototype-count rule when given (method_notes section 2); `survey`
+picks the prototype survey's receptive-field representation, `'points'`
+(one row per prototype) or `'moments'` (spec/method_notes.md section 2),
+passed to `run_xvq`. `quantized_start` (spec/QIJ_mods_waves.md A9 item
+5) picks theta_Q's starting point: `'multistart'` (ported) fits theta_Q
+from scratch on the survey rows; `'full-data'` runs theta_hat first (on
+`pool` when given) and continues it onto the survey rows via `start`
+(a no-op for an estimator without `takes_start`). After stage 1, the
+ABC interval's curvature ingredient (`core.abc.curvature`,
+spec/QIJ_mods_waves.md A10) is measured on the survey rows for every
+estimator, in its own `'curvature'` evaluation stage. With a `pool`:
+the survey and stage 2's full-data stencils run on it, the full-data
+base evaluation is submitted at the start and collected either before
+the survey (`quantized_start='full-data'`) or after stage 1, the
+influence model's width-grid candidates run on it (method_notes section
+3), and the codebook fit uses `pool.workers` FAISS threads
+(method_notes sections 2 and 4); a marginal split's own evaluation
+stays serial. A plain callable T is wrapped with outputs=('theta',) and
+machine-precision eta; the method sees T only through `Counter`, never
+an analytic influence.
+
+An estimator carrying `measured` (a list of indices into `T.outputs`,
+spec/QIJ_mods_waves.md A11) is measured on that subset only: the
+prototype-count rule reads q = len(measured); the per-output stages
+(the influence model, the marginal refinement or the joint partition,
+and the ABC curvature) still fit every output, since one evaluation of
+T returns them all at no extra cost, but only the measured indices are
+reported, so `QIJResult`'s per-output fields and the prototype survey's
+`I_proto` carry the measured outputs under their names; the marginal
+refinement itself runs only for the measured outputs, since that
+stage's own cost is one evaluation loop per output. `theta_hat`/
+`theta_Q` passed as `start` stay the full T output throughout, so a
+continuation always sees every raw parameter; only the stored copy is
+restricted. Without `measured` every index is its own position
+(0..q-1) and nothing changes bit for bit.
+
+`refine_schedule` picks the marginal path's own schedule
+(spec/QIJ_mods_waves.md A14): `'queue'` (ported, the default) runs
+`core.refine.run_refinement` once per measured output, its evaluations
+always serial; `'rounds'` runs every measured output's refinement
+together through `core.rounds.run_refinement_rounds`, which shares one
+pool batch per round across outputs. Under `ivqbins='joint'` the switch
+is inert -- the joint path's own check already advances in rounds, not
+a queue.
+
+`refine_trigger` (spec/QIJ_mods_waves.md A15) picks the marginal path's
+own leaf-selection rule, under either `refine_schedule`: `'gain'`
+(ported, the default, bit-identical) or `'measured'` (the demo's
+setting, `core.refine`/`core.rounds` module docstrings). Inert under
+`ivqbins='joint'`.
+
+`eta_full` (spec/QIJ_mods_waves.md A15, A13 step 2) is measured once
+per draw, right after `theta_hat`, by `core.eta.measure_eta_full`, and
+used in place of `T`'s own declared `eta` by every full-data evaluation
+of stage 2 -- the marginal refinement's and the joint check's initial
+bins and splits alike -- both for their stencil step and, for a
+restart estimator, the polish's own acceptance tolerance (the per-call
+`eta` override, interface sheet); its own evaluations are counted in a
+dedicated `'eta_full'` stage, outside `'total'`'s audited meaning. Zero
+evaluations, and `eta_full == T.eta` exactly, for an estimator without
+`takes_start`, so every audited path stays bit-identical.
 """
 from __future__ import annotations
 
@@ -29,12 +79,15 @@ from dataclasses import replace
 import numpy as np
 from numpy.linalg import LinAlgError
 
+from .core import abc as core_abc
 from .core.counter import Counter
+from .core.eta import measure_eta_full
 from .core.influence_model import fit_influence_model
 from .core.influence_model import psi0 as _psi0
 from .core.influence_model import uncertainty as _uncertainty
 from .core.joint import run_joint
-from .core.refine import run_refinement
+from .core.refine import run_refinement, whiten_columns
+from .core.rounds import run_refinement_rounds
 from .core.xvq import cost_rule_M, run_xvq
 from .parallel import prepared
 from .result import QIJResult
@@ -61,6 +114,9 @@ def _marginal_defaults(N: int, q: int) -> dict:
         n_adjacency_splits=np.zeros(q, dtype=int), rho=np.full(q, np.nan),
         n_refine_evals=np.zeros(q, dtype=int),
         psi_hat=np.full((N, q), np.nan), bin_label=np.full((N, q), -1, dtype=int),
+        bin_U=(),
+        a_c=np.full(q, np.nan), n_flagged=np.zeros(q, dtype=int),
+        n_flag_evals=np.zeros(q, dtype=int), n_geom_splits=np.zeros(q, dtype=int),
     )
 
 
@@ -90,13 +146,22 @@ def _theta_hat_task(T, case, X: np.ndarray, _task):
     return result, failed, time.perf_counter() - t0
 
 
-def _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
-                  gptrend, gpwidth, M_X_source, workers, ivqbins, survey) -> QIJResult:
+def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
+                  gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
+                  sv, quantized_start, refine_schedule, refine_trigger) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
-    zero, the X-VQ and prototype survey diagnostics kept. The second
-    stage never ran under either value of `ivqbins`, so both the
-    marginal and the joint fields are inert."""
+    zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
+    `survey_step_ratio` come from `sv`, since the survey (stage 1) ran
+    to completion before the influence model's own fit failed; the ABC
+    interval's ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`) and
+    `eta_full` (spec/QIJ_mods_waves.md A15), which need stage 2 and the
+    curvature/eta_full stages none of which ever ran, are NaN/False. The
+    second stage never ran under either value of `ivqbins`, so both the
+    marginal and the joint fields are inert. `I_proto` and `sv.step_ratio`
+    are the full-width survey products; `measured` restricts them to the
+    reported outputs, exactly as the successful path does (spec
+    QIJ_mods_waves.md A11)."""
     q = len(outputs)
     nan_q, false_q = np.full(q, np.nan), np.zeros(q, dtype=bool)
     nan_Nq = np.full((N, q), np.nan)
@@ -108,14 +173,22 @@ def _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
         ell=nan_q, lam=nan_q, ell_bound=false_q, lam_bound=false_q,
         gptrend=gptrend, gpwidth=gpwidth, c=nan_q, c_bound=false_q,
         M_X=xvq.M_used, M_X_source=M_X_source, n_failed=counter.failed,
-        evals_by_stage={'prototype': ev, 'full_data': 0, 'refinement': 0, 'total': ev},
-        rows_by_stage={'prototype': rows, 'full_data': 0, 'refinement': 0, 'total': rows},
-        wall_time_by_stage={'prototype': wall, 'full_data': 0.0, 'refinement': 0.0, 'total': wall},
+        evals_by_stage={'prototype': ev, 'full_data': 0, 'refinement': 0,
+                        'curvature': 0, 'eta_full': 0, 'total': ev},
+        rows_by_stage={'prototype': rows, 'full_data': 0, 'refinement': 0,
+                       'curvature': 0, 'eta_full': 0, 'total': rows},
+        wall_time_by_stage={'prototype': wall, 'full_data': 0.0, 'refinement': 0.0,
+                            'curvature': 0.0, 'eta_full': 0.0, 'total': wall},
         busy_time_total=wall, workers=workers,
         psi0=nan_Nq, sigma=nan_Nq,
         bmu=xvq.bmu, prototype_p=xvq.p,
-        prototype_w=W_X, prototype_I=np.asarray(I_proto, dtype=float),
+        prototype_w=W_X, prototype_I=np.asarray(I_proto, dtype=float)[:, measured],
         prototype_h=np.full(xvq.M_used, np.nan), ivqbins=ivqbins, survey=survey,
+        a=nan_q, b_hat=nan_q, c_q=nan_q, c_q_one_sided=false_q, eta_Q=sv.eta_Q,
+        eta_full=float('nan'),
+        survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
+        quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
+        refine_trigger=refine_trigger,
         **_marginal_defaults(N, q), **_joint_defaults(N, q),
     )
 
@@ -125,7 +198,10 @@ class QIJ:
 
     def __init__(self, eps: float = 0.01, seed: int = 0, vq_transform=None,
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
-                 ivqbins: str = 'marginal', survey: str = 'points') -> None:
+                 ivqbins: str = 'marginal', survey: str = 'points',
+                 quantized_start: str = 'multistart',
+                 refine_schedule: str = 'queue',
+                 refine_trigger: str = 'gain') -> None:
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -134,18 +210,29 @@ class QIJ:
         self.M_X = M_X
         self.ivqbins = ivqbins
         self.survey = survey
+        self.refine_schedule = refine_schedule
+        self.refine_trigger = refine_trigger
+        self.quantized_start = quantized_start
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
-        influences), the shared full-data base evaluation, then
-        per-output refinement, on `pool` per the module docstring."""
+        influences), the shared full-data base evaluation, the ABC
+        curvature stage, then per-output refinement, on `pool` per the
+        module docstring."""
         t_start = time.perf_counter()
         X = np.asarray(X)
         N = len(X)
         T = _wrap(T)
         eta = T.eta
-        outputs = T.outputs
-        q = len(outputs)
+        outputs_full = T.outputs
+        # `measured` (spec/QIJ_mods_waves.md A11): the indices of
+        # `outputs_full` QIJ reports; identity when T carries no
+        # `measured` attribute, so every downstream `[measured]` slice is
+        # a no-op and the draw is bit-identical to before A11.
+        measured = list(getattr(T, 'measured', range(len(outputs_full))))
+        outputs = tuple(outputs_full[i] for i in measured)
+        q_full = len(outputs_full)
+        q = len(measured)
         workers = pool.workers if pool is not None else 1
 
         counter = Counter(T, N)
@@ -170,59 +257,149 @@ class QIJ:
         else:
             M_requested, M_X_source = cost_rule_M(N, q, self.eps), 'rule'
 
+        # `quantized_start='full-data'` (A9 item 5) needs theta_hat before
+        # theta_Q's own fit, so the shared full-data evaluation is
+        # collected here rather than after stage 1; under 'multistart'
+        # (the default) this block is skipped and theta_hat is collected
+        # in its usual place below, bit-identical to before.
+        theta_hat_pre = None
+        full_data_busy = 0.0
+        wall_time_full_data = 0.0
+        if self.quantized_start == 'full-data':
+            t0 = time.perf_counter()
+            if theta_future is None:
+                theta_hat_pre = np.asarray(counter(X, np.ones(N)), dtype=float)
+            else:
+                result, failed, full_data_busy = theta_future.result()
+                theta_future = None
+                counter.add(1, N, int(failed))
+                theta_hat_pre = np.asarray(result, dtype=float)
+            wall_time_full_data = time.perf_counter() - t0
+        ev0, rows0 = counter.snapshot()  # 0, 0 unless the block above ran
+
         t0 = time.perf_counter()
-        xvq, theta_Q, I_proto, xvq_busy = run_xvq(
+        xvq, theta_Q, I_proto, xvq_busy, sv = run_xvq(
             Z, inverse, counter, eta, M_requested, self.seed, pool, workers,
-            survey=self.survey, X=X)
+            survey=self.survey, X=X, quantized_start=self.quantized_start,
+            theta_hat=theta_hat_pre)
         # Prototype positions in T's native coordinates, for the
         # result's diagnostics -- the same `inverse(xvq.centers)`
         # `run_xvq` already applied, recovered rather than re-derived.
         W_X = np.asarray(inverse(xvq.centers), dtype=float)
         try:
+            # Fit only the MEASURED outputs' GPs (spec/QIJ_mods_waves.md
+            # A11): `model` (and, below, `psi0_all`/`sigma_all`) are then
+            # indexed by LOCAL position (0..q-1, `measured`'s own order),
+            # never by the absolute index into `theta_hat`/`I_proto`,
+            # which stay full width for T's own continuation and for the
+            # bin measurements that reuse one shared evaluation across
+            # every output. Identity `measured` reproduces today's
+            # full-width model bit for bit.
             model, model_busy = fit_influence_model(
-                Z, xvq, I_proto, theta_Q, eta, gptrend=self.gptrend, gpwidth=self.gpwidth,
-                pool=pool)
+                Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
+                gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool)
         except (RuntimeError, LinAlgError):
             # A failed stage 1 is recorded as failed, never retried; a
             # submitted `theta_future` is left uncollected and uncounted,
             # as the serial code never reaches its own call here either.
-            return _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
+            return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                  self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
-                                 self.survey)
+                                 self.survey, sv, self.quantized_start, self.refine_schedule,
+                                 self.refine_trigger)
         psi0_all = _psi0(model, Z)
         sigma_all = _uncertainty(model, Z)
         wall_time_prototype = time.perf_counter() - t0
         ev1, rows1 = counter.snapshot()
 
+        # The ABC interval's curvature ingredient (A10): 2q evaluations
+        # on the SURVEY rows, along each output's field-level influence
+        # direction, `start=theta_Q` inside `core_abc.curvature`. Run
+        # here, before the survey's shared rows are replaced by X below,
+        # and counted in its own stage so 'prototype' keeps its meaning
+        # and 'total' (below) excludes it, keeping every audited count
+        # unchanged.
         t0 = time.perf_counter()
-        if theta_future is None:
+        # `outputs=measured` (A11): `theta_Q`/`I_proto` stay full width
+        # (needed for the continuation and for the cheap sigma_Q/u pass
+        # over every output), but the two evaluations per output only
+        # run for the measured indices; `c_q` comes back already at
+        # length q, in `measured`'s order.
+        c_q, _curvature_eps, curvature_busy, c_q_one_sided = core_abc.curvature(
+            counter, sv, theta_Q, I_proto, xvq.p, N, pool=pool, outputs=measured)
+        wall_time_curvature = time.perf_counter() - t0
+        ev1c, rows1c = counter.snapshot()
+        evals_curvature = ev1c - ev1
+        rows_curvature = rows1c - rows1
+
+        t0 = time.perf_counter()
+        if theta_hat_pre is not None:
+            theta_hat = theta_hat_pre
+        elif theta_future is None:
             theta_hat = np.asarray(counter(X, np.ones(N)), dtype=float)
-            full_data_busy = 0.0
+            wall_time_full_data = time.perf_counter() - t0
         else:
             result, failed, full_data_busy = theta_future.result()
             theta_hat = np.asarray(result, dtype=float)
             counter.add(1, N, int(failed))
-        wall_time_full_data = time.perf_counter() - t0
+            wall_time_full_data = time.perf_counter() - t0
+
+        # eta_full (spec/QIJ_mods_waves.md A15, A13 step 2): measured
+        # once, right after theta_hat, and used in place of T's own
+        # declared eta by every full-data evaluation of stage 2 below
+        # (module docstring); its own evaluations are counted in their
+        # own stage, never in 'full_data' or 'total'. Zero evaluations,
+        # eta_full == eta exactly, for an estimator without
+        # `takes_start` (`measure_eta_full`), so this is a no-op there.
+        t0 = time.perf_counter()
+        ev_e0, rows_e0 = counter.snapshot()
+        eta_full, _n_eta_full = measure_eta_full(counter, X, theta_hat)
+        wall_time_eta_full = time.perf_counter() - t0
+        ev_e1, rows_e1 = counter.snapshot()
+        evals_eta_full = ev_e1 - ev_e0
+        rows_eta_full = rows_e1 - rows_e0
 
         if pool is not None:
-            pool.share(X)  # re-share X: the survey shared W_X on `pool`
+            pool.share(X)  # re-share X: the survey shared its own rows on `pool`
+
+        # A9 item 2: the shared full-data base value continues into
+        # stage 2's own evaluations only for an estimator with restarts;
+        # None is a no-op for every other estimator (bit-identical).
+        start_second_stage = theta_hat if getattr(T, 'takes_start', False) else None
+        Z_white = whiten_columns(Z) if self.refine_trigger == 'measured' else None
 
         t0 = time.perf_counter()
+        n_rounds = 0
         if self.ivqbins == 'joint':
-            jr = run_joint(X, counter, theta_hat, psi0_all, sigma_all, model, Z, xvq, eta, self.eps,
-                           pool=pool, I_proto=I_proto)
+            # `psi0_all`/`sigma_all`/`model` are already the measured
+            # subset (this call's own `fit_influence_model` above), so
+            # `run_joint`'s own psi0-driven fields (V_btw, V_win_hat,
+            # V_tot_hat, gain_ratio, S_pred, the check's own scale `a`,
+            # the bin constituents) come back at that same measured
+            # width already, no further slicing. `B_hat`/`a_bca` are
+            # `ivq.bias_and_acceleration`'s result against the FULL
+            # `theta_hat` (one shared evaluation covers every output, as
+            # in the marginal path below), so they stay q_full wide and
+            # are restricted to `measured` here (spec/QIJ_mods_waves.md
+            # A11; inert for the demo, which never runs this path).
+            jr = run_joint(X, counter, theta_hat, psi0_all, sigma_all, model, Z, xvq, eta_full,
+                           self.eps, pool=pool, I_proto=I_proto[:, measured],
+                           start=start_second_stage)
             # A failed output, or a failed initial bin measurement before
             # any check ran, voids every output's variance quantities, as
             # the marginal path voids them on any one coordinate's failure.
             if jr.failed:
                 jr = replace(jr, V_btw=np.full(q, np.nan), V_win_hat=np.full(q, np.nan),
-                              V_tot_hat=np.full(q, np.nan))
+                              V_tot_hat=np.full(q, np.nan), B_hat=np.full(q_full, np.nan),
+                              a_bca=np.full(q_full, np.nan))
             second_stage_evals = int(jr.n_check_evals)
             second_stage_busy = float(jr.busy_delta)
-            second_stage_fields = dict(V_btw=jr.V_btw, V_win_hat=jr.V_win_hat, V_tot_hat=jr.V_tot_hat,
-                                        gain_ratio=jr.gain_ratio, **_marginal_defaults(N, q))
+            second_stage_fields = dict(V_btw=jr.V_btw, V_win_hat=jr.V_win_hat,
+                                        V_tot_hat=jr.V_tot_hat, gain_ratio=jr.gain_ratio,
+                                        a=jr.a_bca[measured], b_hat=jr.B_hat[measured],
+                                        **_marginal_defaults(N, q))
             joint_fields = dict(
-                joint_S_pred=jr.S_pred, joint_a=jr.a, joint_S_pred_pre_lloyd=jr.S_pred_pre_lloyd,
+                joint_S_pred=jr.S_pred, joint_a=jr.a,
+                joint_S_pred_pre_lloyd=jr.S_pred_pre_lloyd,
                 joint_L0=jr.L0, joint_L=jr.L, joint_n_growth_rounds=jr.n_growth_rounds,
                 joint_growth_capped=jr.growth_capped, joint_n_flagged=jr.n_flagged,
                 joint_n_check_rounds=jr.n_check_rounds, joint_n_check_evals=jr.n_check_evals,
@@ -233,20 +410,48 @@ class QIJ:
                 joint_busy_delta=jr.busy_delta,
             )
         else:
-            coordinates = [
-                run_refinement(
-                    X, counter, theta_hat, c, name,
-                    psi0_all[:, c], float(model.offset[c]), sigma_all[:, c],
-                    I_proto[:, c], xvq.bmu, xvq.bmu2,
-                    eta, self.eps, xvq.M_used, bool(model.constant_path[c]), Z, model, pool,
+            # One coordinate per MEASURED output only (its own cost is an
+            # evaluation loop, unlike the shared full-data bin measurement
+            # below). `c` (absolute) indexes `theta_hat`/`I_proto`, which
+            # stay full width; `j` (local) indexes `psi0_all`/`sigma_all`/
+            # `model`, which are already the measured subset -- passed as
+            # `model_index` so `bin_posterior_variance` reads `model`'s
+            # own coordinate, not the absolute one (spec/QIJ_mods_waves.md
+            # A11). Identity `measured` reproduces `enumerate(outputs)` bit
+            # for bit (c == j == its own name's position). `refine_schedule`
+            # (A14) picks how the q measured outputs' evaluations are
+            # scheduled: `'queue'` runs each output's own queue in turn,
+            # serial evaluations only; `'rounds'` runs them together,
+            # batching every round's evaluations across outputs onto `pool`.
+            if self.refine_schedule == 'rounds':
+                coordinates, n_rounds = run_refinement_rounds(
+                    X, counter, theta_hat, list(measured), list(outputs),
+                    [psi0_all[:, j] for j in range(q)], [float(model.offset[j]) for j in range(q)],
+                    [sigma_all[:, j] for j in range(q)], [I_proto[:, c] for c in measured],
+                    xvq.bmu, xvq.bmu2, eta_full, self.eps, xvq.M_used,
+                    [bool(model.constant_path[j]) for j in range(q)], Z, model, list(range(q)),
+                    pool, start=start_second_stage,
+                    refine_trigger=self.refine_trigger, Z_white=Z_white,
                 )
-                for c, name in enumerate(outputs)
-            ]
+            else:
+                coordinates = [
+                    run_refinement(
+                        X, counter, theta_hat, c, name,
+                        psi0_all[:, j], float(model.offset[j]), sigma_all[:, j],
+                        I_proto[:, c], xvq.bmu, xvq.bmu2,
+                        eta_full, self.eps, xvq.M_used, bool(model.constant_path[j]), Z, model, pool,
+                        start=start_second_stage, model_index=j,
+                        refine_trigger=self.refine_trigger, Z_white=Z_white,
+                    )
+                    for j, (c, name) in enumerate(zip(measured, outputs))
+                ]
             # A failed initial-bin evaluation NaNs the whole draw, not just
-            # its own coordinate: every V_btw/V_win_hat/V_tot_hat is voided.
+            # its own coordinate: every V_btw/V_win_hat/V_tot_hat (and the
+            # ABC ingredients derived from the same bins) is voided.
             if any(cr.failed for cr in coordinates):
                 coordinates = [
-                    replace(cr, V_btw=float('nan'), V_win_hat=float('nan'), V_tot_hat=float('nan'))
+                    replace(cr, V_btw=float('nan'), V_win_hat=float('nan'), V_tot_hat=float('nan'),
+                            B_hat=float('nan'), a_bca=float('nan'))
                     for cr in coordinates
                 ]
             second_stage_evals = sum(cr.n_refine_evals for cr in coordinates)
@@ -263,30 +468,69 @@ class QIJ:
                 n_refine_evals=np.array([cr.n_refine_evals for cr in coordinates]),
                 psi_hat=np.stack([cr.field for cr in coordinates], axis=1),
                 bin_label=np.stack([cr.labels for cr in coordinates], axis=1),
+                # `a_bca`/`B_hat` are each coordinate's OWN (q_full,) bin
+                # measurement (every output, from the one shared
+                # evaluation); take this coordinate's own entry, at its
+                # absolute index, not position `local_c` in `coordinates`.
+                a=np.array([cr.a_bca[c] for cr, c in zip(coordinates, measured)]),
+                b_hat=np.array([cr.B_hat[c] for cr, c in zip(coordinates, measured)]),
+                # Every final bin's derivative on every OTHER measured
+                # output too (spec/QIJ_mods_waves.md A14's bin_U product),
+                # sliced from `cr.bin_U`'s full T-output width down to the
+                # measured columns; one (L_c, q) array per output, L_c its
+                # own final bin count.
+                bin_U=tuple(cr.bin_U[:, measured] for cr in coordinates),
+                # A15 item 6's products, per output; NaN/0 for every
+                # coordinate under `refine_trigger='gain'`.
+                a_c=np.array([cr.a_c for cr in coordinates]),
+                n_flagged=np.array([cr.n_flagged for cr in coordinates]),
+                n_flag_evals=np.array([cr.n_flag_evals for cr in coordinates]),
+                n_geom_splits=np.array([cr.n_geom_splits for cr in coordinates]),
             )
             joint_fields = _joint_defaults(N, q)
         wall_time_refinement = time.perf_counter() - t0
         ev3, rows3 = counter.snapshot()
 
-        evals_by_stage = {'prototype': ev1, 'full_data': (ev3 - ev1) - second_stage_evals,
-                           'refinement': second_stage_evals, 'total': ev3}
-        rows_by_stage = {'prototype': rows1, 'full_data': (rows3 - rows1) - second_stage_evals * N,
-                          'refinement': second_stage_evals * N, 'total': rows3}
+        # 'prototype' is stage 1's own work, net of the early theta_hat
+        # evaluation `quantized_start='full-data'` may have spent before
+        # it (ev0/rows0, 0 under 'multistart'); that evaluation's cost
+        # joins 'full_data' below instead, alongside the late theta_hat
+        # call this draw makes instead when it was NOT spent early.
+        # eta_full's own evaluations (spec/QIJ_mods_waves.md A15) are
+        # counted in their own stage, excluded from 'full_data' and
+        # 'total' (module docstring); 0 for an estimator without
+        # `takes_start`, so both stay bit-identical there.
+        evals_by_stage = {'prototype': ev1 - ev0,
+                           'full_data': ev0 + (ev3 - ev1c) - second_stage_evals - evals_eta_full,
+                           'refinement': second_stage_evals, 'curvature': evals_curvature,
+                           'eta_full': evals_eta_full,
+                           'total': ev3 - evals_curvature - evals_eta_full}
+        rows_by_stage = {'prototype': rows1 - rows0,
+                          'full_data': rows0 + (rows3 - rows1c) - second_stage_evals * N - rows_eta_full,
+                          'refinement': second_stage_evals * N, 'curvature': rows_curvature,
+                          'eta_full': rows_eta_full,
+                          'total': rows3 - rows_curvature - rows_eta_full}
         wall_time_total = time.perf_counter() - t_start
         wall_time_by_stage = {'prototype': wall_time_prototype, 'full_data': wall_time_full_data,
-                               'refinement': wall_time_refinement, 'total': wall_time_total}
+                               'refinement': wall_time_refinement, 'curvature': wall_time_curvature,
+                               'eta_full': wall_time_eta_full, 'total': wall_time_total}
         # Parent work plus every pool task's own time, in place of each
         # parallel stage's share of the elapsed total.
-        busy_time_total = wall_time_total + xvq_busy + model_busy + full_data_busy + second_stage_busy
+        busy_time_total = (wall_time_total + xvq_busy + model_busy + full_data_busy
+                            + second_stage_busy + curvature_busy)
 
         # at_bound[:, 0] is whichever width parameter gpwidth fits
-        # (method_notes section 3).
+        # (method_notes section 3); `model` is already the measured
+        # subset (spec/QIJ_mods_waves.md A11), so every model-derived
+        # field below is used as-is, at `model`'s own (measured) width --
+        # only the T-output arrays (`theta_hat`, `I_proto`, `c_q`,
+        # `survey_step_ratio`) still need `[measured]`.
         local = self.gpwidth == 'local'
         ell_bound = np.zeros(q, dtype=bool) if local else model.at_bound[:, 0].copy()
         c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
 
         return QIJResult(
-            outputs=outputs, N=N, theta_hat=theta_hat,
+            outputs=outputs, N=N, theta_hat=theta_hat[measured],
             ell=np.array(model.width), lam=np.array(model.lam),
             ell_bound=ell_bound, lam_bound=model.at_bound[:, 1].copy(),
             gptrend=self.gptrend, gpwidth=self.gpwidth,
@@ -297,6 +541,12 @@ class QIJ:
             busy_time_total=busy_time_total, workers=workers,
             psi0=psi0_all, sigma=sigma_all,
             bmu=xvq.bmu, prototype_p=xvq.p, prototype_w=W_X, prototype_h=np.array(model.h),
-            prototype_I=np.asarray(I_proto, dtype=float),
-            ivqbins=self.ivqbins, survey=self.survey, **second_stage_fields, **joint_fields,
+            prototype_I=np.asarray(I_proto, dtype=float)[:, measured],
+            ivqbins=self.ivqbins, survey=self.survey,
+            c_q=c_q, c_q_one_sided=c_q_one_sided, eta_Q=sv.eta_Q, eta_full=float(eta_full),
+            survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
+            quantized_start=self.quantized_start,
+            refine_schedule=self.refine_schedule, n_rounds=n_rounds,
+            refine_trigger=self.refine_trigger,
+            **second_stage_fields, **joint_fields,
         )
