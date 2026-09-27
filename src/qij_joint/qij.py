@@ -2,14 +2,16 @@
 section 4).
 
 `QIJ(eps=0.01, seed=0, vq_transform=None, gptrend='affine',
-gpwidth='global', M_X=None, ivqbins='marginal').fit(X, T, pool=None)`
+gpwidth='global', M_X=None, ivqbins='marginal', survey='points').fit(X, T, pool=None)`
 runs stage 1 (the X-VQ, prototype influences, initial influence
 estimate) and stage 2 (the shared full-data evaluation, then
 `ivqbins`'s `'marginal'` per-output refinement or `'joint'` shared
 partition, method_notes joint section), returning a `QIJResult`.
 `gptrend`/`gpwidth` pass straight to `fit_influence_model` (method_notes
 section 3); `M_X` overrides the prototype-count rule when given
-(method_notes section 2). With a `pool`: the survey and stage 2's
+(method_notes section 2); `survey` picks the prototype survey's
+receptive-field representation, `'points'` (ported) or `'moments'`
+(spec/QIJ_mods_waves.md A8), passed to `run_xvq`. With a `pool`: the survey and stage 2's
 full-data stencils run on it, the full-data base evaluation is
 submitted at the start and collected after stage 1, the influence
 model's width-grid candidates run on it (method_notes section 3), and
@@ -89,7 +91,7 @@ def _theta_hat_task(T, case, X: np.ndarray, _task):
 
 
 def _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
-                  gptrend, gpwidth, M_X_source, workers, ivqbins) -> QIJResult:
+                  gptrend, gpwidth, M_X_source, workers, ivqbins, survey) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. The second
@@ -113,7 +115,7 @@ def _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
         psi0=nan_Nq, sigma=nan_Nq,
         bmu=xvq.bmu, prototype_p=xvq.p,
         prototype_w=W_X, prototype_I=np.asarray(I_proto, dtype=float),
-        prototype_h=np.full(xvq.M_used, np.nan), ivqbins=ivqbins,
+        prototype_h=np.full(xvq.M_used, np.nan), ivqbins=ivqbins, survey=survey,
         **_marginal_defaults(N, q), **_joint_defaults(N, q),
     )
 
@@ -123,7 +125,7 @@ class QIJ:
 
     def __init__(self, eps: float = 0.01, seed: int = 0, vq_transform=None,
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
-                 ivqbins: str = 'marginal') -> None:
+                 ivqbins: str = 'marginal', survey: str = 'points') -> None:
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -131,6 +133,7 @@ class QIJ:
         self.gpwidth = gpwidth
         self.M_X = M_X
         self.ivqbins = ivqbins
+        self.survey = survey
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -169,7 +172,8 @@ class QIJ:
 
         t0 = time.perf_counter()
         xvq, theta_Q, I_proto, xvq_busy = run_xvq(
-            Z, inverse, counter, eta, M_requested, self.seed, pool, workers)
+            Z, inverse, counter, eta, M_requested, self.seed, pool, workers,
+            survey=self.survey, X=X)
         # Prototype positions in T's native coordinates, for the
         # result's diagnostics -- the same `inverse(xvq.centers)`
         # `run_xvq` already applied, recovered rather than re-derived.
@@ -183,7 +187,8 @@ class QIJ:
             # submitted `theta_future` is left uncollected and uncounted,
             # as the serial code never reaches its own call here either.
             return _failed_draw(outputs, N, xvq, W_X, I_proto, counter, t_start,
-                                 self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins)
+                                 self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
+                                 self.survey)
         psi0_all = _psi0(model, Z)
         sigma_all = _uncertainty(model, Z)
         wall_time_prototype = time.perf_counter() - t0
@@ -293,5 +298,5 @@ class QIJ:
             psi0=psi0_all, sigma=sigma_all,
             bmu=xvq.bmu, prototype_p=xvq.p, prototype_w=W_X, prototype_h=np.array(model.h),
             prototype_I=np.asarray(I_proto, dtype=float),
-            ivqbins=self.ivqbins, **second_stage_fields, **joint_fields,
+            ivqbins=self.ivqbins, survey=self.survey, **second_stage_fields, **joint_fields,
         )

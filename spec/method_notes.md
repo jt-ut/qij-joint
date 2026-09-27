@@ -69,15 +69,46 @@ estimator can fail one output and not another at the same prototype.
 above when given; the result records `M_X_source`, `'rule'` or
 `'argument'`.
 
+**The survey's representation of a receptive field: `survey`.** Under
+`survey='points'` (ported, bit-identical) each live field j is one
+survey row, the prototype, weight M_used*p_j, as above. Under
+`survey='moments'` (spec/QIJ_mods_waves.md A8) field j is instead
+represented by rows built from its own n_j NATIVE points (the rows T
+is called on, not the whitened prototype): its own n_j rows, each
+weight M_used*p_j/n_j, when n_j <= d_x+1; otherwise the d_x+1 vertices
+of a regular simplex centred at the field's native mean, unweighted
+second moment exactly I_{d_x} (the Helmert contrast matrix, scaled),
+mapped through the eigendecomposition-based factor V*sqrt(Lambda) of
+the field's native population covariance (so a rank-deficient field --
+collinear points -- needs no regularization: a zero eigenvalue maps
+every vertex's component along it to zero), first vertex along the
+field's leading eigenvector by a fixed reflection of the canonical
+simplex, each row weight M_used*p_j/(d_x+1). Either representation
+reproduces the field's native mean and covariance exactly. A forward
+step at prototype j scales EVERY row of field j by the same factor
+(1-t_j) + t_j/p_j, every other row by (1-t_j) -- the points path's own
+weight constructor (section 1), generalized to a stacked row array
+whose weights do not sum to the row count, so raising the field's mass
+scales all its rows alike and I_j, theta_Q and the GP's input (the
+field means) keep their definitions. `rows`, the field index of each
+row, and each row's base weight are built once per draw, vectorized
+over fields: the field moments (grouped sums over the field index) and
+the simplex map (a batched eigendecomposition and matrix product over
+every field needing one) are each one call over every field, not a
+per-field loop. Counter rows per evaluation are the stacked row count.
+`X` is unused under `survey='points'`.
+
 **The survey on a pool.** With a pool, the M_used per-prototype forward
 differences are pool tasks; the base evaluation theta_Q stays in the
-parent. W_X is shared with the workers once per draw; each task carries
-its prototype index and perturbed weights, computed by the parent, and
+parent. The survey's own row array (W_X under `survey='points'`, the
+stacked field rows under `survey='moments'`) is shared with the
+workers once per draw; each task carries its prototype index and
+perturbed weights over that same array, computed by the parent, and
 returns the raw evaluation, a failure flag and its own wall time. The
 parent assembles I_j in prototype order and adds each task's evaluation,
 rows and failure to the counter, so I_proto and every count are the same
-at any worker count. A worker computes `T.prepare(W_X)` once per draw.
-`busy_time_total` replaces the pool's elapsed time within the survey by
+at any worker count. A worker computes `T.prepare` on the shared array
+once per draw. `busy_time_total` replaces the pool's elapsed time within the survey by
 the tasks' summed wall times; without a pool it equals the elapsed total.
 
 **theta_hat on a pool.** The full-data base evaluation theta_hat =

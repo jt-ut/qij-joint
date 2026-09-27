@@ -3,6 +3,10 @@ The X-VQ: quantize the data (`fit_xvq`, at `workers` FAISS threads),
 then measure the influence at each prototype by forward differences
 (spec/method_notes.md section 2), `prototype_influences`' per-prototype
 step run through `pool` when given. `run_xvq` is stage 1 in full.
+`survey='moments'` (spec/QIJ_mods_waves.md A8) replaces a receptive
+field's one row by a representation matching its native mean and
+covariance exactly, for the fields too small or too rare for a single
+quantized row to stand in for the data.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 import faiss
 import numpy as np
@@ -109,17 +113,138 @@ def _resolve_bmu2(Z: np.ndarray, centers: np.ndarray, bmu: np.ndarray, bmu2: np.
     return bmu2
 
 
-def _survey_task(T, case, W_X: np.ndarray, task):
+def _field_moments(X: np.ndarray, bmu: np.ndarray, M_used: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per live field j: point count n_j, native mean and native
+    population covariance, by grouped sums (E2) over the field index
+    `bmu` already carries (0..M_used-1, contiguous, so no argsort is
+    needed before `bincount`)."""
+    d_x = X.shape[1]
+    n = np.bincount(bmu, minlength=M_used).astype(float)
+    mean = np.empty((M_used, d_x))
+    for a in range(d_x):
+        mean[:, a] = np.bincount(bmu, weights=X[:, a], minlength=M_used) / n
+    cov = np.empty((M_used, d_x, d_x))
+    for a in range(d_x):
+        for b in range(a, d_x):
+            s2 = np.bincount(bmu, weights=X[:, a] * X[:, b], minlength=M_used)
+            cov[:, a, b] = cov[:, b, a] = s2 / n - mean[:, a] * mean[:, b]
+    return n, mean, cov
+
+
+def _unit_simplex(d_x: int) -> np.ndarray:
+    """The d_x+1 vertices (columns) of a regular simplex in R^d_x,
+    centred at 0, with unweighted second moment exactly I_{d_x}: the
+    Helmert contrast matrix (orthonormal rows, orthogonal to the
+    all-ones vector) scaled by sqrt(d_x+1) (spec/QIJ_mods_waves.md A8).
+    """
+    helmert = np.zeros((d_x, d_x + 1))
+    for k in range(d_x):
+        helmert[k, :k + 1] = 1.0 / math.sqrt((k + 1) * (k + 2))
+        helmert[k, k + 1] = -(k + 1) / math.sqrt((k + 1) * (k + 2))
+    return math.sqrt(d_x + 1) * helmert
+
+
+def _align_first_vertex(V: np.ndarray) -> np.ndarray:
+    """Reflect the canonical simplex `V` (Householder about the bisector
+    of its first vertex and the leading axis) so vertex 0 sits on
+    +e_1, before it is mapped through a field's own covariance factor;
+    a reflection is an orthogonal map, so it leaves the second moment
+    at I_{d_x} unchanged (the deterministic orientation convention of
+    spec/QIJ_mods_waves.md A8)."""
+    d_x = V.shape[0]
+    a = V[:, 0] / np.linalg.norm(V[:, 0])
+    e1 = np.zeros(d_x)
+    e1[0] = 1.0
+    u = a - e1
+    norm_u = np.linalg.norm(u)
+    if norm_u < 1e-12:
+        return V
+    u = u / norm_u
+    H = np.eye(d_x) - 2.0 * np.outer(u, u)
+    return H @ V
+
+
+def _moments_survey_rows(
+    X: np.ndarray, bmu: np.ndarray, p: np.ndarray, M_used: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The `survey='moments'` rows (spec/QIJ_mods_waves.md A8): field j
+    keeps its own n_j native rows when n_j <= d_x+1; otherwise it is
+    the d_x+1 vertices of a regular simplex reproducing the field's
+    native mean and covariance exactly, mapped through the
+    eigendecomposition-based factor V*sqrt(Lambda) of its covariance
+    (so a rank-deficient field, collinear points, needs no
+    regularization: a zero eigenvalue maps every vertex's component
+    along it to zero) with the first vertex along the field's leading
+    eigenvector. Every field's rows carry R*p_j in total, split evenly
+    over its own rows, R the stacked row count, so the weights sum to the
+    number of rows as they do for every other call of T (an estimator
+    may normalize its score by the weight total and its information by
+    the row count, which agree only then). Vectorized over fields (E1): the field
+    moments, the eigendecomposition and the simplex map are one batched
+    call each, over every large field at once. Returns (rows, row of
+    each row's field, that row's base weight)."""
+    d_x = X.shape[1]
+    n, mean, cov = _field_moments(X, bmu, M_used)
+    small = n <= (d_x + 1)
+
+    small_ids = np.where(small)[0]
+    point_mask = np.isin(bmu, small_ids)
+    large_ids = np.where(~small)[0]
+    R = int(point_mask.sum()) + large_ids.size * (d_x + 1)
+
+    rows_small = X[point_mask]
+    field_small = bmu[point_mask]
+    weight_small = R * p[field_small] / n[field_small]
+
+    if large_ids.size:
+        vals, vecs = np.linalg.eigh(cov[large_ids])  # ascending, per field
+        order = np.argsort(-vals, axis=1)
+        vals = np.take_along_axis(vals, order, axis=1)
+        vecs = np.take_along_axis(vecs, order[:, None, :], axis=2)
+        factor = vecs * np.sqrt(np.clip(vals, 0.0, None))[:, None, :]
+        canon = _align_first_vertex(_unit_simplex(d_x))       # (d_x, d_x+1)
+        offsets = np.matmul(factor, canon)                    # (M_large, d_x, d_x+1)
+        verts = mean[large_ids][:, :, None] + offsets
+        rows_large = np.transpose(verts, (0, 2, 1)).reshape(-1, d_x)
+        field_large = np.repeat(large_ids, d_x + 1)
+        weight_large = np.repeat(R * p[large_ids] / (d_x + 1), d_x + 1)
+    else:
+        rows_large = np.empty((0, d_x))
+        field_large = np.empty((0,), dtype=int)
+        weight_large = np.empty((0,))
+
+    rows = np.concatenate([rows_small, rows_large], axis=0)
+    row_field = np.concatenate([field_small, field_large])
+    weight0 = np.concatenate([weight_small, weight_large])
+    return rows, row_field, weight0
+
+
+def _field_step_weights(
+    omega0: np.ndarray, row_field: np.ndarray, j: int, p_j: float, t: float,
+) -> np.ndarray:
+    """The points path's own weight constructor (method_notes section
+    1), generalized to a stacked-rows `omega0` whose sum need not equal
+    its length: every row of field j is scaled by (1-t) + t/p_j, every
+    other row by (1-t), with p_j the field's OWN mass fraction (not
+    recomputed from `omega0`, since the stacked base weights do not sum
+    to the row count) -- so raising the field's mass scales all its
+    rows alike, and I_j keeps its definition (spec A8)."""
+    member = (row_field == j).astype(float)
+    return (1.0 - t) * omega0 + t * omega0 * member / p_j
+
+
+def _survey_task(T, case, rows: np.ndarray, task):
     """One task: evaluate T at prototype j's perturbed weights against
-    the shared W_X, `T.prepare` cached per process (method_notes
-    section 2). A failing evaluation is caught here, this task's own
-    declared failure boundary. Returns (j, raw evaluation, failure
-    flag, this call's own wall time)."""
+    the shared survey rows (the prototypes under 'points', the stacked
+    field rows under 'moments'), `T.prepare` cached per process
+    (method_notes section 2). A failing evaluation is caught here, this
+    task's own declared failure boundary. Returns (j, raw evaluation,
+    failure flag, this call's own wall time)."""
     j, omega = task
-    prep = prepared(T, W_X)
+    prep = prepared(T, rows)
     t0 = time.perf_counter()
     try:
-        result = T(W_X, omega, prep=prep) if prep is not None else T(W_X, omega)
+        result = T(rows, omega, prep=prep) if prep is not None else T(rows, omega)
         result = np.asarray(result, dtype=float)
         failed = bool(np.any(np.isnan(result)))
     except Exception:
@@ -139,37 +264,59 @@ def _step_prototype(omega0: np.ndarray, p: np.ndarray, delta_f: float, j: int) -
 
 def prototype_influences(
     W_X: np.ndarray, counter, p: np.ndarray, eta: float, pool=None,
+    survey: str = 'points', X: Optional[np.ndarray] = None,
+    bmu: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """theta_Q = T(W_X, M_used*p) once, then one forward difference per
-    prototype at t_j = step_parameter(delta_f, p_j), on `pool` when
-    given, mass-centred over the finite prototypes (spec/method_
-    notes.md section 2). `busy_delta` is 0 with `pool=None`, else the
-    tasks' summed wall time less `pool.map`'s own wall clock."""
+    """theta_Q = T(rows, base weights) once, then one forward difference
+    per prototype j at t_j = step_parameter(delta_f, p_j), on `pool`
+    when given, mass-centred over the finite prototypes (spec/method_
+    notes.md section 2). Under `survey='points'` (ported, bit-
+    identical) `rows` is one row per prototype, weight M_used*p_j.
+    Under `survey='moments'` (spec/QIJ_mods_waves.md A8) `rows` is the
+    stacked field representation of `_moments_survey_rows`, `X` (native
+    coordinates) and `bmu` are required, and a forward step scales a
+    whole field's rows together. `busy_delta` is 0 with `pool=None`,
+    else the tasks' summed wall time less `pool.map`'s own wall clock."""
     M_used = len(p)
-    omega0 = M_used * p
     delta_f = forward_step(eta)
-    theta_Q = np.asarray(counter(W_X, omega0), dtype=float)
+
+    if survey == 'points':
+        rows = W_X
+        omega0 = M_used * p
+    else:
+        rows, row_field, omega0 = _moments_survey_rows(X, bmu, p, M_used)
+
+    theta_Q = np.asarray(counter(rows, omega0), dtype=float)
     q = theta_Q.shape[0]
 
     I_proto = np.empty((M_used, q), dtype=float)
     busy_delta = 0.0
     if pool is None:
         for j in range(M_used):
-            t_j, omega = _step_prototype(omega0, p, delta_f, j)
-            I_proto[j] = (counter(W_X, omega) - theta_Q) / t_j
+            if survey == 'points':
+                t_j, omega = _step_prototype(omega0, p, delta_f, j)
+            else:
+                t_j = step_parameter(delta_f, float(p[j]))
+                omega = _field_step_weights(omega0, row_field, j, float(p[j]), t_j)
+            I_proto[j] = (counter(rows, omega) - theta_Q) / t_j
     else:
-        pool.share(W_X)
+        pool.share(rows)
         t_j = np.empty(M_used, dtype=float)
         tasks = []
         for j in range(M_used):
-            t_j[j], omega = _step_prototype(omega0, p, delta_f, j)
+            if survey == 'points':
+                t_j[j], omega = _step_prototype(omega0, p, delta_f, j)
+            else:
+                t_j[j] = step_parameter(delta_f, float(p[j]))
+                omega = _field_step_weights(omega0, row_field, j, float(p[j]), t_j[j])
             tasks.append((j, omega))
         t_map0 = time.perf_counter()
         results = pool.map(_survey_task, tasks)
         busy_delta = -(time.perf_counter() - t_map0)
+        row_count = rows.shape[0]
         for j, result, failed, wall in results:
             I_proto[j] = (result - theta_Q) / t_j[j]
-            counter.add(1, M_used, int(failed))
+            counter.add(1, row_count, int(failed))
             busy_delta += wall
 
     # A failed evaluation at a prototype is a missing response: centre
@@ -186,12 +333,18 @@ def prototype_influences(
 def run_xvq(
     Z: np.ndarray, inverse: Callable[[np.ndarray], np.ndarray], counter, eta: float,
     M: int, seed: int, pool=None, workers: int = 1,
+    survey: str = 'points', X: Optional[np.ndarray] = None,
 ) -> Tuple[XVQ, np.ndarray, np.ndarray, float]:
     """Stage 1 in full: fit the codebook on Z (at `workers` FAISS
     threads), map its prototypes to T's native coordinates with
     `inverse`, and survey them, on `pool` when given (method_notes
-    section 2). The only function in `core/` that calls `inverse`."""
+    section 2). `survey='moments'` (spec/QIJ_mods_waves.md A8) needs
+    `X`, the draw in T's native coordinates (the rows T is called on);
+    it is unused under `survey='points'`. The only function in `core/`
+    that calls `inverse`."""
     xvq = fit_xvq(Z, M, seed, workers)
     W_X = inverse(xvq.centers)
-    theta_Q, I_proto, busy_delta = prototype_influences(W_X, counter, xvq.p, eta, pool)
+    theta_Q, I_proto, busy_delta = prototype_influences(
+        W_X, counter, xvq.p, eta, pool, survey=survey, X=X, bmu=xvq.bmu,
+    )
     return xvq, theta_Q, I_proto, busy_delta

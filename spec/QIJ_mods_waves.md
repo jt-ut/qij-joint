@@ -299,6 +299,56 @@ mixture 11 and replaces the weights; the same generator otherwise, so
 `expand_dimension` still applies). Nothing else in this section is
 specific to that mixture.
 
+### A8. The survey's representation of a receptive field: `survey` switch (author's ruling, 27 September)
+
+**Why.** The survey fits T to the prototypes with their masses as weights. A
+component of the data covered by one or two prototypes has no within-cell
+spread in that data set, so the quantized problem is no longer near the
+full-data one: on the demo mixture (weight set B, N = 5000, M_𝒳 = 600) the
+outer spikes, 27 and 23 points, got one and two prototypes, the quantized
+mixture fit split a blob instead and landed on a saddle, and 576 of 601
+survey fits were NaN. Nothing in the estimator is wrong; the quantized data
+set is not the data where the data are rare.
+
+**The switch.** `survey` with two values: `points` (ported: one row per
+receptive field, the prototype, with weight M_𝒳 p_j) and `moments`.
+
+Under `moments`, receptive field j is represented by
+
+    its own n_j points, each with weight proportional to p_j / n_j,  if n_j ≤ d_x + 1;
+    otherwise the d_x + 1 vertices of a regular simplex, centred at the
+    field's mean, scaled so the vertices' second moment is the identity,
+    mapped through the Cholesky factor of the field's covariance, each with
+    weight proportional to p_j / (d_x + 1).
+
+Either representation reproduces the field's mean and covariance exactly
+(the first also every higher moment); d_x + 1 is the smallest number of
+points that can carry a rank-d_x covariance, so no constant and no
+regularization enter. The simplex's orientation is a rotation that leaves
+the moments unchanged; fix it by a deterministic convention (first vertex
+along the field's leading eigenvector). The rows of field j are perturbed
+together: raising prototype j's mass scales all of its rows' weights by the
+same factor, so the prototype influence keeps its definition as the
+derivative with respect to the field's mass, θ_Q keeps its definition as the
+base fit on the survey rows, and the GP still regresses on the field means
+w_j. CADJ, the 𝒳-VQ and everything downstream are untouched. Rows per
+survey evaluation become Σ_j min(n_j, d_x + 1) ≤ (d_x + 1) M_𝒳; the
+evaluation count is unchanged.
+
+`points` remains the package default; the audit stands. `moments` is the
+setting the demo passes.
+
+**Probe before the build is used (testing rule 3 applies).** Mixture 11,
+weight set B, N = 5000, seed 0, M_𝒳 = 600, `survey=moments`, `gptrend=
+quadratic`, `gpwidth=global`: (i) the base survey fit θ_Q: does it converge
+(Newton gate on which test, polished score norm), and its parameters
+against the full-data fit θ̂ as (θ_Q − θ̂)/√V_ij; (ii) the survey: the
+number of the 601 fits that are finite, and the number of outputs on the
+constant path; (iii) timings: one converged fit at 600 rows and at the
+`moments` row count, and the survey's wall time on the workers used.
+Nothing else. If (ii) is still failing, the fallback is M_𝒳 = 2500 with
+`points`, priced beforehand from (iii).
+
 ### A5. Wave A audit and measurement
 
 Audit: with `gptrend=affine`, `gpwidth=global`, any worker count, every kept

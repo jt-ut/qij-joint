@@ -65,6 +65,7 @@ class QIJResult:
     prototype_I: np.ndarray        # (M, q)
     prototype_h: np.ndarray        # (M,) local CONN spacing; NaN under gpwidth='global'
     ivqbins: str                   # 'marginal' or 'joint' (method_notes joint section)
+    survey: str                    # 'points' (ported) or 'moments' (spec/QIJ_mods_waves.md A8)
     joint_S_pred: np.ndarray       # (q,) predicted within share at end of growth; NaN under 'marginal'
     joint_a: np.ndarray            # (q,) the check's fitted scale factor; NaN under 'marginal'
     joint_S_pred_pre_lloyd: np.ndarray  # (q,); NaN under 'marginal' or when the Lloyd pass did not run

@@ -129,13 +129,13 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
 
 def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> dict:
     """One `qij` scalar row: `QIJResult`'s scalars flattened to columns
-    per stage and per output, plus `ivqbins` and the joint scalars from
-    the joint second stage (spec/method_notes.md section 6) -- inert
-    under `ivqbins='marginal'`."""
+    per stage and per output, plus `ivqbins`, `survey` and the joint
+    scalars from the joint second stage (spec/method_notes.md section 6)
+    -- the joint scalars inert under `ivqbins='marginal'`."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
-           'ivqbins': res.ivqbins}
+           'ivqbins': res.ivqbins, 'survey': res.survey}
     for stage in ('prototype', 'full_data', 'refinement', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
@@ -221,12 +221,15 @@ def _qij_prototypes(res) -> pd.DataFrame:
 def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
             out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
             workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
-            M_X: Optional[int] = None, ivqbins: str = 'marginal') -> Tuple[int, int]:
+            M_X: Optional[int] = None, ivqbins: str = 'marginal',
+            survey: str = 'points') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2) and, under
     `ivqbins='joint'`, the shared bins' full-data stencils run in
-    parallel -- the rest of a draw is serial regardless of `workers`."""
+    parallel -- the rest of a draw is serial regardless of `workers`.
+    `survey` picks the prototype survey's receptive-field representation
+    (spec/QIJ_mods_waves.md A8)."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -240,7 +243,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         dseed = seed + s
         X = case.draw(N, dseed)
         res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
-                  gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins).fit(X, T, pool=pool)
+                  gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
+                  survey=survey).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         arrays = None
         if s in diag:
