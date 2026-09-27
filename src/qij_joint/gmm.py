@@ -282,9 +282,9 @@ def _penalty_influence_extra(Ss: np.ndarray, Scov: np.ndarray, a_pen: float,
         u = d @ Pk  # (N,2): Pk @ d_i for every i (Pk symmetric)
 
         idxs = _idx_S(K, k)
-        M00 = (a_pen ** 2) * Gk[0, 0] - (a_pen / W) * (u[:, 0] ** 2 - PkScovPk[0, 0])
-        M11 = (a_pen ** 2) * Gk[1, 1] - (a_pen / W) * (u[:, 1] ** 2 - PkScovPk[1, 1])
-        M01 = (a_pen ** 2) * Gk[0, 1] - (a_pen / W) * (u[:, 0] * u[:, 1] - PkScovPk[0, 1])
+        M00 = (a_pen ** 2) * Gk[0, 0] + (a_pen / W) * (u[:, 0] ** 2 - PkScovPk[0, 0])
+        M11 = (a_pen ** 2) * Gk[1, 1] + (a_pen / W) * (u[:, 1] ** 2 - PkScovPk[1, 1])
+        M01 = (a_pen ** 2) * Gk[0, 1] + (a_pen / W) * (u[:, 0] * u[:, 1] - PkScovPk[0, 1])
         extra[:, idxs[0]] = M00
         extra[:, idxs[1]] = 2.0 * M01
         extra[:, idxs[2]] = M11

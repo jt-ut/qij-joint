@@ -579,7 +579,7 @@ w-weighted mean, not `prepare`'s unweighted `xmean`), `da/dw_i = -a^2`
 form, the second because `sum_i w_i d_i = 0` exactly by definition of
 the weighted mean), the extra per-point, per-component term is
 
-    Delta_k(w_i) = a^2 * G_k - (a/W) * P_k (d_i d_i^T - Scov) P_k,
+    Delta_k(w_i) = a^2 * G_k + (a/W) * P_k (d_i d_i^T - Scov) P_k,
 
 packed into the theta vector the same way `g` is, and `influence`'s
 per-observation term is `psi_full_i = psi_raw_i + sum_k Delta_k(w_i)`
