@@ -276,23 +276,27 @@ T is a function of (X, ω) alone and nothing in the package may depend on a
 warm start being available (author's ruling). The reference labelling of
 A6 stands as the labelling mechanism.
 
-**The demo mixture (author's ruling, 26 September).** The talk's estimand is
-Chacon mixture 11 with its means and covariances as loaded from
-`structsynhd` and these weights (in the loaded component order; the level
-sets are nearly unchanged, every component has at least 50 points at
-N = 2000, the rarest components stay fifteen times rarer than the blobs):
+**The demo mixture (author's ruling, 27 September; supersedes the 26
+September N = 2000 weights).** The talk's estimand is Chacon mixture 11 at
+**N = 5000** with its means and covariances as loaded from `structsynhd`
+and these weights ("set B", loaded component order). The three spike
+levels put about 25, 75 and 200 points per spike, so the bootstrap's
+rare-support behaviour can be shown across its transition while the
+penalized estimator still exists at the rarest level (verified: converges,
+recovery max |z| = 3.27 over 53 outputs); the original weights, about 14
+points per spike, do not fit at all:
 
-| k | component | mean | weight |
-|---|---|---|---|
-| 0 | blob | (−1.5, 0) | 0.3775 |
-| 1 | blob | (+1.5, 0) | 0.3775 |
-| 2 | outer spike | (−2.5, −1) | 0.025 |
-| 3 | on-mean spike | (−1.5, 0) | 0.035 |
-| 4 | inner spike | (−0.5, +1) | 0.050 |
-| 5 | middle | (0, 0) | 0.025 |
-| 6 | inner spike | (+0.5, −1) | 0.050 |
-| 7 | on-mean spike | (+1.5, 0) | 0.035 |
-| 8 | outer spike | (+2.5, +1) | 0.025 |
+| k | component | mean | weight | expected points at N = 5000 |
+|---|---|---|---|---|
+| 0 | blob | (−1.5, 0) | 0.43 | 2150 |
+| 1 | blob | (+1.5, 0) | 0.43 | 2150 |
+| 2 | outer spike | (−2.5, −1) | 0.005 | 25 |
+| 3 | on-mean spike | (−1.5, 0) | 0.015 | 75 |
+| 4 | inner spike | (−0.5, +1) | 0.04 | 200 |
+| 5 | middle | (0, 0) | 0.02 | 100 |
+| 6 | inner spike | (+0.5, −1) | 0.04 | 200 |
+| 7 | on-mean spike | (+1.5, 0) | 0.015 | 75 |
+| 8 | outer spike | (+2.5, +1) | 0.005 | 25 |
 
 Sum 1.0000. The coder decides the plumbing (a dataset entry that loads
 mixture 11 and replaces the weights; the same generator otherwise, so
@@ -324,7 +328,17 @@ Under `moments`, receptive field j is represented by
 Either representation reproduces the field's mean and covariance exactly
 (the first also every higher moment); d_x + 1 is the smallest number of
 points that can carry a rank-d_x covariance, so no constant and no
-regularization enter. The simplex's orientation is a rotation that leaves
+regularization enter. **Normalization (ruled 27 September):** the survey
+rows' weights are scaled to sum to the row count R = Σ_j min(n_j, d_x + 1),
+so that every caller of T satisfies Σω = rows, the estimator contract; the
+penalty's a is then 1/R on the survey rows. (The first build summed them to
+M_𝒳 and the mixture estimator's Newton step, which normalizes its score by
+Σω and its information by the row count, came out three times too long.)
+**Estimator-side ruling:** `GMM2D` is to normalize its information by Σω
+as it does its score, so that T is invariant to a common rescaling of the
+weights for any caller, contract or not; this is the weighted-mean scale
+identity the package's one check expresses, and it changes no audited
+estimand. The simplex's orientation is a rotation that leaves
 the moments unchanged; fix it by a deterministic convention (first vertex
 along the field's leading eigenvector). The rows of field j are perturbed
 together: raising prototype j's mass scales all of its rows' weights by the

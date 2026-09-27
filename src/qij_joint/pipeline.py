@@ -229,7 +229,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     `ivqbins='joint'`, the shared bins' full-data stencils run in
     parallel -- the rest of a draw is serial regardless of `workers`.
     `survey` picks the prototype survey's receptive-field representation
-    (spec/QIJ_mods_waves.md A8)."""
+    (spec/method_notes.md section 2)."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()

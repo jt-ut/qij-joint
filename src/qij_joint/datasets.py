@@ -1,5 +1,5 @@
 """The four paper draws (pareto, mvt, fp, imf), the MVT VQ transform, and
-the `mix11` demo mixture (spec/QIJ_mods_waves.md section A7; not one of
+the `mix11` demo mixture (spec/method_notes.md section 5; not one of
 the paper's four).
 
 Parametric draws (`pareto`, `mvt`, `mix11`) sample the named law
@@ -50,7 +50,7 @@ def mvt(N: int, seed: int) -> np.ndarray:
 
 
 # Chacon mixture 11's own means/covariances (structsynhd's loaded 2-D
-# order), with the demo weights of spec/QIJ_mods_waves.md section A7 --
+# order), with the talk demo's weights --
 # the level sets stay close to the file's own, every component keeping
 # at least 50 points at N = 2000.
 MIX11_MIXNUM = 11

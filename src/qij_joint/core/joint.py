@@ -28,7 +28,7 @@ from .refine import adjacency_gain_value, adjacency_split_gain, level_gain_value
 
 __all__ = ["Growth", "JointResult", "grow", "run_joint", "two_means_split"]
 
-_CHUNK = 2048  # row chunk for the full-partition Lloyd reassignment (E4)
+_CHUNK = 2048  # row chunk for the full-partition Lloyd reassignment: bounds memory
 
 
 @dataclass
@@ -127,7 +127,7 @@ def two_means_split(rows: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]
 
 def _bin_stats(psi0_all: np.ndarray, labels: np.ndarray, L: int):
     """Per-bin count, mean and population variance of every output over
-    the FULL labelling, via two `bincount` passes per output (E2): the
+    the FULL labelling, via two `bincount` passes per output: the
     loop is over q (outputs), never over bins or points."""
     q = psi0_all.shape[1]
     counts = np.bincount(labels, minlength=L).astype(float)

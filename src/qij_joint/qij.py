@@ -10,8 +10,8 @@ partition, method_notes joint section), returning a `QIJResult`.
 `gptrend`/`gpwidth` pass straight to `fit_influence_model` (method_notes
 section 3); `M_X` overrides the prototype-count rule when given
 (method_notes section 2); `survey` picks the prototype survey's
-receptive-field representation, `'points'` (ported) or `'moments'`
-(spec/QIJ_mods_waves.md A8), passed to `run_xvq`. With a `pool`: the survey and stage 2's
+receptive-field representation, `'points'` (one row per prototype) or `'moments'`
+(spec/method_notes.md section 2), passed to `run_xvq`. With a `pool`: the survey and stage 2's
 full-data stencils run on it, the full-data base evaluation is
 submitted at the start and collected after stage 1, the influence
 model's width-grid candidates run on it (method_notes section 3), and

@@ -5,7 +5,7 @@ factory for a fresh estimator instance, and the VQ transform (if any)
 QIJ should quantize in. Seven cases: the paper's six, matching
 `datasets.py`'s four draws -- pareto (shape, tail), mvt (nu, tail), fp
 (all), imf (all, Chabrier) -- plus the demo mixture, mix11 (all,
-`GMM2D`, spec/QIJ_mods_waves.md section A7).
+`GMM2D`, spec/method_notes.md section 5).
 """
 
 import json

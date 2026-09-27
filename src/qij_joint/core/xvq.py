@@ -3,7 +3,7 @@ The X-VQ: quantize the data (`fit_xvq`, at `workers` FAISS threads),
 then measure the influence at each prototype by forward differences
 (spec/method_notes.md section 2), `prototype_influences`' per-prototype
 step run through `pool` when given. `run_xvq` is stage 1 in full.
-`survey='moments'` (spec/QIJ_mods_waves.md A8) replaces a receptive
+`survey='moments'` (spec/method_notes.md section 2) replaces a receptive
 field's one row by a representation matching its native mean and
 covariance exactly, for the fields too small or too rare for a single
 quantized row to stand in for the data.
@@ -115,7 +115,7 @@ def _resolve_bmu2(Z: np.ndarray, centers: np.ndarray, bmu: np.ndarray, bmu2: np.
 
 def _field_moments(X: np.ndarray, bmu: np.ndarray, M_used: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per live field j: point count n_j, native mean and native
-    population covariance, by grouped sums (E2) over the field index
+    population covariance, by grouped sums over the field index
     `bmu` already carries (0..M_used-1, contiguous, so no argsort is
     needed before `bincount`)."""
     d_x = X.shape[1]
@@ -135,7 +135,7 @@ def _unit_simplex(d_x: int) -> np.ndarray:
     """The d_x+1 vertices (columns) of a regular simplex in R^d_x,
     centred at 0, with unweighted second moment exactly I_{d_x}: the
     Helmert contrast matrix (orthonormal rows, orthogonal to the
-    all-ones vector) scaled by sqrt(d_x+1) (spec/QIJ_mods_waves.md A8).
+    all-ones vector) scaled by sqrt(d_x+1) (spec/method_notes.md section 2).
     """
     helmert = np.zeros((d_x, d_x + 1))
     for k in range(d_x):
@@ -150,7 +150,7 @@ def _align_first_vertex(V: np.ndarray) -> np.ndarray:
     +e_1, before it is mapped through a field's own covariance factor;
     a reflection is an orthogonal map, so it leaves the second moment
     at I_{d_x} unchanged (the deterministic orientation convention of
-    spec/QIJ_mods_waves.md A8)."""
+    spec/method_notes.md section 2)."""
     d_x = V.shape[0]
     a = V[:, 0] / np.linalg.norm(V[:, 0])
     e1 = np.zeros(d_x)
@@ -167,7 +167,7 @@ def _align_first_vertex(V: np.ndarray) -> np.ndarray:
 def _moments_survey_rows(
     X: np.ndarray, bmu: np.ndarray, p: np.ndarray, M_used: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The `survey='moments'` rows (spec/QIJ_mods_waves.md A8): field j
+    """The `survey='moments'` rows (spec/method_notes.md section 2): field j
     keeps its own n_j native rows when n_j <= d_x+1; otherwise it is
     the d_x+1 vertices of a regular simplex reproducing the field's
     native mean and covariance exactly, mapped through the
@@ -179,7 +179,7 @@ def _moments_survey_rows(
     over its own rows, R the stacked row count, so the weights sum to the
     number of rows as they do for every other call of T (an estimator
     may normalize its score by the weight total and its information by
-    the row count, which agree only then). Vectorized over fields (E1): the field
+    the row count, which agree only then). Vectorized over fields: the field
     moments, the eigendecomposition and the simplex map are one batched
     call each, over every large field at once. Returns (rows, row of
     each row's field, that row's base weight)."""
@@ -228,7 +228,7 @@ def _field_step_weights(
     other row by (1-t), with p_j the field's OWN mass fraction (not
     recomputed from `omega0`, since the stacked base weights do not sum
     to the row count) -- so raising the field's mass scales all its
-    rows alike, and I_j keeps its definition (spec A8)."""
+    rows alike, and I_j keeps its definition (method_notes section 2)."""
     member = (row_field == j).astype(float)
     return (1.0 - t) * omega0 + t * omega0 * member / p_j
 
@@ -270,9 +270,9 @@ def prototype_influences(
     """theta_Q = T(rows, base weights) once, then one forward difference
     per prototype j at t_j = step_parameter(delta_f, p_j), on `pool`
     when given, mass-centred over the finite prototypes (spec/method_
-    notes.md section 2). Under `survey='points'` (ported, bit-
-    identical) `rows` is one row per prototype, weight M_used*p_j.
-    Under `survey='moments'` (spec/QIJ_mods_waves.md A8) `rows` is the
+    notes.md section 2). Under `survey='points'`
+    `rows` is one row per prototype, weight M_used*p_j.
+    Under `survey='moments'` `rows` is the
     stacked field representation of `_moments_survey_rows`, `X` (native
     coordinates) and `bmu` are required, and a forward step scales a
     whole field's rows together. `busy_delta` is 0 with `pool=None`,
@@ -338,7 +338,7 @@ def run_xvq(
     """Stage 1 in full: fit the codebook on Z (at `workers` FAISS
     threads), map its prototypes to T's native coordinates with
     `inverse`, and survey them, on `pool` when given (method_notes
-    section 2). `survey='moments'` (spec/QIJ_mods_waves.md A8) needs
+    section 2). `survey='moments'` needs
     `X`, the draw in T's native coordinates (the rows T is called on);
     it is unused under `survey='points'`. The only function in `core/`
     that calls `inverse`."""

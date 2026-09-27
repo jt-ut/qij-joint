@@ -72,7 +72,7 @@ class _PointTerms:
     R       per coordinate, (N, m_c) the affine-mean residual r_i =
             h(x_i) - Hb^T A_c^-1 k_i (`bin_posterior_variance`'s R is a
             row sum of it); None on the constant path. Kernel rows
-            k(x_i, w_j) themselves are never cached (E4): every
+            k(x_i, w_j) themselves are never cached: every
             consumer re-forms its own rows in bounded chunks.
     """
 
@@ -806,7 +806,7 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     `bin_posterior_variance` read instead of recomputing. psi0 and
     sigma are produced together because they share the kernel rows
     k(x_i, w_j), formed in row chunks of at most `_UNCERTAINTY_BATCH_
-    CAP` and never held beyond the chunk that used them (E4). Under
+    CAP` and never held beyond the chunk that used them. Under
     `gpwidth='local'` those rows come from `_matern32_nonstationary` at
     each query row's own length scale c*h[bmu_i] (`model.bmu`, set at
     fit time) against the design's c*h_design; under 'global' from
