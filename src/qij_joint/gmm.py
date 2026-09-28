@@ -73,6 +73,7 @@ same two-phase screen.
 
 from collections import namedtuple
 import math
+import time
 import warnings
 
 import numpy as np
@@ -1313,6 +1314,253 @@ def _fit_info(fit, status) -> FitInfo:
                         n_iter_newton=0, label_order=None)
     return FitInfo(status=status, score=fit['resid'], n_iter_em=fit['n_iter_em'],
                    n_iter_newton=fit['n_iter_newton'], label_order=fit['label_order'])
+
+
+def _merge_scores(R: np.ndarray) -> np.ndarray:
+    """J_merge(i, j) = (r_i . r_j) / (||r_i|| ||r_j||), r_k = R[:, k] the
+    length-N responsibility vector of component k (Ueda, Nakano,
+    Ghahramani and Hinton 2000, eq. 12), unweighted by the row weights
+    `w` -- the spec's own definition, on the plain responsibility
+    vectors, not a weighted inner product. (K, K); only the upper
+    triangle (i < j) is used by the caller. A component with zero
+    responsibility everywhere (norm 0) scores -1 against everything
+    (lowest priority) rather than 0/0."""
+    norms = np.sqrt((R * R).sum(axis=0))
+    G = R.T @ R
+    prod = np.outer(norms, norms)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        J = np.where(prod > 0.0, G / prod, -1.0)
+    return J
+
+
+def _split_scores(R: np.ndarray, X: np.ndarray, mus: np.ndarray,
+                   a: np.ndarray, b: np.ndarray, c: np.ndarray, det: np.ndarray) -> np.ndarray:
+    """J_split(k) = sum_i f_k(x_i) log(f_k(x_i) / p_k(x_i)) (Ueda et al.
+    2000, eq. 13, evaluated on the sample): f_k(x_i) = R[i,k] /
+    sum_i R[i,k] is component k's responsibility-weighted empirical
+    distribution over the N rows (unweighted by `w`, matching
+    `_merge_scores`); p_k(x_i) = phi(x_i; mu_k, Sigma_k) / sum_i
+    phi(x_i; mu_k, Sigma_k) is component k's OWN Gaussian density
+    (not pi_k * phi_k), renormalized over the same finite sample rather
+    than its continuous integral -- both f_k and p_k are probability
+    distributions over the N rows, so their KL divergence is an ordinary
+    finite sum. Largest first is the worst-fitting component."""
+    N, K = R.shape
+    n_k = R.sum(axis=0)
+    scores = np.empty(K)
+    for k in range(K):
+        dx = X[:, 0] - mus[k, 0]
+        dy = X[:, 1] - mus[k, 1]
+        q = (c[k] * dx * dx - 2.0 * b[k] * dx * dy + a[k] * dy * dy) / det[k]
+        log_phi = -_LOG2PI - 0.5 * np.log(det[k]) - 0.5 * q
+        phi = np.exp(log_phi)
+        p_k = phi / phi.sum()
+        f_k = R[:, k] / n_k[k]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            log_ratio = np.log(f_k) - np.log(p_k)
+            contrib = np.where(f_k > 0.0, f_k * log_ratio, 0.0)
+        scores[k] = float(np.sum(contrib))
+    return scores
+
+
+def _merge_params(pis: np.ndarray, mus: np.ndarray, Ss: np.ndarray, i: int, j: int):
+    """Moment-matching merge of components i and j into one Gaussian
+    (Ueda et al. 2000, sec. 3.1): the merged component's (pi, mu, Sigma)
+    match the two-component sub-mixture {pi_i, mu_i, Sigma_i}, {pi_j,
+    mu_j, Sigma_j}'s own zeroth, first and second moments exactly --
+    algebra on the current parameters alone, no data or responsibilities
+    needed. Raises np.linalg.LinAlgError (this proposal's skip rule,
+    spec 2.3) if the merged covariance is not positive definite."""
+    pi_m = float(pis[i] + pis[j])
+    mu_m = (pis[i] * mus[i] + pis[j] * mus[j]) / pi_m
+    Si = np.array([[Ss[i, 0], Ss[i, 1]], [Ss[i, 1], Ss[i, 2]]])
+    Sj = np.array([[Ss[j, 0], Ss[j, 1]], [Ss[j, 1], Ss[j, 2]]])
+    second_i = Si + np.outer(mus[i], mus[i])
+    second_j = Sj + np.outer(mus[j], mus[j])
+    cov_m = (pis[i] * second_i + pis[j] * second_j) / pi_m - np.outer(mu_m, mu_m)
+    S_m = np.array([cov_m[0, 0], cov_m[0, 1], cov_m[1, 1]])
+    _sigma_terms(S_m[None, :])  # raises LinAlgError if cov_m is not PD
+    return pi_m, mu_m, S_m
+
+
+def _split_params(pis: np.ndarray, mus: np.ndarray, Ss: np.ndarray, k: int,
+                   split_offset: float):
+    """Split component k into two along its covariance's leading
+    eigenvector (Ueda et al. 2000, sec. 3.1): both halves keep pi_k/2
+    and Sigma_k unchanged, means displaced +/- split_offset standard
+    deviations (sqrt of the leading eigenvalue) along the leading
+    eigenvector. None (this proposal's other skip rule, spec 2.3) when
+    the leading eigenvalue is 0 -- no direction to split along."""
+    Sigma_k = np.array([[Ss[k, 0], Ss[k, 1]], [Ss[k, 1], Ss[k, 2]]])
+    evals, evecs = np.linalg.eigh(Sigma_k)
+    lam1 = evals[-1]
+    if lam1 <= 0.0:
+        return None
+    v1 = evecs[:, -1]
+    disp = split_offset * math.sqrt(lam1) * v1
+    pi_half = float(pis[k]) / 2.0
+    mu1 = mus[k] - disp
+    mu2 = mus[k] + disp
+    S_k = Ss[k].copy()
+    return pi_half, mu1, S_k, pi_half, mu2, S_k
+
+
+def _try_smem_proposal(X, Q, XP, w, pis, mus, Ss, R, i, j, k, eta, Scov, a_pen,
+                        split_offset):
+    """Form and run one split-and-merge proposal (i, j, k) (spec
+    2.3): merge i, j; split k; partial EM on the three new components;
+    full EM on all K. None if the proposal degenerates anywhere (a
+    non-PD merged covariance, a zero leading eigenvalue at the split,
+    or `_run_em` failing in either phase) -- the caller then tries the
+    next proposal, never raises.
+
+    PARTIAL EM (Ueda et al. 2000, sec. 2.2/3.2) is exactly ordinary
+    penalized EM (`_run_em`) run on the three new components alone,
+    against a modified row weight `w' = w * (R[:,i]+R[:,j]+R[:,k])`:
+    `R[:,i]+R[:,j]+R[:,k]` is the pre-proposal responsibility mass of
+    the three affected components, i.e. `1 - sum_others R_pre`, held
+    fixed for the whole partial phase (the other K-3 components'
+    responsibility mass is frozen at its pre-proposal value, as the
+    spec requires); an ordinary 3-component E-step against this
+    reweighted data assigns each point the SAME mass Ueda's partial
+    E-step would (softmax among the three, scaled by the frozen
+    leftover), and its M-step is `_m_step`'s own penalized closed form,
+    so `_run_em` needs no new code to be the partial-EM step, only new
+    weights and a 3-row (pis, mus, Ss). Because the three's partial-EM
+    mixing weights are internally renormalized to sum to 1, they are
+    rescaled back by `pi_budget = pi_i + pi_j + pi_k` (the mass the
+    trio held before the proposal, and, since `w'`'s total is exactly
+    `pi_budget * sum(w)` by construction, the same rescaling that keeps
+    the full K-component pis summing to 1) before full EM runs on all
+    K components together.
+
+    FULL EM plus the finish (spec 2.3: "then the finish (the local
+    optimizer, unchanged)") is `_fit` itself, called with `start` set
+    to the partial-EM result: with a `start`, `_fit` runs exactly one
+    accelerated-EM continuation (`_run_em`, the full-EM step) followed
+    unconditionally by the trust-region Newton finish, labelled against
+    `start`'s own components (so the labelling is the identity here) --
+    the same "full EM to convergence, then the finish" `GMM2D.__call__`
+    itself gets on every continuation, with no new finish code needed.
+    A `_Cfg` is built locally since `split_merge` takes no `cfg`; only
+    its `K` and `p` are used (`start` given skips both `n_starts` and
+    `seed`)."""
+    try:
+        pi_m, mu_m, S_m = _merge_params(pis, mus, Ss, i, j)
+    except np.linalg.LinAlgError:
+        return None
+    split = _split_params(pis, mus, Ss, k, split_offset)
+    if split is None:
+        return None
+    pi_s1, mu_s1, S_s1, pi_s2, mu_s2, S_s2 = split
+
+    K = pis.shape[0]
+    keep = [c for c in range(K) if c not in (i, j, k)]
+    pi_budget = float(pis[i] + pis[j] + pis[k])
+    three_pis = np.array([pi_m, pi_s1, pi_s2]) / pi_budget
+    three_mus = np.stack([mu_m, mu_s1, mu_s2])
+    three_Ss = np.stack([S_m, S_s1, S_s2])
+
+    leftover = R[:, i] + R[:, j] + R[:, k]
+    w_partial = w * leftover
+    fit_partial = _run_em(X, Q, XP, w_partial, three_pis, three_mus, three_Ss,
+                           eta, Scov, a_pen)
+    if fit_partial is None:
+        return None
+
+    pis_p = np.concatenate([pis[keep], fit_partial['pis'] * pi_budget])
+    mus_p = np.concatenate([mus[keep], fit_partial['mus']], axis=0)
+    Ss_p = np.concatenate([Ss[keep], fit_partial['Ss']], axis=0)
+
+    cfg = _Cfg(K=K, n_starts=0, seed=0, p=(K - 1) + 5 * K)
+    theta_p = _pack(K, pis_p, mus_p, Ss_p)
+    fit_full, status_full = _fit(X, w, cfg, Q, XP, eta, None, theta_p)
+    if status_full != 'converged':
+        return None
+    return fit_full['pis'], fit_full['mus'], fit_full['Ss'], fit_full['ll']
+
+
+def split_merge(X, Q, XP, w, pis, mus, Ss, eta, Scov, a_pen, breadth=5,
+                 split_offset=0.5):
+    """The split-and-merge finish of the cold search
+    (spec/QIJ_estimator_search_spec.md 2.3; Ueda, Nakano, Ghahramani and
+    Hinton 2000), from the racing screen's converged winner. `X, Q, XP,
+    w, Scov, a_pen` are exactly `_run_em`'s own arguments (centered
+    rows, features, weights, the penalty's covariance and strength);
+    `(pis, mus, Ss)` the winner to refine. `breadth` (C, published
+    value 5) is the number of (merge, split) proposals tried per cycle;
+    `split_offset` (published value 0.5) is the split displacement in
+    standard deviations along the split component's principal axis.
+    Both are arguments, never module constants (spec 5).
+
+    One cycle: rank every merge pair (i, j) by `_merge_scores` (largest
+    J_merge first) and every component by `_split_scores` (largest
+    J_split, i.e. worst-fitting, first); form the first `breadth`
+    (i, j, k) triples by pairing each ranked merge pair with the
+    highest-ranked split candidate not in {i, j}; try them in order
+    (`_try_smem_proposal`) and accept the FIRST whose full-EM-plus-finish ll
+    exceeds the current ll by more than `eta`. An accepted proposal
+    starts a new cycle (candidates re-ranked from the new parameters).
+    The stage ends when a cycle accepts none of its `breadth`
+    proposals, or when `n_accepted` reaches the safety cap `p =
+    (K-1) + 5K` (status 'smem_cap'; the loop otherwise terminates
+    because acceptance strictly increases a likelihood bounded by the
+    penalty). K never changes: one component is always merged away and
+    one always split.
+
+    Returns dict(pis, mus, Ss, ll, n_accepted, n_smem_tried, status,
+    wall_time): `ll` the returned fit's penalized log-likelihood per
+    unit weight; `n_smem_tried` the number of proposals actually run
+    (partial + full EM) across every cycle, `n_accepted` how many of
+    those were accepted; `status` 'ok' or 'smem_cap'."""
+    t0 = time.time()
+    K = pis.shape[0]
+    p = (K - 1) + 5 * K
+    W = float(w.sum())
+    ll = _penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen)
+    n_accepted = 0
+    n_tried = 0
+    status = 'ok'
+
+    while True:
+        a, b, c, det = _sigma_terms(Ss)
+        R, _ = _e_step_fast(Q, pis, mus, a, b, c, det)
+        Jm = _merge_scores(R)
+        Js = _split_scores(R, X, mus, a, b, c, det)
+        merge_pairs = sorted(
+            ((Jm[i, j], i, j) for i in range(K) for j in range(i + 1, K)),
+            key=lambda t: t[0], reverse=True)
+        split_order = sorted(range(K), key=lambda kk: Js[kk], reverse=True)
+
+        proposals = []
+        for _, i, j in merge_pairs:
+            kk = next((c2 for c2 in split_order if c2 not in (i, j)), None)
+            if kk is not None:
+                proposals.append((i, j, kk))
+            if len(proposals) == breadth:
+                break
+
+        accepted = False
+        for (i, j, kk) in proposals:
+            n_tried += 1
+            outcome = _try_smem_proposal(X, Q, XP, w, pis, mus, Ss, R,
+                                          i, j, kk, eta, Scov, a_pen, split_offset)
+            if outcome is None:
+                continue
+            pis_new, mus_new, Ss_new, ll_new = outcome
+            if ll_new > ll + eta:
+                pis, mus, Ss, ll = pis_new, mus_new, Ss_new, ll_new
+                n_accepted += 1
+                accepted = True
+                break
+        if not accepted:
+            break
+        if n_accepted >= p:
+            status = 'smem_cap'
+            break
+
+    return dict(pis=pis, mus=mus, Ss=Ss, ll=ll, n_accepted=n_accepted,
+                 n_smem_tried=n_tried, status=status, wall_time=time.time() - t0)
 
 
 class GMM2D:

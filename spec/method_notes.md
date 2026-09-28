@@ -746,6 +746,61 @@ the full data without a reference, converts that fit with
 `reference_from_theta(theta, K)`, and builds the estimator for every other
 evaluation of the draw with it; the naive ordering remains the default.
 
+**Split-and-merge finish** (`split_merge`, spec/QIJ_estimator_search_spec.md
+2.3; Ueda, Nakano, Ghahramani and Hinton 2000), the cold search's remedy
+for that search's characteristic failure: two adjacent components merged
+into one and the component freed by the merge spent on a spurious,
+near-empty one elsewhere. From the cold search's converged winner
+`(pis, mus, Ss)`, `split_merge(X, Q, XP, w, pis, mus, Ss, eta, Scov,
+a_pen, breadth=5, split_offset=0.5)` repeats one cycle: rank every merge
+pair `(i, j)` by `J_merge(i, j) = (r_i . r_j) / (||r_i|| ||r_j||)`, `r_k`
+component k's length-N responsibility vector (Ueda et al. eq. 12,
+unweighted by `w`); rank every component `k` by `J_split(k) = sum_i
+f_k(x_i) log(f_k(x_i)/p_k(x_i))`, `f_k` = component k's own responsibility
+renormalized to sum to 1 over the sample and `p_k` = component k's own
+Gaussian density renormalized the same way (Ueda et al. eq. 13, evaluated
+on the sample -- both `f_k` and `p_k` are probability distributions over
+the N rows, so their KL divergence is an ordinary finite sum); pair the
+first `breadth` ranked merge pairs each with the highest-ranked split
+component not in the pair, forming `breadth` proposals `(i, j, k)`.
+
+A proposal merges `i, j` and splits `k` by algebra alone, no data pass
+needed: the merged component's `(pi, mu, Sigma)` moment-match the
+two-component sub-mixture {pi_i, mu_i, Sigma_i}, {pi_j, mu_j, Sigma_j}
+exactly (`_merge_params`); the split component's two halves keep
+`pi_k/2` and `Sigma_k` each, means displaced +/- `split_offset` standard
+deviations (the square root of `Sigma_k`'s leading eigenvalue) along its
+leading eigenvector (`_split_params`). A merged covariance that is not
+PD, or a split whose leading eigenvalue is 0, skips the proposal (no
+data or direction to build it from). Otherwise: PARTIAL EM runs on the
+three new components alone, the other K-3 held fixed with their
+responsibility mass frozen at its pre-proposal value -- implemented with
+no new EM code by giving `_run_em` a modified row weight `w' = w *
+(R[:,i]+R[:,j]+R[:,k])` (the pre-proposal responsibility mass the three
+inherit) and a 3-row `(pis, mus, Ss)`: an ordinary 3-component E-step
+against `w'` reproduces Ueda's partial E-step exactly (a softmax among
+the three scaled by the frozen leftover mass), and the M-step is
+`_m_step`'s own penalized closed form. The three's partial-EM mixing
+weights, internally normalized to sum to 1, are rescaled by `pi_budget =
+pi_i + pi_j + pi_k` (the mass the trio held before the proposal, and
+exactly `sum(w')/sum(w)` by construction) so the full K-component `pis`
+still sums to 1. FULL EM plus the finish is `_fit` itself, called with
+`start` set to the partial-EM result: with a `start`, `_fit` runs one
+accelerated-EM continuation followed unconditionally by the
+trust-region Newton finish and returns 'converged' or not, the same
+"full EM to convergence, then the finish" any other continuation gets.
+
+Proposals are tried in the ranked order; the first with penalized ll
+per unit weight exceeding the current by more than `eta` is accepted
+(current parameters replaced, a new cycle begins); a cycle accepting
+none of its `breadth` proposals ends the stage. `breadth` (published
+value 5) and `split_offset` (published value 0.5) are constructor-style
+arguments, never module constants. A safety cap of `p = (K-1) + 5K`
+acceptances ends the stage with status `smem_cap` (the loop otherwise
+terminates because acceptance strictly increases a likelihood bounded
+by the penalty); `split_merge` returns `dict(pis, mus, Ss, ll,
+n_accepted, n_smem_tried, status, wall_time)`.
+
 ## 6. The joint second stage
 
 Under `ivqbins='joint'` (`core/joint.py`), stage 2 replaces the marginal
