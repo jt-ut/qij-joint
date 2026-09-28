@@ -56,10 +56,10 @@ def _curvature_task(T, case, rows: np.ndarray, task):
     `parallel.call_T` applies the estimator-protocol rule for `start`
     (interface sheet); this is this task's own failure boundary (R7).
     Returns (key, result, failure flag, this call's own wall time)."""
-    key, omega, start = task
+    key, omega, start, eta = task
     t0 = time.perf_counter()
     try:
-        result = np.asarray(call_T(T, rows, omega, start), dtype=float)
+        result = np.asarray(call_T(T, rows, omega, start, eta), dtype=float)
         failed = bool(np.any(np.isnan(result)))
     except Exception:
         result = np.full(len(T.outputs), np.nan)
@@ -207,15 +207,15 @@ def curvature(
         for i, c in enumerate(outputs):
             omega_plus = sv.omega0 * (1.0 + eps[i] * row_u[:, c])
             omega_minus = sv.omega0 * (1.0 - eps[i] * row_u[:, c])
-            t_plus = np.asarray(counter(sv.rows, omega_plus, start=theta_Q), dtype=float)
-            t_minus = np.asarray(counter(sv.rows, omega_minus, start=theta_Q), dtype=float)
+            t_plus = np.asarray(counter(sv.rows, omega_plus, start=theta_Q, eta=sv.eta_rows), dtype=float)
+            t_minus = np.asarray(counter(sv.rows, omega_minus, start=theta_Q, eta=sv.eta_rows), dtype=float)
             plus_ok = np.isfinite(t_plus[c])
             minus_ok = np.isfinite(t_minus[c])
             t_far_c = np.nan
             if plus_ok != minus_ok:
                 sign = 1.0 if plus_ok else -1.0
                 omega_far = sv.omega0 * (1.0 + sign * 2.0 * eps[i] * row_u[:, c])
-                t_far = np.asarray(counter(sv.rows, omega_far, start=theta_Q), dtype=float)
+                t_far = np.asarray(counter(sv.rows, omega_far, start=theta_Q, eta=sv.eta_rows), dtype=float)
                 t_far_c = t_far[c]
             c_q[i], one_sided[i] = _cq_from_pair(
                 t_plus[c], t_minus[c], t_far_c, theta_Q[c], eps[i], sigma_Q[c], N,
@@ -226,8 +226,8 @@ def curvature(
         for i, c in enumerate(outputs):
             omega_plus = sv.omega0 * (1.0 + eps[i] * row_u[:, c])
             omega_minus = sv.omega0 * (1.0 - eps[i] * row_u[:, c])
-            tasks.append((('+', c), omega_plus, theta_Q))
-            tasks.append((('-', c), omega_minus, theta_Q))
+            tasks.append((('+', c), omega_plus, theta_Q, sv.eta_rows))
+            tasks.append((('-', c), omega_minus, theta_Q, sv.eta_rows))
         t_map0 = time.perf_counter()
         results = pool.map(_curvature_task, tasks)
         busy = sum(r[3] for r in results) - (time.perf_counter() - t_map0)
@@ -248,7 +248,7 @@ def curvature(
             if plus_ok != minus_ok:
                 sign = 1.0 if plus_ok else -1.0
                 omega_far = sv.omega0 * (1.0 + sign * 2.0 * eps[i] * row_u[:, c])
-                extra_tasks.append((('2', c), omega_far, theta_Q))
+                extra_tasks.append((('2', c), omega_far, theta_Q, sv.eta_rows))
         if extra_tasks:
             t_map1 = time.perf_counter()
             extra_results = pool.map(_curvature_task, extra_tasks)

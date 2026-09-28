@@ -45,8 +45,6 @@ def main(argv=None) -> None:
                     choices=['multistart', 'full-data'], default='multistart')
     p.add_argument('--refine-schedule', dest='refine_schedule',
                     choices=['queue', 'rounds'], default='queue')
-    p.add_argument('--refine-trigger', dest='refine_trigger',
-                    choices=['gain', 'measured'], default='gain')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
@@ -76,14 +74,13 @@ def main(argv=None) -> None:
         params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
                       ivqbins=args.ivqbins, survey=args.survey,
                       quantized_start=args.quantized_start,
-                      refine_schedule=args.refine_schedule,
-                      refine_trigger=args.refine_trigger)
+                      refine_schedule=args.refine_schedule)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
             workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
             ivqbins=args.ivqbins, survey=args.survey, quantized_start=args.quantized_start,
-            refine_schedule=args.refine_schedule, refine_trigger=args.refine_trigger)
+            refine_schedule=args.refine_schedule)
     else:
         params['point_curvature'] = args.point_curvature
         written, skipped = pipeline.run_ijfd(

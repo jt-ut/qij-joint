@@ -54,12 +54,6 @@ pool batch per round across outputs. Under `ivqbins='joint'` the switch
 is inert -- the joint path's own check already advances in rounds, not
 a queue.
 
-`refine_trigger` (spec/QIJ_mods_waves.md A15) picks the marginal path's
-own leaf-selection rule, under either `refine_schedule`: `'gain'`
-(ported, the default, bit-identical) or `'measured'` (the demo's
-setting, `core.refine`/`core.rounds` module docstrings). Inert under
-`ivqbins='joint'`.
-
 `eta_full` (spec/QIJ_mods_waves.md A15, A13 step 2) is measured once
 per draw, right after `theta_hat`, by `core.eta.measure_eta_full`, and
 used in place of `T`'s own declared `eta` by every full-data evaluation
@@ -79,7 +73,6 @@ from dataclasses import replace
 import numpy as np
 from numpy.linalg import LinAlgError
 
-from . import registry
 from .core import abc as core_abc
 from .core.counter import Counter
 from .core.eta import measure_eta_full
@@ -87,7 +80,7 @@ from .core.influence_model import fit_influence_model
 from .core.influence_model import psi0 as _psi0
 from .core.influence_model import uncertainty as _uncertainty
 from .core.joint import run_joint
-from .core.refine import run_refinement, whiten_columns
+from .core.refine import run_refinement
 from .core.rounds import run_refinement_rounds
 from .core.xvq import cost_rule_M, run_xvq
 from .parallel import prepared
@@ -116,8 +109,6 @@ def _marginal_defaults(N: int, q: int) -> dict:
         n_refine_evals=np.zeros(q, dtype=int),
         psi_hat=np.full((N, q), np.nan), bin_label=np.full((N, q), -1, dtype=int),
         bin_U=(),
-        a_c=np.full(q, np.nan), n_flagged=np.zeros(q, dtype=int),
-        n_flag_evals=np.zeros(q, dtype=int), n_geom_splits=np.zeros(q, dtype=int),
     )
 
 
@@ -132,20 +123,9 @@ def _wrap(T):
     return T
 
 
-_NO_COLD_DIAG = dict(beta_star=float('nan'), cold_ll=float('nan'),
-                      search_gap=float('nan'), search_failed=False)
-
-
-def _theta_hat_task(T, case, X: np.ndarray, task):
+def _theta_hat_task(T, case, X: np.ndarray, _task):
     """theta_hat = T(X, ones(N)) on the pool, submitted at draw start
-    (method_notes section 2). `task` = (dataset, estimator) for
-    `registry.cold_fit_diagnostics` (A16 items 6-7), read in THIS worker
-    immediately after the cold fit -- `theta_hat`'s own fit runs in a
-    separate process from `QIJ.fit` whenever a pool is given, so the
-    diagnostics (and the search audit's own continuation evaluation)
-    must be spent here, not after `.result()`. Returns (evaluation,
-    failure, wall time, the diagnostics dict)."""
-    dataset, estimator = task
+    (method_notes section 2). Returns (evaluation, failure, wall time)."""
     prep = prepared(T, X)
     t0 = time.perf_counter()
     try:
@@ -155,15 +135,12 @@ def _theta_hat_task(T, case, X: np.ndarray, task):
         failed = bool(np.any(np.isnan(result)))
     except Exception:
         result, failed = np.full(len(T.outputs), np.nan), True
-    wall = time.perf_counter() - t0
-    diag = (registry.cold_fit_diagnostics(T, X, result, dataset, estimator)
-            if dataset is not None else dict(_NO_COLD_DIAG))
-    return result, failed, wall, diag
+    return result, failed, time.perf_counter() - t0
 
 
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
-                  sv, quantized_start, refine_schedule, refine_trigger) -> QIJResult:
+                  sv, quantized_start, refine_schedule) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -203,8 +180,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        refine_trigger=refine_trigger,
-        **_marginal_defaults(N, q), **_joint_defaults(N, q), **_NO_COLD_DIAG,
+        **_marginal_defaults(N, q), **_joint_defaults(N, q),
     )
 
 
@@ -215,8 +191,7 @@ class QIJ:
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
-                 refine_schedule: str = 'queue',
-                 refine_trigger: str = 'gain') -> None:
+                 refine_schedule: str = 'queue') -> None:
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -226,18 +201,13 @@ class QIJ:
         self.ivqbins = ivqbins
         self.survey = survey
         self.refine_schedule = refine_schedule
-        self.refine_trigger = refine_trigger
         self.quantized_start = quantized_start
 
-    def fit(self, X: np.ndarray, T, pool=None, dataset: str = None,
-            estimator: str = None) -> QIJResult:
+    def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
         influences), the shared full-data base evaluation, the ABC
         curvature stage, then per-output refinement, on `pool` per the
-        module docstring. `dataset`/`estimator`, when given, name this
-        draw's case for `registry.cold_fit_diagnostics` (A16 items 6-7),
-        computed from theta_hat's own cold fit wherever it happens to
-        run (`_theta_hat_task`'s own worker, or in-process)."""
+        module docstring."""
         t_start = time.perf_counter()
         X = np.asarray(X)
         N = len(X)
@@ -259,7 +229,7 @@ class QIJ:
         theta_future = None
         if pool is not None:
             pool.share(X)
-            theta_future = pool.submit(_theta_hat_task, (dataset, estimator))
+            theta_future = pool.submit(_theta_hat_task, None)
 
         # `vq_transform` returns (Z, inverse) fitted to this draw;
         # identity when `vq_transform` is None. A 1-D Z is promoted to
@@ -284,25 +254,40 @@ class QIJ:
         theta_hat_pre = None
         full_data_busy = 0.0
         wall_time_full_data = 0.0
-        cold_diag = None
         if self.quantized_start == 'full-data':
             t0 = time.perf_counter()
             if theta_future is None:
                 theta_hat_pre = np.asarray(counter(X, np.ones(N)), dtype=float)
-                cold_diag = registry.cold_fit_diagnostics(T, X, theta_hat_pre, dataset, estimator)
             else:
-                result, failed, full_data_busy, cold_diag = theta_future.result()
+                result, failed, full_data_busy = theta_future.result()
                 theta_future = None
                 counter.add(1, N, int(failed))
                 theta_hat_pre = np.asarray(result, dtype=float)
             wall_time_full_data = time.perf_counter() - t0
-        ev0, rows0 = counter.snapshot()  # 0, 0 unless the block above ran
+        # With theta_hat in hand before the survey, eta_full (below) is
+        # measured now and is also the polish tolerance of every
+        # evaluation on the survey rows: T's declared eta can sit below
+        # what a fit reproduces (cloudfil draw 1: 1e-12 against a polish
+        # floor of 2e-12), which fails every survey evaluation.
+        eta_rows = None
+        eta_full_pre = None
+        if theta_hat_pre is not None:
+            t0 = time.perf_counter()
+            ev_e0, rows_e0 = counter.snapshot()
+            eta_full_pre, _n_eta_full = measure_eta_full(counter, X, theta_hat_pre)
+            wall_time_eta_full = time.perf_counter() - t0
+            ev_e1, rows_e1 = counter.snapshot()
+            evals_eta_full = ev_e1 - ev_e0
+            rows_eta_full = rows_e1 - rows_e0
+            if getattr(counter, 'takes_start', False):
+                eta_rows = eta_full_pre
+        ev0, rows0 = counter.snapshot()  # the eta_full evaluations above are excluded
 
         t0 = time.perf_counter()
         xvq, theta_Q, I_proto, xvq_busy, sv = run_xvq(
             Z, inverse, counter, eta, M_requested, self.seed, pool, workers,
             survey=self.survey, X=X, quantized_start=self.quantized_start,
-            theta_hat=theta_hat_pre)
+            theta_hat=theta_hat_pre, eta_rows=eta_rows)
         # Prototype positions in T's native coordinates, for the
         # result's diagnostics -- the same `inverse(xvq.centers)`
         # `run_xvq` already applied, recovered rather than re-derived.
@@ -325,8 +310,7 @@ class QIJ:
             # as the serial code never reaches its own call here either.
             return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                  self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
-                                 self.survey, sv, self.quantized_start, self.refine_schedule,
-                                 self.refine_trigger)
+                                 self.survey, sv, self.quantized_start, self.refine_schedule)
         psi0_all = _psi0(model, Z)
         sigma_all = _uncertainty(model, Z)
         wall_time_prototype = time.perf_counter() - t0
@@ -357,10 +341,9 @@ class QIJ:
             theta_hat = theta_hat_pre
         elif theta_future is None:
             theta_hat = np.asarray(counter(X, np.ones(N)), dtype=float)
-            cold_diag = registry.cold_fit_diagnostics(T, X, theta_hat, dataset, estimator)
             wall_time_full_data = time.perf_counter() - t0
         else:
-            result, failed, full_data_busy, cold_diag = theta_future.result()
+            result, failed, full_data_busy = theta_future.result()
             theta_hat = np.asarray(result, dtype=float)
             counter.add(1, N, int(failed))
             wall_time_full_data = time.perf_counter() - t0
@@ -372,13 +355,16 @@ class QIJ:
         # own stage, never in 'full_data' or 'total'. Zero evaluations,
         # eta_full == eta exactly, for an estimator without
         # `takes_start` (`measure_eta_full`), so this is a no-op there.
-        t0 = time.perf_counter()
-        ev_e0, rows_e0 = counter.snapshot()
-        eta_full, _n_eta_full = measure_eta_full(counter, X, theta_hat)
-        wall_time_eta_full = time.perf_counter() - t0
-        ev_e1, rows_e1 = counter.snapshot()
-        evals_eta_full = ev_e1 - ev_e0
-        rows_eta_full = rows_e1 - rows_e0
+        if eta_full_pre is not None:
+            eta_full = eta_full_pre
+        else:
+            t0 = time.perf_counter()
+            ev_e0, rows_e0 = counter.snapshot()
+            eta_full, _n_eta_full = measure_eta_full(counter, X, theta_hat)
+            wall_time_eta_full = time.perf_counter() - t0
+            ev_e1, rows_e1 = counter.snapshot()
+            evals_eta_full = ev_e1 - ev_e0
+            rows_eta_full = rows_e1 - rows_e0
 
         if pool is not None:
             pool.share(X)  # re-share X: the survey shared its own rows on `pool`
@@ -387,7 +373,6 @@ class QIJ:
         # stage 2's own evaluations only for an estimator with restarts;
         # None is a no-op for every other estimator (bit-identical).
         start_second_stage = theta_hat if getattr(T, 'takes_start', False) else None
-        Z_white = whiten_columns(Z) if self.refine_trigger == 'measured' else None
 
         t0 = time.perf_counter()
         n_rounds = 0
@@ -453,7 +438,6 @@ class QIJ:
                     xvq.bmu, xvq.bmu2, eta_full, self.eps, xvq.M_used,
                     [bool(model.constant_path[j]) for j in range(q)], Z, model, list(range(q)),
                     pool, start=start_second_stage,
-                    refine_trigger=self.refine_trigger, Z_white=Z_white,
                 )
             else:
                 coordinates = [
@@ -463,17 +447,14 @@ class QIJ:
                         I_proto[:, c], xvq.bmu, xvq.bmu2,
                         eta_full, self.eps, xvq.M_used, bool(model.constant_path[j]), Z, model, pool,
                         start=start_second_stage, model_index=j,
-                        refine_trigger=self.refine_trigger, Z_white=Z_white,
                     )
                     for j, (c, name) in enumerate(zip(measured, outputs))
                 ]
             # A failed initial-bin evaluation NaNs the whole draw, not just
             # its own coordinate: every V_btw/V_win_hat/V_tot_hat (and the
             # ABC ingredients derived from the same bins) is voided.
-            # `B_hat`/`a_bca` stay (q_full,) arrays here (every coordinate's
-            # own per-output bin measurement, `core.refine.CoordinateResult`'s
-            # own shape) -- a bare `float('nan')` broke the per-output
-            # `cr.a_bca[c]`/`cr.B_hat[c]` indexing below on any failed draw.
+            # `B_hat`/`a_bca` stay (q_full,) arrays: they are indexed per
+            # output below.
             if any(cr.failed for cr in coordinates):
                 nan_q_full = np.full(q_full, np.nan)
                 coordinates = [
@@ -507,12 +488,6 @@ class QIJ:
                 # measured columns; one (L_c, q) array per output, L_c its
                 # own final bin count.
                 bin_U=tuple(cr.bin_U[:, measured] for cr in coordinates),
-                # A15 item 6's products, per output; NaN/0 for every
-                # coordinate under `refine_trigger='gain'`.
-                a_c=np.array([cr.a_c for cr in coordinates]),
-                n_flagged=np.array([cr.n_flagged for cr in coordinates]),
-                n_flag_evals=np.array([cr.n_flag_evals for cr in coordinates]),
-                n_geom_splits=np.array([cr.n_geom_splits for cr in coordinates]),
             )
             joint_fields = _joint_defaults(N, q)
         wall_time_refinement = time.perf_counter() - t0
@@ -574,6 +549,5 @@ class QIJ:
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
-            refine_trigger=self.refine_trigger,
-            **second_stage_fields, **joint_fields, **cold_diag,
+            **second_stage_fields, **joint_fields,
         )

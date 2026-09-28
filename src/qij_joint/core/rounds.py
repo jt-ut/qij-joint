@@ -69,20 +69,7 @@ def _select_round(states: dict, active: set) -> dict:
     at or above that output's current tau, sorted by (-g, id) and
     capped at its remaining evaluation budget (spec/QIJ_mods_waves.md
     A14). An output with nothing to select is dropped from `active` in
-    place -- a fixed point it can never leave (module docstring).
-
-    Under `refine_trigger='measured'` (A15 item 1: flagging is
-    entry-only, so `l['flagged']` is only ever true for an as-yet-
-    unsplit initial bin), every flagged open leaf is placed FIRST, in
-    descending measured-discrepancy order (ties: lower leaf id), ahead
-    of the ported gain-qualifying leaves: 'flagged bins are split in the
-    round they're flagged, all in the round's pool batch' -- unlike the
-    queue, a round need not wait for the flagged leaves alone; the
-    remaining budget still admits gain-qualifying leaves in the same
-    batch -- an unflagged leaf's 'g' is the ported predicted gain, a
-    flagged lineage's own descendant's 'g' is the measured Delta/2
-    `refine.apply_split` set at its creation (item 3), both compared to
-    tau the same way here."""
+    place -- a fixed point it can never leave (module docstring)."""
     selections = {}
     for i in list(active):
         state = states[i]
@@ -91,21 +78,10 @@ def _select_round(states: dict, active: set) -> dict:
             active.discard(i)
             continue
         tau = state.eps * state.V_btw / len(state.leaves)
-        if state.refine_trigger == 'measured':
-            flagged = sorted(
-                (l for l in open_leaves if l['flagged']),
-                key=lambda l: (-l['discrepancy'], l['id']),
-            )
-            gain_ok = sorted(
-                (l for l in open_leaves if not l['flagged'] and l['g'] >= tau),
-                key=lambda l: (-l['g'], l['id']),
-            )
-            qualifying = flagged + gain_ok
-        else:
-            qualifying = sorted(
-                (l for l in open_leaves if l['g'] >= tau),
-                key=lambda l: (-l['g'], l['id']),
-            )
+        qualifying = sorted(
+            (l for l in open_leaves if l['g'] >= tau),
+            key=lambda l: (-l['g'], l['id']),
+        )
         remaining = state.evals_cap - state.n_refine_evals
         if not qualifying or remaining <= 0:
             active.discard(i)
@@ -135,8 +111,6 @@ def run_refinement_rounds(
     model_indices: Sequence[int],
     pool=None,
     start: np.ndarray = None,
-    refine_trigger: str = 'gain',
-    Z_white: Optional[np.ndarray] = None,
 ) -> Tuple[List[CoordinateResult], int]:
     """
     Refine every measured output together, in synchronized rounds
@@ -148,8 +122,7 @@ def run_refinement_rounds(
     result is applied with `refine.apply_split` before the next round's
     selection is made. Every other argument mirrors
     `refine.run_refinement`'s own, one entry per measured output in the
-    per-output sequences; `refine_trigger`/`Z_white` are shared across
-    every output (A15), same as `eta`/`eps`/`M_X_used`. Returns (this
+    per-output sequences, same as `eta`/`eps`/`M_X_used`. Returns (this
     call's `CoordinateResult` per output, in `coordinates`' order, and
     the number of rounds run).
     """
@@ -161,7 +134,6 @@ def run_refinement_rounds(
             X, counter, theta_hat, coordinates[i], names[i], psi0_cols[i], m_vals[i],
             sigma_cols[i], I_proto_cols[i], bmu, bmu2, eta, eps, M_X_used,
             constant_paths[i], Z, model, pool, start, model_indices[i],
-            refine_trigger, Z_white,
         )
         if isinstance(setup, CoordinateResult):
             results[i] = setup

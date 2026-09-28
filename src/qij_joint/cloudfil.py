@@ -150,24 +150,8 @@ class P2Mixture:
         self.measured = (list(measured) if measured is not None
                           else list(range(n_raw, n_raw + len(_DERIVED_NAMES))))
 
-    @property
-    def last_fit_info(self):
-        """The wrapped `GMM2D`'s own diagnostic side channel (A16 items
-        6-7): `beta_star`, `beta_trace`, `ll` (its raw 59-output
-        `theta`), None before any call or after a failed one."""
-        return self._gmm.last_fit_info
-
     def prepare(self, X: np.ndarray) -> tuple:
         return self._gmm.prepare(X)
-
-    def score_at(self, X: np.ndarray, w: np.ndarray, theta: np.ndarray,
-                 prep: tuple = None):
-        """(ll, resid) of `theta`'s first 59 (raw `GMM2D`) entries at
-        (X, w) -- the seven derived outputs have no likelihood term
-        (spec/QIJ_mods_waves.md A16.7's search audit needs only the
-        mixture fit's own objective)."""
-        raw_theta = np.asarray(theta, dtype=float)[:self._gmm.p]
-        return self._gmm.score_at(X, w, raw_theta, prep=prep)
 
     def __call__(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
                  start: np.ndarray = None, eta: float = None, **kwargs) -> np.ndarray:

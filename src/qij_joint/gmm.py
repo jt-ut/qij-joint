@@ -2,17 +2,15 @@
 covariances) with an analytic influence function via Louis's (1982)
 identity.
 
-`GMM2D(K, tol=1e-8, max_iter=500, reference=None)` fits a cold call by
-deterministic annealing EM (SQUAREM-accelerated; spec/QIJ_mods_waves.md
-A16), polishes the beta=1 result with a damped Newton step gated on the
-observed information's positive-definiteness, and reports the score and
-observed information at the fit for `influence`. Follows
-`estimators.py`'s conventions: `T(X, w) -> ndarray(p,)` never raises (a
-failed fit is NaN); no state between calls (the `last_fit_info`
-diagnostic side channel, spec A16 items 6-7, is never read by T itself,
-so this holds). Without `start` (see below), `reference` labels every
-evaluation's components by the assignment to it minimizing total
-Bhattacharyya distance (method_notes section 5); without either,
+`GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`
+fits by multi-start weighted EM (SQUAREM-accelerated), polishes the
+winning start with a damped Newton step gated on the observed
+information's positive-definiteness, and reports the score and observed
+information at the fit for `influence`. Follows `estimators.py`'s
+conventions: `T(X, w) -> ndarray(p,)` never raises (a failed fit is
+NaN); no state between calls. Without `start` (see below), `reference`
+labels every evaluation's components by the assignment to it minimizing
+total Bhattacharyya distance (method_notes section 5); without either,
 components are ordered by ascending first-mean coordinate.
 
 `GMM2D.takes_start = True`: `T`, `influence` and `fit_and_influence` all
@@ -57,22 +55,23 @@ exactly as described there.
 feature buffer built from the centered X, both independent of `w` and
 otherwise rebuilt on every evaluation of the same X.
 
-The cold search (`start` not given) is deterministic annealing EM (Ueda
-and Nakano 1998; spec/QIJ_mods_waves.md A16), the estimator's ONLY cold
-search: all K components start at the sample (weighted) mean and
-covariance with equal weights and a deterministic symmetry break, then
-track the penalized objective's maximizer as the inverse temperature
-beta rises on a fixed geometric schedule from 0.02 to 1, tempered
-E-step, penalized weighted M-step at every step. A continuation
-(`start` given) never anneals -- it runs EM from its own start, since
-annealing would erase the branch a derivative depends on (A16 item 5).
+The multi-start's start set is `n_starts` k-means starts plus greedy-EM
+starts from `seeding.py` (spec/QIJ_mods_waves.md A12 round 5, A15): a
+component grown to K by residual-driven insertion after Verbeek,
+Vlassis and Kroese (2003), one at 50*K over-segmentation cells and a
+second at 25*K cells, the second contributing its own ×1/2 and ×2
+covariance variants alongside it. Every kind of start goes through the
+same two-phase screen.
 """
 
 from collections import namedtuple
-from typing import Tuple
+import warnings
 
 import numpy as np
+from scipy.cluster.vq import kmeans2
 from scipy.optimize import linear_sum_assignment
+
+from .seeding import greedy_em_start, scaled_variants
 
 _LOG2PI = float(np.log(2.0 * np.pi))
 _ACCEPT_TOL = 1e-9
@@ -80,20 +79,28 @@ _COND_MAX = 1e12
 _MAX_NEWTON = 40
 _MAX_HALVINGS = 30
 # Declared from the score norm the polish reliably reaches on the demo
-# mixture's annealed fit (module report), rounded up to a power of ten.
+# mixture's multi-start (module report), rounded up to a power of ten.
 _ETA = 1e-12
 
-# A16's fixed annealing schedule: inverse temperature beta from
-# `_BETA_MIN` to 1 in `_N_BETA_STEPS` geometric steps (`_BETA_FACTOR`
-# each), the "standard schedule"; the only permitted change, on a
-# failed acceptance draw, is a finer factor (A16's own words).
-_BETA_MIN = 0.02
-_N_BETA_STEPS = 25
-_BETA_FACTOR = _BETA_MIN ** (-1.0 / _N_BETA_STEPS)  # ~1.169 ("~1.17")
+# Phase 1's fixed screening budget and phase 2's promotion count, set by
+# measurement (module report): fastest choice that never moved the
+# winning start or theta_hat relative to running every start to full
+# budget.
+_SHORT_ITERS = 25
+_PROMOTE_N = 3
 
-# A16 item 6's "effective number of components": weight above this
-# floor over N (not sum(w) -- A16's own words, "weights above 5/N").
-_EFF_WEIGHT_FLOOR = 5.0
+# The second greedy-EM start's over-segmentation resolution
+# (spec/QIJ_mods_waves.md A15), beside `seeding.py`'s own 50*K default,
+# and the covariance factors of its two scaled variants (A12 item 6).
+_GREEDY_CELL_FACTOR_2 = 25
+_GREEDY_VARIANT_FACTORS = (0.5, 2.0)
+
+# scipy.cluster.vq.kmeans2 runs exactly this many Lloyd iterations (its
+# `thresh` argument is not implemented as a convergence test), so this is
+# set well past the point a k-means run on data of this scale has any
+# label left to reassign; further iterations after that point are exact
+# no-ops, not a source of nondeterminism or extra failure.
+_KMEANS_ITER = 300
 
 _D = {
     'S11': np.array([[1.0, 0.0], [0.0, 0.0]]),
@@ -102,7 +109,7 @@ _D = {
 }
 _STYPES = ('S11', 'S12', 'S22')
 
-_Cfg = namedtuple('_Cfg', ['K', 'tol', 'max_iter', 'p'])
+_Cfg = namedtuple('_Cfg', ['K', 'n_starts', 'seed', 'tol', 'max_iter', 'p'])
 
 
 def _make_outputs(K: int) -> tuple:
@@ -152,79 +159,47 @@ def _unpack(K: int, theta: np.ndarray):
 # Weighted EM -- one start at a time.
 # ======================================================================
 
-def _beta_schedule() -> np.ndarray:
-    """A16 item 1's geometric schedule, `_BETA_MIN` to 1 in
-    `_N_BETA_STEPS` steps of `_BETA_FACTOR`; the last entry forced to
-    exactly 1.0 (the point where the penalized likelihood itself is the
-    objective)."""
-    betas = _BETA_MIN * _BETA_FACTOR ** np.arange(_N_BETA_STEPS + 1)
-    betas[-1] = 1.0
-    return betas
-
-
-def _anneal_start(K: int, Scov: np.ndarray, xbar: np.ndarray):
-    """A16 item 2's cold start: all K components at the sample (weighted)
-    mean `xbar` and covariance `Scov`, equal weights, with the
-    deterministic symmetry break -- component k (1-indexed) displaced by
-    (k - (K+1)/2) * 1e-3 * sigma_1 along `Scov`'s leading eigenvector,
-    sigma_1 its standard deviation -- since symmetric EM would otherwise
-    keep every component identical forever."""
-    eigvals, eigvecs = np.linalg.eigh(Scov)
-    sigma1 = float(np.sqrt(max(eigvals[-1], 0.0)))
-    v1 = eigvecs[:, -1]
-    offsets = (np.arange(1, K + 1) - 0.5 * (K + 1)) * 1e-3 * sigma1
-    mus = xbar[None, :] + offsets[:, None] * v1[None, :]
-    Ss = np.tile(np.array([Scov[0, 0], Scov[0, 1], Scov[1, 1]]), (K, 1))
-    pis = np.full(K, 1.0 / K)
-    return pis, mus, Ss
-
-
-def _last_change_beta(trace: list) -> float:
-    """A16 item 6: the beta at which the effective component count
-    (`trace`'s own n_eff, `_EFF_WEIGHT_FLOOR`) LAST changed over the
-    annealing run; the first beta if it never changes; NaN for an empty
-    trace."""
-    if not trace:
-        return float('nan')
-    last_beta, prev_n = trace[0][0], trace[0][1]
-    for beta, n_eff, _ in trace[1:]:
-        if n_eff != prev_n:
-            last_beta, prev_n = beta, n_eff
-    return last_beta
-
-
-def _anneal_fit(X: np.ndarray, Q: np.ndarray, XP: np.ndarray, w: np.ndarray, K: int,
-                 tol: float, max_iter: int, Scov: np.ndarray, a_pen: float):
-    """Deterministic annealing EM (Ueda and Nakano 1998,
-    spec/QIJ_mods_waves.md A16): the mixture estimator's ONLY cold
-    search, replacing the multi-start. Tracks the penalized objective's
-    maximizer from `_anneal_start` as beta rises over `_beta_schedule`
-    (tempered E-step, the SAME penalized weighted M-step as any other
-    beta -- SQUAREM-accelerated, `_em_accelerated`, warm from the
-    previous beta, A16 item 3), then the final beta = 1 fit IS the
-    penalized-likelihood fit any other caller sees. None if the
-    trajectory degenerates (a non-PD covariance or non-finite free
-    energy at any beta). Returns `_run_em`'s own dict shape plus
-    `beta_star`/`beta_trace` (A16 item 6)."""
+def _starts(X: np.ndarray, K: int, n_starts: int, seed: int):
+    """Deterministic in (X, seed) only -- never sees w (the estimator
+    must stay continuous in w, which is why the starts cannot depend on
+    it). Each of the `n_starts` starts is a standard k-means clustering
+    of X into K clusters (`scipy.cluster.vq.kmeans2`, `minit='++'`,
+    already a package dependency so no new one is added): a start's
+    means are the cluster centroids, its mixing weights the cluster
+    fractions, and each component's covariance is that cluster's own
+    population covariance. Successive starts draw their k-means seeding
+    from the same generator, so they differ from each other and the
+    whole sequence is reproducible in (X, seed) alone."""
+    rng = np.random.default_rng(seed)
     N = X.shape[0]
-    W = float(w.sum())
-    xbar = (w @ X) / W
-    pis, mus, Ss = _anneal_start(K, Scov, xbar)
-    trace = []
-    ll = None
-    try:
-        for beta in _beta_schedule():
-            ll0 = _penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen, beta)
-            if not np.isfinite(ll0):
-                return None
-            pis, mus, Ss, ll, _, _ = _em_accelerated(
-                Q, XP, w, W, pis, mus, Ss, ll0, tol, max_iter, Scov, a_pen, K, beta)
-            n_eff = int(np.sum(pis > _EFF_WEIGHT_FLOOR / N))
-            trace.append((float(beta), n_eff, float(ll)))
-    except np.linalg.LinAlgError:
-        return None
-    return dict(pis=pis, mus=mus, Ss=Ss, ll=ll, converged=True, n_iter=0,
-                beta_star=_last_change_beta(trace), beta_trace=trace)
+    data_cov = np.cov(X.T, bias=True)
+    S0 = np.array([data_cov[0, 0], data_cov[0, 1], data_cov[1, 1]]) / K
+    out = []
+    for _ in range(n_starts):
+        with warnings.catch_warnings():
+            # A cluster left empty by ++ seeding is not a failure here:
+            # its covariance below is not finite/PD and falls back to
+            # S0, or (if that leaves the start unusable) phase 1 drops
+            # the whole start, exactly as any other degenerate start.
+            warnings.simplefilter('ignore')
+            centroids, labels = kmeans2(X, K, iter=_KMEANS_ITER, minit='++', seed=rng)
+        pis0 = np.bincount(labels, minlength=K).astype(float) / N
+        mus0 = centroids.astype(float).copy()
+        Ss0 = np.empty((K, 3))
+        for k in range(K):
+            pts = X[labels == k]
+            if pts.shape[0] == 0:
+                Ss0[k] = S0
+                continue
+            c = np.cov(pts.T, bias=True)
+            a, b, cc = c[0, 0], c[0, 1], c[1, 1]
+            det = a * cc - b * b
+            # A covariance from fewer than 3 distinct points, or from
+            # collinear points, is singular (det <= 0): fall back to S0
+            # so no start is degenerate at birth.
+            Ss0[k] = (a, b, cc) if (np.isfinite(det) and det > 0.0) else S0
+        out.append((pis0, mus0, Ss0))
+    return out
 
 
 def _build_features(X: np.ndarray):
@@ -264,6 +239,14 @@ def _penalty_sum(SA, SB, SC, det, Scov: np.ndarray):
     s11, s12, s22 = Scov[0, 0], Scov[0, 1], Scov[1, 1]
     trace_k = (SA * s22 + SC * s11 - 2.0 * SB * s12) / det
     return float(np.sum(trace_k + np.log(det)))
+
+
+def _penalty_sum_batched(SA, SB, SC, det, Scov: np.ndarray, K: int, S: int):
+    """Same as `_penalty_sum` but per start: (K*S,) monomials -> (S,)
+    sums, one per start's own K components."""
+    s11, s12, s22 = Scov[0, 0], Scov[0, 1], Scov[1, 1]
+    trace_k = (SA * s22 + SC * s11 - 2.0 * SB * s12) / det
+    return (trace_k + np.log(det)).reshape(S, K).sum(axis=1)
 
 
 def _weighted_cov(Xc: np.ndarray, w: np.ndarray):
@@ -367,21 +350,16 @@ def _log_density_coeffs(pis: np.ndarray, mus: np.ndarray,
 
 
 def _e_step_fast(Q: np.ndarray, pis: np.ndarray, mus: np.ndarray,
-                  a: np.ndarray, b: np.ndarray, c: np.ndarray, det: np.ndarray,
-                  beta: float = 1.0):
-    """One (N,6) @ (6,K) matmul. Returns R (N,K) tempered responsibilities,
-    r_ik(beta) propto [pi_k phi_k(x_i)]^beta normalized over k
-    (spec/QIJ_mods_waves.md A16 item 3), and log_norm (N,) the matching
-    free-energy term log(sum_k [pi_k phi_k]^beta)/beta. `beta=1.0`
-    (every caller but `_anneal_fit`) reproduces the untempered E-step
-    bit for bit: multiplying/dividing by 1.0 changes no bit."""
+                  a: np.ndarray, b: np.ndarray, c: np.ndarray, det: np.ndarray):
+    """One (N,6) @ (6,K) matmul. Returns R (N,K) responsibilities and
+    log_norm (N,)."""
     C = _log_density_coeffs(pis, mus, a, b, c, det)
-    L = beta * (Q @ C)
+    L = Q @ C
     Lmax = L.max(axis=1)
     E = np.exp(L - Lmax[:, None])
     ssum = E.sum(axis=1)
     R = E / ssum[:, None]
-    log_norm = (Lmax + np.log(ssum)) / beta
+    log_norm = Lmax + np.log(ssum)
     return R, log_norm
 
 
@@ -416,25 +394,22 @@ def _m_step(w: np.ndarray, R: np.ndarray, XP: np.ndarray,
     return pis, mus, Ss
 
 
-def _penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen, beta=1.0):
-    """ell_p per unit weight at (pis, mus, Ss) (or, at `beta` != 1, the
-    matching tempered free energy, A16 item 3): the E-step's log-
+def _penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen):
+    """ell_p per unit weight at (pis, mus, Ss): the E-step's log-
     normalizer plus the penalty, no M-step. Raises np.linalg.LinAlgError
     if Ss is not PD."""
     a, b, c, det = _sigma_terms(Ss)
-    _, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det, beta)
+    _, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det)
     return float(np.dot(w, log_norm)) / W - a_pen * _penalty_sum(a, b, c, det, Scov) / W
 
 
-def _em_step(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, beta=1.0):
+def _em_step(Q, XP, w, W, pis, mus, Ss, Scov, a_pen):
     """One penalized-EM update -> (pis_new, mus_new, Ss_new, ll), `ll`
     at the INPUT (the E-step's by-product, so a caller needing both
-    pays no extra pass); tempered at `beta` (A16 item 3) -- the M-step
-    itself is the same penalized weighted one at every beta, only the
-    responsibilities `r` feeding it are tempered. Raises
-    np.linalg.LinAlgError if the input covariance is not PD."""
+    pays no extra pass). Raises np.linalg.LinAlgError if the input
+    covariance is not PD."""
     a, b, c, det = _sigma_terms(Ss)
-    r, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det, beta)
+    r, log_norm = _e_step_fast(Q, pis, mus, a, b, c, det)
     ll = float(np.dot(w, log_norm)) / W - a_pen * _penalty_sum(a, b, c, det, Scov) / W
     pis_new, mus_new, Ss_new = _m_step(w, r, XP, Scov, a_pen)
     return pis_new, mus_new, Ss_new, ll
@@ -453,7 +428,7 @@ def _feasible(pis: np.ndarray, Ss: np.ndarray) -> bool:
     return True
 
 
-def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m, beta=1.0):
+def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m):
     """One SQUAREM round, spending at most `budget` (>=1) EM steps
     (method_notes section 5: theta1, theta2 from two EM steps; r, v,
     alpha = -norm(r)/norm(v), held at most -1 so the step is never
@@ -463,20 +438,18 @@ def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m, beta=1.
     ll is below theta2's -- so the returned ll is always >= theta2's,
     hence monotone as plain EM is). `budget` < 3 skips the candidate
     trial and returns theta1 (`budget`==1) or theta2 (`budget`==2)
-    plain. `beta` (spec/QIJ_mods_waves.md A16 item 3) tempers every EM
-    step's E-step alike; `beta=1.0` is bit-identical to the untempered
-    round. Returns (pis, mus, Ss, ll, n_em, m) with ll at the RETURNED
+    plain. Returns (pis, mus, Ss, ll, n_em, m) with ll at the RETURNED
     point, n_em <= budget the EM steps used and m the step limit for
     the next round. Raises np.linalg.LinAlgError if (pis, mus, Ss) is
     already infeasible."""
     theta0 = _pack(K, pis, mus, Ss)
-    pis1, mus1, Ss1, _ = _em_step(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, beta)
+    pis1, mus1, Ss1, _ = _em_step(Q, XP, w, W, pis, mus, Ss, Scov, a_pen)
     if budget == 1:
-        return pis1, mus1, Ss1, _penalized_ll(Q, w, W, pis1, mus1, Ss1, Scov, a_pen, beta), 1, m
+        return pis1, mus1, Ss1, _penalized_ll(Q, w, W, pis1, mus1, Ss1, Scov, a_pen), 1, m
 
     theta1 = _pack(K, pis1, mus1, Ss1)
-    pis2, mus2, Ss2, _ = _em_step(Q, XP, w, W, pis1, mus1, Ss1, Scov, a_pen, beta)
-    ll2 = _penalized_ll(Q, w, W, pis2, mus2, Ss2, Scov, a_pen, beta)
+    pis2, mus2, Ss2, _ = _em_step(Q, XP, w, W, pis1, mus1, Ss1, Scov, a_pen)
+    ll2 = _penalized_ll(Q, w, W, pis2, mus2, Ss2, Scov, a_pen)
     if budget == 2:
         return pis2, mus2, Ss2, ll2, 2, m
 
@@ -495,8 +468,8 @@ def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m, beta=1.
     if _feasible(pis_sq, Ss_sq):
         try:
             pis3, mus3, Ss3, _ = _em_step(Q, XP, w, W, pis_sq, mus_sq, Ss_sq,
-                                           Scov, a_pen, beta)
-            ll3 = _penalized_ll(Q, w, W, pis3, mus3, Ss3, Scov, a_pen, beta)
+                                           Scov, a_pen)
+            ll3 = _penalized_ll(Q, w, W, pis3, mus3, Ss3, Scov, a_pen)
         except np.linalg.LinAlgError:
             ll3 = None
         if ll3 is not None and np.isfinite(ll3) and ll3 >= ll2:
@@ -505,21 +478,19 @@ def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m, beta=1.
     return pis2, mus2, Ss2, ll2, 2, m
 
 
-def _em_accelerated(Q, XP, w, W, pis, mus, Ss, ll, tol, max_iter, Scov, a_pen, K, beta=1.0):
+def _em_accelerated(Q, XP, w, W, pis, mus, Ss, ll, tol, max_iter, Scov, a_pen, K):
     """SQUAREM rounds (`_squarem_round`) from (pis, mus, Ss) with its own
     `ll`, to `tol` or `max_iter` EM steps (each round costs 1-3, method_notes
-    section 5), tempered at `beta` (spec/QIJ_mods_waves.md A16 item 3;
-    `beta=1.0`, every caller but `_anneal_fit`, is bit-identical to the
-    untempered loop). Returns (pis, mus, Ss, ll, n_used, converged).
-    Raises np.linalg.LinAlgError on a degenerate covariance anywhere
-    along the trajectory."""
+    section 5). Returns (pis, mus, Ss, ll, n_used, converged). Raises
+    np.linalg.LinAlgError on a degenerate covariance anywhere along the
+    trajectory."""
     n_used = 0
     converged = False
     m = 4.0
     while n_used < max_iter:
         budget = max_iter - n_used
         pis, mus, Ss, ll_new, n_em, m = _squarem_round(
-            Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m, beta)
+            Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m)
         if not np.isfinite(ll_new):
             raise np.linalg.LinAlgError('non-finite penalized log-likelihood')
         n_used += n_em
@@ -550,6 +521,157 @@ def _run_em(Q, XP, w, pis0, mus0, Ss0, tol, max_iter, Scov, a_pen):
     except np.linalg.LinAlgError:
         return None
     return dict(pis=pis, mus=mus, Ss=Ss, ll=ll, converged=converged, n_iter=n_used)
+
+
+def _sigma_terms_batched(Ss: np.ndarray):
+    """Same monomials as `_sigma_terms` but never raises: a batched
+    start's non-PD covariance turns to NaN/Inf confined to its own
+    columns, checked once after the loop (`_phase1_batch`)."""
+    a = Ss[:, 0]
+    b = Ss[:, 1]
+    c = Ss[:, 2]
+    det = a * c - b * b
+    return a, b, c, det
+
+
+def _e_step_batched(Q: np.ndarray, pis: np.ndarray, mus: np.ndarray,
+                     a: np.ndarray, b: np.ndarray, c: np.ndarray, det: np.ndarray,
+                     K: int, S: int):
+    """One (N,6) @ (6, K*S) matmul; softmax normalized per start (block
+    of K columns), so one start's numbers never leak into another's
+    responsibilities. Returns R (N, K*S), log_norm (N, S)."""
+    N = Q.shape[0]
+    C = _log_density_coeffs(pis, mus, a, b, c, det)
+    L = Q @ C
+    L3 = L.reshape(N, S, K)
+    Lmax = L3.max(axis=2, keepdims=True)
+    E = np.exp(L3 - Lmax)
+    ssum = E.sum(axis=2, keepdims=True)
+    R3 = E / ssum
+    log_norm = Lmax[:, :, 0] + np.log(ssum[:, :, 0])
+    return R3.reshape(N, K * S), log_norm
+
+
+def _m_step_batched(w: np.ndarray, R: np.ndarray, XP: np.ndarray, K: int, S: int,
+                     Scov: np.ndarray, a_pen: float):
+    """Same moments as `_m_step`, and the same penalized Sigma_k
+    blend (`Scov`, `a_pen` are the same for every start -- they depend
+    on (X, w) alone), for all K*S components at once; only the mixing-
+    weight normalization is taken within each start's own K components,
+    not across all K*S."""
+    rw = w[:, None] * R
+    n_k = rw.sum(axis=0)
+    M = rw.T @ XP
+    n_k3 = n_k.reshape(S, K)
+    denom = n_k3.sum(axis=1)
+    pis = (n_k3 / denom[:, None]).reshape(K * S)
+    mux = M[:, 0] / n_k
+    muy = M[:, 1] / n_k
+    Exx = M[:, 2] / n_k
+    Exy = M[:, 3] / n_k
+    Eyy = M[:, 4] / n_k
+    S11_raw = Exx - mux * mux
+    S12_raw = Exy - mux * muy
+    S22_raw = Eyy - muy * muy
+    denom_pen = n_k + 2.0 * a_pen
+    S11 = (n_k * S11_raw + 2.0 * a_pen * Scov[0, 0]) / denom_pen
+    S12 = (n_k * S12_raw + 2.0 * a_pen * Scov[0, 1]) / denom_pen
+    S22 = (n_k * S22_raw + 2.0 * a_pen * Scov[1, 1]) / denom_pen
+    mus = np.stack([mux, muy], axis=-1)
+    Ss = np.stack([S11, S12, S22], axis=-1)
+    return pis, mus, Ss
+
+
+def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
+                   K: int, iters: int, Scov: np.ndarray, a_pen: float):
+    """Run every start in `starts` for exactly `iters` EM iterations,
+    batched in lockstep (one E-step matmul, one M-step matmul per
+    iteration, S = len(starts)), M-step the penalized one; no
+    convergence test, no per-iteration bookkeeping (so no per-iteration
+    penalized `ll` either -- only the trailing one, used for ranking).
+    Degeneracy is checked once, after the loop, start by start -- the
+    batched matmuls are column-blocked per start, so a NaN in one
+    start's columns cannot reach another's. Returns a list of dicts
+    (`_run_em`'s shape, `converged=False`, `n_iter=iters` always), one
+    per surviving start."""
+    S = len(starts)
+    W = float(w.sum())
+    pis = np.concatenate([s[0] for s in starts])
+    mus = np.concatenate([s[1] for s in starts], axis=0)
+    Ss = np.concatenate([s[2] for s in starts], axis=0)
+
+    with np.errstate(all='ignore'):
+        for _ in range(iters):
+            a, b, c, det = _sigma_terms_batched(Ss)
+            R, _ = _e_step_batched(Q, pis, mus, a, b, c, det, K, S)
+            pis, mus, Ss = _m_step_batched(w, R, XP, K, S, Scov, a_pen)
+
+        # One trailing E-step pairs the reported ll with the last M-step.
+        a, b, c, det = _sigma_terms_batched(Ss)
+        _, log_norm = _e_step_batched(Q, pis, mus, a, b, c, det, K, S)
+        ll_raw = (w @ log_norm) / W  # (S,)
+        ll = ll_raw - a_pen * _penalty_sum_batched(a, b, c, det, Scov, K, S) / W
+
+    pis_s = pis.reshape(S, K)
+    mus_s = mus.reshape(S, K, 2)
+    Ss_s = Ss.reshape(S, K, 3)
+
+    out = []
+    for s in range(S):
+        ll_i = float(ll[s])
+        pis_i, mus_i, Ss_i = pis_s[s], mus_s[s], Ss_s[s]
+        if not (np.isfinite(ll_i) and np.all(np.isfinite(pis_i))
+                and np.all(np.isfinite(mus_i))):
+            continue
+        try:
+            _sigma_terms(Ss_i)
+        except np.linalg.LinAlgError:
+            continue
+        out.append(dict(pis=pis_i.copy(), mus=mus_i.copy(), Ss=Ss_i.copy(),
+                         ll=ll_i, converged=False, n_iter=iters))
+    return out
+
+
+def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter, Scov, a_pen):
+    """Pool = every surviving start, ranked by penalized weighted log-
+    likelihood (ell_p/W), via the two-phase screen: phase 1 runs
+    every start's short budget in lockstep (`_phase1_batch`); the best
+    few are carried, one at a time, to `max_iter` (phase 2, sequential
+    `_run_em`). Starts are the `n_starts` k-means starts (`_starts`),
+    the greedy-EM insertion start of A12 at `seeding.py`'s own 50*K
+    cells, a second at `_GREEDY_CELL_FACTOR_2`*K cells (A15), and that
+    second start's own `_GREEDY_VARIANT_FACTORS` covariance-scaled
+    variants (A12 item 6) -- appended after the k-means starts and the
+    50*K one, so their presence never reorders or drops any start the
+    ported pool already had. `seeding.greedy_em_start` takes this module's own
+    `_em_accelerated`/`_penalized_ll` as arguments rather than importing
+    this module (seeding.py must not import gmm.py, which already
+    imports it)."""
+    starts = _starts(X, K, n_starts, seed)
+    starts += greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, tol, max_iter,
+                               em_accelerated=_em_accelerated, penalized_ll=_penalized_ll)
+    greedy2 = greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, tol, max_iter,
+                               em_accelerated=_em_accelerated, penalized_ll=_penalized_ll,
+                               cell_factor=_GREEDY_CELL_FACTOR_2)
+    if greedy2:
+        starts += greedy2 + scaled_variants(greedy2[0], _GREEDY_VARIANT_FACTORS)
+    phase1_budget = min(_SHORT_ITERS, max_iter)
+
+    screened = _phase1_batch(Q, XP, w, starts, K, phase1_budget, Scov, a_pen)
+    if not screened:
+        return None
+
+    screened.sort(key=lambda r: -r['ll'])
+    top = screened[:min(_PROMOTE_N, len(screened))]
+    finished = []
+    for r in top:
+        res = _run_em(Q, XP, w, r['pis'], r['mus'], r['Ss'], tol, max_iter,
+                       Scov, a_pen)
+        if res is not None:
+            finished.append(res)
+    if not finished:
+        return None
+    return max(finished, key=lambda r: r['ll'])
 
 
 def _canonical_sort(pis, mus, Ss):
@@ -758,28 +880,23 @@ def _cholesky_ok(A: np.ndarray) -> bool:
 def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
          eta: float, reference=None, start: np.ndarray = None):
     """None on failure; else dict(theta, pis, mus, Ss, psi, A, ll,
-    score_history, polished, resid, beta_star, beta_trace) -- the
-    penalized-likelihood estimand (method_notes section 5). `ll` is
-    ell_p/W; `A` is the penalized observed information; `psi` is the raw
-    mixture score plus the per-point sensitivity of the penalty to that
-    point's own weight. `beta_star`/`beta_trace` are A16 items 6-7's
-    annealing diagnostics (NaN/empty for a continuation, which never
-    anneals). Operates in the caller's own (already-centered)
-    coordinates with the caller's own (X-only) `Q`, `XP`. Components are
-    labelled against `start`'s own components (min-Bhattacharyya
-    assignment) when `start` is given; otherwise by `reference` when
-    given, else ordered by ascending first-mean coordinate.
+    score_history, polished, resid) -- the penalized-likelihood
+    estimand (method_notes section 5). `ll` is ell_p/W; `A` is the
+    penalized observed information; `psi` is the raw mixture score plus
+    the per-point sensitivity of the penalty to that point's own
+    weight. Operates in the caller's own (already-centered) coordinates
+    with the caller's own (X-only) `Q`, `XP`. Components are labelled
+    against `start`'s own components (min-Bhattacharyya assignment)
+    when `start` is given; otherwise by `reference` when given, else
+    ordered by ascending first-mean coordinate.
 
     With `start` (theta (p,) in this function's own centered, packed
     layout) given, a single accelerated-EM run (`_run_em`) from `start`
-    at the given `w` replaces the cold annealed search below (A16 item
-    5: a continuation never anneals, since annealing would erase the
-    branch a derivative depends on); everything after (labelling
-    against `start`, Newton gate, polish, acceptance) is unchanged, so
-    the perturbed fit is the continuation of `start`, never a fresh cold
-    fit, and never relabelled away from it. Without `start`, the cold
-    fit is deterministic annealing EM (`_anneal_fit`, spec/
-    QIJ_mods_waves.md A16), the estimator's only cold search.
+    at the given `w` replaces the multi-start search below; everything
+    after (labelling against `start`, Newton gate, polish, acceptance)
+    is unchanged, so the perturbed fit is the continuation of `start`,
+    never a fresh multi-start winner, and never relabelled away from
+    it. Without `start`, unchanged (bit-identical).
 
     Newton gate: the polish only runs once -H (`A`) is PD (a Cholesky
     succeeds); otherwise one more block of accelerated EM (the same
@@ -789,7 +906,8 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     W, a_pen, Scov, d = _weighted_cov(X, w)
 
     if start is None:
-        best = _anneal_fit(X, Q, XP, w, cfg.K, cfg.tol, cfg.max_iter, Scov, a_pen)
+        best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
+                                   cfg.tol, cfg.max_iter, Scov, a_pen)
     else:
         pis0, mus0, Ss0 = _unpack(cfg.K, start)
         best = _run_em(Q, XP, w, pis0, mus0, Ss0, cfg.tol, cfg.max_iter,
@@ -797,8 +915,6 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     if best is None:
         return None
     pis, mus, Ss = best['pis'], best['mus'], best['Ss']
-    beta_star = best.get('beta_star', float('nan'))
-    beta_trace = best.get('beta_trace', [])
 
     # A continuation is labelled against START's own components (min
     # Bhattacharyya assignment, A6's machinery), never the canonical
@@ -892,8 +1008,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     psi_full = psi + extra
 
     return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, psi=psi_full, A=A, ll=ll,
-                score_history=score_history, polished=polished, resid=resid,
-                beta_star=beta_star, beta_trace=beta_trace)
+                score_history=score_history, polished=polished, resid=resid)
 
 
 def _center_start(start, K: int, xmean: np.ndarray):
@@ -912,46 +1027,31 @@ def _center_start(start, K: int, xmean: np.ndarray):
     return start_c
 
 
-def _uncenter_theta(theta: np.ndarray, K: int, xmean: np.ndarray) -> np.ndarray:
-    """A copy of `_fit`'s own centered `theta` shifted into T's own
-    (uncentered) output layout -- the inverse of `_center_start`, and
-    the one place every public method builds its returned/cached theta,
-    so `self.last_fit_info['theta']` is always in the same layout a
-    caller could pass back in as `start`."""
-    theta = theta.copy()
-    for k in range(K):
-        mx, my = _idx_mu(K, k)
-        theta[mx] += xmean[0]
-        theta[my] += xmean[1]
-    return theta
-
-
 class GMM2D:
     """See module docstring. `T(X, w) -> ndarray(p,)`, `T.influence(X,
     w) -> ndarray(N, p)`, `T.fit_and_influence(X, w) -> (ndarray(p,),
-    ndarray(N, p))`; all three accept `K`, `tol`, `max_iter` as per-call
-    keyword overrides, an optional `prep` from `T.prepare(X)`, an
-    optional `start` (theta (p,) in `T`'s own output layout: a
-    continuation of a previous fit, see module docstring), and an
-    optional `eta`: when given, it replaces `self.eta` in the polish's
-    acceptance rule for that call alone (spec/QIJ_mods_waves.md A15's
-    measured eta_full), leaving `self.eta` itself untouched for every
-    other call. With `start` given, all three label components against
-    `start`'s own components (never `self.reference`, and never the
-    canonical sort); without it, against `self.reference` (method_notes
-    section 5) when it is not None, else the canonical sort. `self.name`,
-    `self.outputs`, `self.eta`, `self.p` are fixed at construction from
-    the constructor's own `K`. The cold search (A16) is deterministic
-    annealing, which needs no seed: `self.last_fit_info` is a diagnostic
-    side channel (never read by T itself) exposing the most recent
-    call's `beta_star`/`beta_trace`/`ll` (A16 items 6-7), None before any
-    call or after a failed one."""
+    ndarray(N, p))`; all three accept `K`, `n_starts`, `seed`, `tol`,
+    `max_iter` as per-call keyword overrides, an optional `prep` from
+    `T.prepare(X)`, an optional `start` (theta (p,) in `T`'s own
+    output layout: a continuation of a previous fit, see module
+    docstring), and an optional `eta`: when given, it replaces
+    `self.eta` in the polish's acceptance rule for that call alone
+    (spec/QIJ_mods_waves.md A15's measured eta_full), leaving `self.eta`
+    itself untouched for every other call. With `start` given, all three
+    label components against `start`'s own components (never
+    `self.reference`, and never the canonical sort); without it, against
+    `self.reference` (method_notes section 5) when it is not None, else
+    the canonical sort. `self.name`, `self.outputs`, `self.eta`,
+    `self.p` are fixed at construction from the constructor's own `K`."""
 
     name = 'gmm2d'
     takes_start = True
 
-    def __init__(self, K: int, tol: float = 1e-8, max_iter: int = 500, reference=None):
+    def __init__(self, K: int, n_starts: int = 20, seed: int = 0,
+                 tol: float = 1e-8, max_iter: int = 500, reference=None):
         self.K = int(K)
+        self.n_starts = int(n_starts)
+        self.seed = int(seed)
         self.tol = float(tol)
         self.max_iter = int(max_iter)
         self.reference = reference
@@ -959,21 +1059,13 @@ class GMM2D:
         self.p = (self.K - 1) + 5 * self.K
         self.outputs = _make_outputs(self.K)
         self.eta = _ETA
-        self._last_fit = None
-
-    @property
-    def last_fit_info(self):
-        """The most recent call's raw fit dict (`_fit`'s own shape:
-        `beta_star`, `beta_trace`, `ll`, ... -- A16 items 6-7), or None
-        before any call or after a failed one. A diagnostic side channel
-        only: never read by T itself, so the returned theta/psi never
-        depend on it (purity holds)."""
-        return self._last_fit
 
     def _resolve(self, kwargs: dict) -> _Cfg:
         K = int(kwargs.get('K', self.K))
         return _Cfg(
             K=K,
+            n_starts=int(kwargs.get('n_starts', self.n_starts)),
+            seed=int(kwargs.get('seed', self.seed)),
             tol=float(kwargs.get('tol', self.tol)),
             max_iter=int(kwargs.get('max_iter', self.max_iter)),
             p=(K - 1) + 5 * K,
@@ -999,13 +1091,14 @@ class GMM2D:
             eta_use = self.eta if eta is None else eta
             fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
             if fit is None:
-                self._last_fit = None
                 return np.full(cfg.p, np.nan)
-            theta = _uncenter_theta(fit['theta'], cfg.K, xmean)
-            self._last_fit = dict(fit, theta=theta)
+            theta = fit['theta']
+            for k in range(cfg.K):
+                mx, my = _idx_mu(cfg.K, k)
+                theta[mx] += xmean[0]
+                theta[my] += xmean[1]
             return theta
         except Exception:
-            self._last_fit = None
             return np.full(cfg.p, np.nan)
 
     def influence(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
@@ -1019,9 +1112,7 @@ class GMM2D:
             eta_use = self.eta if eta is None else eta
             fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
             if fit is None:
-                self._last_fit = None
                 return np.full((N, cfg.p), np.nan)
-            self._last_fit = dict(fit, theta=_uncenter_theta(fit['theta'], cfg.K, xmean))
             A = fit['A']
             if np.linalg.cond(A) > _COND_MAX:
                 return np.full((N, cfg.p), np.nan)
@@ -1030,14 +1121,13 @@ class GMM2D:
                 return np.full((N, cfg.p), np.nan)
             return IF
         except Exception:
-            self._last_fit = None
             return np.full((N, cfg.p), np.nan)
 
     def fit_and_influence(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
                            start: np.ndarray = None, eta: float = None, **kwargs):
         """(theta (p,), psi (N,p)) from a single fit -- for a caller that
         wants both (`ij`, always), `T(X,w)` then `T.influence(X,w)` pays
-        for the cold search twice."""
+        for the multi-start search twice."""
         cfg = self._resolve(kwargs)
         N = len(X)
         nan_theta = np.full(cfg.p, np.nan)
@@ -1049,10 +1139,12 @@ class GMM2D:
             eta_use = self.eta if eta is None else eta
             fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
             if fit is None:
-                self._last_fit = None
                 return nan_theta, nan_psi
-            theta = _uncenter_theta(fit['theta'], cfg.K, xmean)
-            self._last_fit = dict(fit, theta=theta)
+            theta = fit['theta'].copy()
+            for k in range(cfg.K):
+                mx, my = _idx_mu(cfg.K, k)
+                theta[mx] += xmean[0]
+                theta[my] += xmean[1]
             A = fit['A']
             if np.linalg.cond(A) > _COND_MAX:
                 return theta, nan_psi
@@ -1061,26 +1153,4 @@ class GMM2D:
                 return theta, nan_psi
             return theta, IF
         except Exception:
-            self._last_fit = None
             return nan_theta, nan_psi
-
-    def score_at(self, X: np.ndarray, w: np.ndarray, theta: np.ndarray,
-                 prep: tuple = None) -> Tuple[float, float]:
-        """(ll, resid): the penalized log-likelihood and Newton score
-        norm of a given `theta` (T's own output layout) at (X, w) -- no
-        fitting, the same objective `_fit`'s own acceptance and polish
-        read, for a caller scoring an externally supplied point (the
-        search audit's cold fit and truth continuation,
-        spec/QIJ_mods_waves.md A16.7) against one another. (nan, nan) if
-        `theta`'s covariances are not PD or the computation fails."""
-        try:
-            w = np.asarray(w, dtype=float)
-            xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
-            theta_c = _center_start(np.asarray(theta, dtype=float), self.K, xmean)
-            pis, mus, Ss = _unpack(self.K, theta_c)
-            W, a_pen, Scov, _d = _weighted_cov(Xc, w)
-            _, _, ll, psi_bar = _score_info_penalized(Xc, Q, w, self.K, pis, mus, Ss,
-                                                        Scov, a_pen, W)
-            return ll, float(np.linalg.norm(psi_bar))
-        except Exception:
-            return float('nan'), float('nan')

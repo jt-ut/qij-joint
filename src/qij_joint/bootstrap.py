@@ -24,39 +24,25 @@ from typing import Optional
 
 import numpy as np
 
-from . import registry
 from .core.eta import measure_eta_full
 from .parallel import Pool, call_T
 from .result import BootstrapResult
 
-_NO_COLD_DIAG = dict(beta_star=float('nan'), cold_ll=float('nan'),
-                      search_gap=float('nan'), search_failed=False)
 
-
-def _theta_hat_task(T, case, X: np.ndarray, task):
+def _theta_hat_task(T, case, X: np.ndarray, _task):
     """T(X, ones(N)) on the shared draw: the bootstrap's own full-data
     point estimate (spec/QIJ_mods_waves.md A10), submitted to the pool
     at the start of `fit` so it overlaps with the first replicate
     chunks rather than blocking them, and computed outside the resample
     loop's own RNG stream. A failing evaluation is caught here, this
-    task's own declared failure boundary. `task` = (dataset, estimator)
-    for `registry.cold_fit_diagnostics` (A16 items 6-7), read in THIS
-    worker immediately after the cold fit, before any replicate's own
-    `start=theta_hat` continuation could touch `T.last_fit_info` --
-    `theta_hat`'s own fit runs in a separate process from `Bootstrap.fit`
-    whenever `workers > 1`, so the diagnostics must be read here, not
-    after `.result()`. Returns (evaluation, this call's own wall time,
-    the diagnostics dict)."""
-    dataset, estimator = task
+    task's own declared failure boundary. Returns (evaluation, this
+    call's own wall time)."""
     t0 = time.perf_counter()
     try:
         result = np.asarray(call_T(T, X, np.ones(len(X))), dtype=float)
     except Exception:
         result = np.full(len(T.outputs), np.nan)
-    wall = time.perf_counter() - t0
-    diag = (registry.cold_fit_diagnostics(T, X, result, dataset, estimator)
-            if dataset is not None else dict(_NO_COLD_DIAG))
-    return result, wall, diag
+    return result, time.perf_counter() - t0
 
 
 def _boot_task(T, case, X: np.ndarray, task):
@@ -86,8 +72,7 @@ class Bootstrap:
         self.B = B
         self.seed = seed
 
-    def fit(self, X: np.ndarray, T, pool: Optional[Pool] = None,
-            dataset: str = None, estimator: str = None) -> BootstrapResult:
+    def fit(self, X: np.ndarray, T, pool: Optional[Pool] = None) -> BootstrapResult:
         """Draw `B` resamples of `X`, evaluate `T` on each, in chunks of
         about `B / (4 * workers)` replicates; up to `workers` chunks run
         on `pool` at once (an in-process `Pool(1)` when none is given),
@@ -96,9 +81,7 @@ class Bootstrap:
         `T.takes_start`, `theta_hat` is awaited up front, `eta_full`
         (spec/QIJ_mods_waves.md A15) is measured from it once, and every
         chunk carries both as the replicates' warm start and polish
-        tolerance. `dataset`/`estimator`, when given, name this draw's
-        case for `registry.cold_fit_diagnostics` (A16 items 6-7),
-        computed in `_theta_hat_task`'s own worker process."""
+        tolerance."""
         X = np.asarray(X)
         N, q = len(X), len(T.outputs)
         own_pool = pool is None
@@ -108,15 +91,14 @@ class Bootstrap:
         rng = np.random.default_rng(self.seed)
         probs = np.full(N, 1.0 / N)
         pool.share(X)
-        theta_future = pool.submit(_theta_hat_task, (dataset, estimator))
+        theta_future = pool.submit(_theta_hat_task, None)
 
         warm = getattr(T, 'takes_start', False)
         busy_time = 0.0
         theta_hat = None
         eta_full = T.eta
-        cold_diag = dict(_NO_COLD_DIAG)
         if warm:
-            theta_hat, theta_wall, cold_diag = theta_future.result()
+            theta_hat, theta_wall = theta_future.result()
             busy_time += theta_wall
             t_eta0 = time.perf_counter()
             eta_full, _ = measure_eta_full(T, X, theta_hat)
@@ -149,7 +131,7 @@ class Bootstrap:
                 busy_time += wall
 
         if not warm:
-            theta_hat, theta_wall, cold_diag = theta_future.result()
+            theta_hat, theta_wall = theta_future.result()
             busy_time += theta_wall
         wall_time = time.perf_counter() - t_start
         if own_pool:
@@ -159,5 +141,5 @@ class Bootstrap:
         return BootstrapResult(
             outputs=T.outputs, theta_hat=theta_hat, replicates=replicates,
             n_degenerate=n_degenerate, wall_time=wall_time, busy_time=busy_time,
-            workers=workers, eta_full=eta_full, **cold_diag,
+            workers=workers, eta_full=eta_full,
         )

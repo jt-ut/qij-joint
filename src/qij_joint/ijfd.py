@@ -98,7 +98,6 @@ from typing import Dict, Tuple
 
 import numpy as np
 
-from . import registry
 from .core import abc as core_abc
 from .core.abc import _curvature_task
 from .core.counter import Counter
@@ -144,10 +143,6 @@ class IJFDResult:
     step_ratio: np.ndarray         # (10, q); step 5
     nan_fraction: float            # perturbed fits that returned NaN, over all such fits run
     psi: np.ndarray                # (N, q_full); see the class docstring
-    beta_star: float                # A16 item 6, from T.last_fit_info; NaN for a non-annealed T
-    cold_ll: float                  # A16 item 6, the cold fit's final penalized log-likelihood
-    search_gap: float                # A16.7's search audit (spec/QIJ_mods_waves.md)
-    search_failed: bool              # A16.7's search audit
 
     @property
     def variance(self) -> np.ndarray:
@@ -207,8 +202,6 @@ def _failed_result(outputs: Tuple[str, ...], outputs_full: Tuple[str, ...], N: i
         wall_time_total=wall, busy_time_total=wall, workers=workers,
         step_ratio=np.full((_N_CHECK_POINTS, q), np.nan), nan_fraction=1.0,
         psi=np.full((N, q_full), np.nan),
-        beta_star=float('nan'), cold_ll=float('nan'),
-        search_gap=float('nan'), search_failed=False,
     )
 
 
@@ -374,15 +367,9 @@ class IJFD:
     def __init__(self, point_curvature: bool = False) -> None:
         self.point_curvature = point_curvature
 
-    def fit(self, X: np.ndarray, T, pool=None, dataset: str = None,
-            estimator: str = None) -> IJFDResult:
+    def fit(self, X: np.ndarray, T, pool=None) -> IJFDResult:
         """Run A13's draw on one draw; the backward pass and the ABC
-        ingredients only when `point_curvature` (module docstring).
-        `dataset`/`estimator`, when given, name this draw's case for
-        `registry.cold_fit_diagnostics` (A16 items 6-7): read
-        IMMEDIATELY after step 1's cold fit, before any later
-        continuation call can overwrite `T.last_fit_info`. NaN/False
-        throughout when not given (no truth to audit against)."""
+        ingredients only when `point_curvature` (module docstring)."""
         t_start = time.perf_counter()
         X = np.asarray(X)
         N = len(X)
@@ -408,10 +395,6 @@ class IJFD:
             return _failed_result(outputs, outputs_full, N, workers, counter, t_start,
                                    self.point_curvature)
         ev_cold, rows_cold = counter.snapshot()
-        # A16 items 6-7: read `T.last_fit_info` and spend the search
-        # audit's own continuation now, before any of steps 3-5's own
-        # `start=theta_hat` continuations below overwrite it.
-        cold_diag = registry.cold_fit_diagnostics(T, X, theta_hat, dataset, estimator)
 
         # Step 2 (core/eta.py::measure_eta_full, A13 step 2 / A15):
         # every point its own "field" (row_field = its own index) when
@@ -503,5 +486,4 @@ class IJFD:
             eta_full=eta_full, evals_by_stage=evals_by_stage, rows_by_stage=rows_by_stage,
             wall_time_total=wall_time_total, busy_time_total=busy_time_total, workers=workers,
             step_ratio=step_ratio, nan_fraction=n_perturbed_failed / n_perturbed_total, psi=psi,
-            **cold_diag,
         )

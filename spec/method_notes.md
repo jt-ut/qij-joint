@@ -8,8 +8,8 @@ implements, once.
 
 ## 1. The weight constructor and step rule
 
-For a member set K of mass p in base weights omega0 (summing to the
-row count R), the one weight constructor is
+For a member set K of mass p in base weights omega0 (of any
+total), the one weight constructor is
 
     omega_i(t) = (1 - t) * omega0_i + t * omega0_i * 1{i in K} / p
 
@@ -83,7 +83,8 @@ the field's native population covariance (so a rank-deficient field --
 collinear points -- needs no regularization: a zero eigenvalue maps
 every vertex's component along it to zero), first vertex along the
 field's leading eigenvector by a fixed reflection of the canonical
-simplex, each row weight M_used*p_j/(d_x+1). Either representation
+simplex, each row weight N*p_j/(d_x+1) = n_j/(d_x+1), so the rows' weights
+sum to N, the number of points they stand for. Either representation
 reproduces the field's native mean and covariance exactly. A forward
 step at prototype j scales EVERY row of field j by the same factor
 (1-t_j) + t_j/p_j, every other row by (1-t_j) -- the points path's own

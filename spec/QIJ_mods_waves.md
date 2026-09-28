@@ -337,10 +337,17 @@ Under `moments`, receptive field j is represented by
 Either representation reproduces the field's mean and covariance exactly
 (the first also every higher moment); d_x + 1 is the smallest number of
 points that can carry a rank-d_x covariance, so no constant and no
-regularization enter. **Normalization (ruled 27 September):** the survey
-rows' weights are scaled to sum to the row count R = Σ_j min(n_j, d_x + 1),
-so that every caller of T satisfies Σω = rows, the estimator contract; the
-penalty's a is then 1/R on the survey rows. (The first build summed them to
+regularization enter. **Normalization (corrected 28 September):** the
+survey rows' weights sum to N, field j's rows carrying n_j in total, since
+the rows stand for the N points. An estimator whose value depends on the
+weight total is then the same estimator on the rows as on the data: the
+mixture's penalty is a = 1/N on both. The 27 September rule (weights
+summing to the row count R ≈ 3 300) made the penalty 1/R on the survey
+rows, about nine times stronger relative to the likelihood than on the
+data; the quantized fit then pulled the compact component P2's covariance
+toward the global one, which was the demo's survey error (P2's angle
+r² 0.23 against the true receptive-field means; 0.95 with weights summing
+to N). (The first build summed them to
 M_𝒳 and the mixture estimator's Newton step, which normalizes its score by
 Σω and its information by the row count, came out three times too long.)
 **Estimator-side ruling:** `GMM2D` is to normalize its information by Σω
@@ -875,6 +882,11 @@ reports the per-output difference and its sign. No other run.
 
 ### A15. The consolidated repair round (author's instruction, 28 September): the marginal refinement gets a measured trigger
 
+**Withdrawn (28 September): item 1 (the measured trigger, rounds 1–4), item 2 and item 3's
+demo setting are removed from the code; the refinement is the ported rule. The shortfall they
+chased was the survey's weight normalization (A8, corrected). The bookkeeping fixes, η_full
+and the Newton cap stand.**
+
 **The finding it repairs (rehearsal + diagnostics, draws 0 and 1 of the
 demo).** QIJ's between-bin variance reached 57–93% of the analytic
 influence variance at ε = 0.01 on every measured output, with the position
@@ -1021,6 +1033,11 @@ next step is the next diagnosis from the rerun's products and the next
 repair to the method; the estimand does not change.
 
 ### A16. Deterministic annealing as the mixture estimator's search (author's ruling, 28 September)
+
+**Withdrawn (28 September).** As built, the annealing never left its start (all K
+components at the sample mean; the per-step perturbation of item 3 was not in the
+code), so every cold fit on the demo returned NaN. The multistart search of A12
+(`seeding.py`) is restored, with the search audit and its products removed.
 
 **Why.** Every cold fit in the study, and all ten thousand of the oracle's,
 must reach the right basin without knowing the truth, or the search's
@@ -1308,17 +1325,3 @@ the joint count. No bootstrap. One table. Report as found.
 Wave A first, audited and measured; then wave B on top of it. B assumes
 A's switches exist but does not depend on their values. Item 4 is ruled
 (A4) and item 7 is closed (B6); nothing in either wave waits on a ruling.
-
-### A17. The stencils update the influence model (author's instruction, 28 September)
-
-Specified in full in `QIJ_A17_stencil_update.md`; the diagnosis it rests
-on is `QIJ_stage2_groundup.md`. In one sentence: every full-data stencil
-(initial bin or refinement split) is an exact observation of the mean of
-the influence over a known set of points for every output, and it enters
-every output's influence model as such, so every open leaf of every
-output is re-proposed from a model corrected by what has been measured.
-New switch `refine_update` (`none` = ported, default; `stencils` = the
-demo). A15 items 1–5 (`refine_trigger` and the flagged-lineage
-machinery) are superseded and removed; A15's η_full, local width and
-bookkeeping fixes stand. Acceptance runs first on the planner's exact
-offline simulator, then as the A15 rehearsal gate.

@@ -122,15 +122,6 @@ class QIJResult:
                                     # without `takes_start`
     survey_step_ratio: np.ndarray  # (5, q) A9 item 4; NaN rows/columns as eta_Q is
     quantized_start: str           # 'multistart' or 'full-data' (A9 item 5)
-    refine_trigger: str            # 'gain' or 'measured' (A15); inert under 'joint'
-    a_c: np.ndarray                # (q,) A15 item 6's measured-trigger scale factor; NaN under 'gain'
-    n_flagged: np.ndarray          # (q,) int; initial bins flagged; 0 under 'gain'
-    n_flag_evals: np.ndarray       # (q,) int; evaluations on flagged lineages; 0 under 'gain'
-    n_geom_splits: np.ndarray      # (q,) int; GEOMETRIC splits taken; 0 under 'gain'
-    beta_star: float               # A16 item 6, from theta_hat's own T.last_fit_info
-    cold_ll: float                 # A16 item 6, theta_hat's own final penalized log-likelihood
-    search_gap: float              # A16.7's search audit
-    search_failed: bool            # A16.7's search audit
 
     @property
     def variance(self) -> np.ndarray:
@@ -176,10 +167,6 @@ class BootstrapResult:
     busy_time: float
     workers: int
     eta_full: float
-    beta_star: float         # A16 item 6, from theta_hat's own T.last_fit_info
-    cold_ll: float           # A16 item 6, theta_hat's own final penalized log-likelihood
-    search_gap: float        # A16.7's search audit
-    search_failed: bool      # A16.7's search audit
 
     @property
     def variance(self) -> np.ndarray:
