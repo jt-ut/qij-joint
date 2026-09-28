@@ -150,6 +150,14 @@ class P2Mixture:
         self.measured = (list(measured) if measured is not None
                           else list(range(n_raw, n_raw + len(_DERIVED_NAMES))))
 
+    @property
+    def last_fit_info(self):
+        """The wrapped `GMM2D`'s own `last_fit_info`
+        (spec/QIJ_estimator_fit_spec.md 2.4): `_select_p2`/the derived
+        outputs' Jacobian add no fit of their own, so P2Mixture's status
+        is exactly the raw mixture's."""
+        return self._gmm.last_fit_info
+
     def prepare(self, X: np.ndarray) -> tuple:
         return self._gmm.prepare(X)
 

@@ -13,8 +13,11 @@ bit-identical to before, `theta_hat`'s own evaluation still overlapping
 the first replicate chunks. When warm, `eta_full` is also measured from
 `theta_hat` on the full data (spec/QIJ_mods_waves.md A15) and every
 replicate's polish is held to it instead of `T`'s own declared `eta`,
-which the Newton cap (`gmm.py`'s `_MAX_NEWTON`) can otherwise reach
-before a fit at this scale has actually stalled.
+which the trust-region finish's own iteration cap (`gmm.py`'s
+`2 * p`, spec/QIJ_estimator_fit_spec.md 5.4) can otherwise reach before
+a fit at this scale has actually stalled. `measure_eta_full` never
+returns NaN (spec 2.3): a failed measurement falls back to `T.eta`
+itself, so `eta_full` here is always a finite, safe polish tolerance.
 """
 from __future__ import annotations
 
@@ -101,7 +104,7 @@ class Bootstrap:
             theta_hat, theta_wall = theta_future.result()
             busy_time += theta_wall
             t_eta0 = time.perf_counter()
-            eta_full, _ = measure_eta_full(T, X, theta_hat)
+            eta_full, _, _ = measure_eta_full(T, X, theta_hat)
             busy_time += time.perf_counter() - t_eta0
 
         replicates = np.empty((self.B, q), dtype=float)
