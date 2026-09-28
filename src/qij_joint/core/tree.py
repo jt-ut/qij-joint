@@ -700,7 +700,7 @@ def _frame(state: TreeState, node: int, row_z: np.ndarray, omega0: np.ndarray,
     single = state.node_kind[node] == 0 and cell != -1 and state.cell_row[cell] != -1
     p_l = node_mass(state, node)
     if single:
-        n_l, mu, cov = float(fn[cell]), fm[cell], fc[cell]
+        n_l, mu, cov = int(fn[cell]), fm[cell], fc[cell]
         rows = np.array([state.cell_row[cell]])
     else:
         rows = node_rows(state, node)
