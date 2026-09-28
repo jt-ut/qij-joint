@@ -72,6 +72,7 @@ from scipy.cluster.vq import kmeans2
 from scipy.optimize import linear_sum_assignment
 
 from .seeding import greedy_em_start, scaled_variants
+from .gmm_param import to_unconstrained, coordinate_scales, scaled_gradient_norm, jacobian
 
 _LOG2PI = float(np.log(2.0 * np.pi))
 _ACCEPT_TOL = 1e-9
@@ -478,49 +479,127 @@ def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m):
     return pis2, mus2, Ss2, ll2, 2, m
 
 
-def _em_accelerated(Q, XP, w, W, pis, mus, Ss, ll, tol, max_iter, Scov, a_pen, K):
+def _em_accelerated(X, Q, XP, w, W, pis, mus, Ss, ll, eta, Scov, a_pen, K):
     """SQUAREM rounds (`_squarem_round`) from (pis, mus, Ss) with its own
-    `ll`, to `tol` or `max_iter` EM steps (each round costs 1-3, method_notes
-    section 5). Returns (pis, mus, Ss, ll, n_used, converged). Raises
+    `ll`, until BOTH halves of the stop test pass or the 20*p iteration
+    cap fires (spec/QIJ_estimator_fit_spec.md section 5 items 1-2):
+    the scaled gradient norm <= sqrt(eta), and the Aitken-projected
+    remaining gain |ell_inf - ell_k| <= eta * max(|ell_k|, 1), with
+    ell_k the penalized ll/W at iteration k, c_k = (ell_k - ell_{k-1}) /
+    (ell_{k-1} - ell_{k-2}) and ell_inf = ell_{k-1} + (ell_k -
+    ell_{k-1}) / (1 - c_k) (McLachlan and Krishnan section 4.9). The
+    Aitken test costs nothing beyond the ll history this loop already
+    keeps; the gradient test additionally forms the penalized observed
+    information (`_score_info_penalized` gives psi_bar and A together,
+    so there is no way to get one without paying for the other), so it
+    is evaluated only once the Aitken test has already passed --
+    cheap-before-expensive, and never both in the same failing
+    iteration for nothing. Reaching the cap without the gradient test
+    ever passing still reports a real `score_scaled` (formed once more
+    at the final iterate) rather than leaving it unset.
+
+    Returns (pis, mus, Ss, ll, n_used, status, score_scaled,
+    last_step_u): `n_used` the EM-step count (each round costs 1-3,
+    method_notes section 5), `status` 'converged' or 'em_cap',
+    `score_scaled` the last scaled gradient norm evaluated, and
+    `last_step_u` the unconstrained-coordinate difference between the
+    last two iterates (agent C's initial trust radius). Raises
     np.linalg.LinAlgError on a degenerate covariance anywhere along the
     trajectory."""
+    p = (K - 1) + 5 * K
+    iter_cap = 20 * p
+    sqrt_eta = np.sqrt(eta)
+    eps = np.finfo(float).eps
+    s = coordinate_scales(K, Scov)
+
     n_used = 0
-    converged = False
     m = 4.0
-    while n_used < max_iter:
-        budget = max_iter - n_used
+    ll_hist = [ll]
+    u_prev = to_unconstrained(K, _pack(K, pis, mus, Ss))
+    last_step_u = np.zeros(p)
+    score_scaled = None
+    status = 'em_cap'
+
+    while n_used < iter_cap:
+        budget = iter_cap - n_used
         pis, mus, Ss, ll_new, n_em, m = _squarem_round(
             Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m)
         if not np.isfinite(ll_new):
             raise np.linalg.LinAlgError('non-finite penalized log-likelihood')
         n_used += n_em
-        converged = abs(ll_new - ll) / max(abs(ll), 1e-300) < tol
+        ll_hist.append(ll_new)
+        if len(ll_hist) > 3:
+            ll_hist.pop(0)
+
+        u_new = to_unconstrained(K, _pack(K, pis, mus, Ss))
+        last_step_u = u_new - u_prev
+        u_prev = u_new
         ll = ll_new
-        if converged:
-            break
-    return pis, mus, Ss, ll, n_used, converged
+
+        if len(ll_hist) == 3:
+            ell_km2, ell_km1, ell_k = ll_hist
+            denom = ell_km1 - ell_km2
+            aitken_ok = False
+            # Guard: a denominator too small to divide safely means
+            # either a genuine 0/0 fixed point (ell has stopped moving,
+            # so the remaining gain is trivially the last increment, not
+            # tested here since the projection itself is skipped) or
+            # noise; c_k within eps of 1 means the extrapolated limit is
+            # numerically unstable (a small error in c_k is amplified
+            # without bound). Either way the projection is not trusted
+            # this round and EM keeps iterating -- the cap is the
+            # backstop, never a false "converged".
+            if abs(denom) > eps * max(abs(ell_km1), abs(ell_km2), 1.0):
+                c_k = (ell_k - ell_km1) / denom
+                one_minus_c = 1.0 - c_k
+                if abs(one_minus_c) > eps * max(abs(c_k), 1.0):
+                    ell_inf = ell_km1 + (ell_k - ell_km1) / one_minus_c
+                    aitken_ok = abs(ell_inf - ell_k) <= eta * max(abs(ell_k), 1.0)
+            if aitken_ok:
+                psi_bar = _score_info_penalized(X, Q, w, K, pis, mus, Ss,
+                                                 Scov, a_pen, W)[3]
+                g_u = jacobian(K, u_new).T @ psi_bar
+                score_scaled = scaled_gradient_norm(g_u, s, ell_k)
+                if score_scaled <= sqrt_eta:
+                    status = 'converged'
+                    break
+
+    if score_scaled is None:
+        # The cap fired before the Aitken test ever passed once, so the
+        # gradient norm was never formed; form it here so the caller
+        # always gets a real number rather than a placeholder.
+        psi_bar = _score_info_penalized(X, Q, w, K, pis, mus, Ss,
+                                         Scov, a_pen, W)[3]
+        g_u = jacobian(K, u_prev).T @ psi_bar
+        score_scaled = scaled_gradient_norm(g_u, s, ll)
+
+    return pis, mus, Ss, ll, n_used, status, score_scaled, last_step_u
 
 
-def _run_em(Q, XP, w, pis0, mus0, Ss0, tol, max_iter, Scov, a_pen):
+def _run_em(X, Q, XP, w, pis0, mus0, Ss0, eta, Scov, a_pen):
     """Weighted EM for a single start, SQUAREM-accelerated
-    (`_em_accelerated`, method_notes section 5). None the moment the
-    start degenerates (non-PD covariance or non-finite penalized ll)
-    anywhere along the trajectory; otherwise runs to `tol` or
-    `max_iter` EM steps (budget exhaustion is not a failure -- the
-    start is finalized `converged=False`). Returns dict(pis, mus, Ss,
-    ll, converged, n_iter), `ll` = ell_p/W, `n_iter` the EM-step count
-    used."""
+    (`_em_accelerated`, spec/QIJ_estimator_fit_spec.md section 5). None
+    the moment the start degenerates (non-PD covariance or non-finite
+    penalized ll) anywhere along the trajectory; otherwise runs to the
+    joint Aitken/scaled-gradient stop test or the 20*p iteration cap
+    (`_em_accelerated`; cap exhaustion is not a failure -- the start is
+    finalized with `status='em_cap'`). Returns dict(pis, mus, Ss, ll,
+    converged, n_iter, status, score_scaled, last_step_u): `ll` =
+    ell_p/W, `n_iter` the EM-step count used, `converged` = (status ==
+    'converged')."""
     W = float(w.sum())
     K = pis0.shape[0]
     try:
         ll0 = _penalized_ll(Q, w, W, pis0, mus0, Ss0, Scov, a_pen)
         if not np.isfinite(ll0):
             return None
-        pis, mus, Ss, ll, n_used, converged = _em_accelerated(
-            Q, XP, w, W, pis0, mus0, Ss0, ll0, tol, max_iter, Scov, a_pen, K)
+        pis, mus, Ss, ll, n_used, status, score_scaled, last_step_u = _em_accelerated(
+            X, Q, XP, w, W, pis0, mus0, Ss0, ll0, eta, Scov, a_pen, K)
     except np.linalg.LinAlgError:
         return None
-    return dict(pis=pis, mus=mus, Ss=Ss, ll=ll, converged=converged, n_iter=n_used)
+    return dict(pis=pis, mus=mus, Ss=Ss, ll=ll, converged=(status == 'converged'),
+                n_iter=n_used, status=status, score_scaled=score_scaled,
+                last_step_u=last_step_u)
 
 
 def _sigma_terms_batched(Ss: np.ndarray):
