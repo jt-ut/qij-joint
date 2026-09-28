@@ -333,7 +333,7 @@ class QIJT:
             inverse = lambda A, _inv=inverse: _inv(A.reshape(-1))
         xvq = fit_xvq(Z, self.M_X, self.seed, workers)
         centers_x = np.asarray(inverse(xvq.centers), dtype=float)
-        node_cap = xvq.M_used + N + 1
+        node_cap = 2 * (xvq.M_used + N)  # cell tree 2M-1, each opened cell's tree 2n_j-1
         state = build_state(X, Z, xvq.bmu, centers_x, xvq.centers, measured, q_full, node_cap)
         state.theta_hat = theta_hat
         wall['xvq'] = time.perf_counter() - t0

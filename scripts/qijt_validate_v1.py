@@ -144,6 +144,8 @@ def run_case(dataset: str, estimator: str, runs_root: str) -> dict:
         ratio = {o: float(row_qijt[f'V_tot_{o}']) / V_ij[o] for o in outputs}
         per_draw.append({
             's': s, 'crossing_evals': crossing, 'V_tot_over_V_ij': ratio,
+            'abc_terms': {o: {k: float(row_qijt[f'{k}_{o}']) for k in ('b_hat', 'accel', 'c_q')}
+                          for o in outputs},
             'qijt_cost': stage_cost(row_qijt, QIJT_STAGES),
             'qij_cost': stage_cost(row_qij, QIJ_STAGES),
         })
@@ -177,9 +179,12 @@ def write_report(cases: list, out_dir: str) -> None:
         rows = []
         for d in case['per_draw']:
             for o in case['outputs']:
+                t = d['abc_terms'][o]
                 rows.append([d['s'], o, d['crossing_evals'][o],
-                             round(d['V_tot_over_V_ij'][o], 4)])
-        lines.append(_md_table(['draw', 'output', 'crossing_evals', 'V_tot/V_ij'], rows))
+                             round(d['V_tot_over_V_ij'][o], 4),
+                             f"{t['b_hat']:.3g}", f"{t['accel']:.3g}", f"{t['c_q']:.3g}"])
+        lines.append(_md_table(['draw', 'output', 'crossing_evals', 'V_tot/V_ij',
+                                'b_hat', 'accel', 'c_q'], rows))
         lines.append('')
         cov_rows = [[o] + [round(case['coverage'][f'{lo}_{hi}'][o], 2) for lo, hi in LEVELS]
                     for o in case['outputs']]
