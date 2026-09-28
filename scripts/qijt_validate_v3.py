@@ -87,7 +87,8 @@ def _drop_timing(df: pd.DataFrame) -> pd.DataFrame:
     """Every column whose name contains 'wall' or 'time' (case-
     insensitive), dropped -- covers `busy_time` and every `wall_<stage>`/
     `evals_<stage>`-adjacent timing column without naming each one."""
-    keep = [c for c in df.columns if 'wall' not in c.lower() and 'time' not in c.lower()]
+    keep = [c for c in df.columns if 'wall' not in c.lower() and 'time' not in c.lower()
+            and c != 'workers']
     return df[keep]
 
 

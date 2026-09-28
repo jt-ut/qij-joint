@@ -11,7 +11,7 @@ import numpy as np
 import time
 
 from ..parallel import call_T, fit_status
-from .differences import step_parameter
+from .differences import central_step, difference, step_parameter
 from .xvq import _field_moments
 
 
@@ -559,23 +559,27 @@ def _scale(y_full: np.ndarray, y_Q: np.ndarray):
 
 
 def _bias(state, T, counter, pool, info, full_raw) -> np.ndarray:
-    """b_hat (6.4): the root's own second difference along each child's
-    member set, reusing the root's anchor/half-step evaluations for the
-    measured child A, two fresh full-data evaluations for the other
-    child B (stage 'bias')."""
-    q_meas = state.measured
-    A, B, p_A, p_B, t_A = info[0]
-    D2_A = (full_raw[('f', 0)] - 2.0 * full_raw[('h', 0)] + state.theta_hat) / (t_A / 2.0) ** 2
-
-    t_B = step_parameter(state.delta_f, p_B)
-    mask_B = _full_member_mask(state, B)
+    """b_hat (6.4): for each of the root's two children K, the central
+    second difference of `differences.difference` on the full data at
+    the second-difference step central_step(eta_full); the four
+    evaluations run as one batch and are handed to the stencil through
+    its `evaluate` callback (stage 'bias')."""
+    A, B, p_A, p_B, _t_A = info[0]
+    delta = central_step(state.eta_full)
     ones_N = np.ones(state.N)
-    tasks = [('f', set_weights(ones_N, mask_B, p_B, t_B), state.theta_hat, state.eta_full),
-             ('h', set_weights(ones_N, mask_B, p_B, t_B / 2.0), state.theta_hat, state.eta_full)]
+    tasks = []
+    for K, p_K in ((A, p_A), (B, p_B)):
+        t = step_parameter(delta, p_K)
+        mask = _full_member_mask(state, K)
+        tasks.append(((K, +1), set_weights(ones_N, mask, p_K, +t), state.theta_hat, state.eta_full))
+        tasks.append(((K, -1), set_weights(ones_N, mask, p_K, -t), state.theta_hat, state.eta_full))
     raw = _batch_to_dict(run_batch(T, counter, pool, state.X, tasks), state.q_full)
-    D2_B = (raw['f'] - 2.0 * raw['h'] + state.theta_hat) / (t_B / 2.0) ** 2
-
-    return (p_A * D2_A[q_meas] + p_B * D2_B[q_meas]) / (2.0 * state.N)
+    D2 = {}
+    for K, p_K in ((A, p_A), (B, p_B)):
+        D2[K] = difference(p_K, delta, lambda t, K=K: raw[(K, 1 if t > 0 else -1)],
+                           state.theta_hat)[1]
+    q_meas = state.measured
+    return (p_A * D2[A][q_meas] + p_B * D2[B][q_meas]) / (2.0 * state.N)
 
 
 def anchors(state, T, counter, pool) -> dict:

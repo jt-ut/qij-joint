@@ -33,10 +33,10 @@ from .core.counter import Counter
 from .core.differences import forward_step
 from .core.eta import measure_eta_full
 from .core.tree import (active_rows, anchors, build_state, drift, grow, leaf_V_btw, leaves, node_mass,
-                        reconstruct, within)
+                        reconstruct, run_batch, within)
 from .core.xvq import SurveyRows, _measure_eta_Q, fit_xvq
 from .parallel import fit_status
-from .qij import _theta_hat_task, _wrap
+from .qij import _wrap
 from .result import _normal_interval
 
 _STAGES = ('full_fit', 'eta_full', 'xvq', 'base_Q', 'eta_Q', 'tree', 'opening',
@@ -304,14 +304,11 @@ class QIJT:
 
         # --- full_fit (spec 2.2 item 1) ---
         t0 = time.perf_counter()
-        if pool is not None:
-            pool.share(X)
-            result, failed, _ = pool.submit(_theta_hat_task, None).result()
-            counter.add(1, N, int(failed))
-        else:
-            result = counter(X, np.ones(N))
+        # run_batch reads the fit status in the process that ran the fit
+        # (a pool worker's estimator, not the parent's).
+        [(_, result, _failed, theta_hat_status, _)] = run_batch(
+            T, counter, pool, X, [('theta_hat', np.ones(N), None, None)])
         theta_hat = np.asarray(result, dtype=float)
-        theta_hat_status = fit_status(T, theta_hat)
         wall['full_fit'] = time.perf_counter() - t0
         evals['full_fit'], rows['full_fit'] = counter.snapshot()
         if np.any(np.isnan(theta_hat)):
@@ -398,7 +395,7 @@ class QIJT:
         anc = anchors(state, T, counter, pool)
         wall['anchors'] = time.perf_counter() - t0  # bias's 2 full evals share this wall time
         n_anchor = len(anc['table'])
-        evals['bias'], rows['bias'] = 2, 2 * N
+        evals['bias'], rows['bias'] = 4, 4 * N
         evals['anchors'] = 2 * n_anchor
         rows['anchors'] = 2 * n_anchor * N + anc['evals_anchor_Q'] * R_tree_final
         a_scale, a_scatter, b_hat = anc['a'], anc['scatter'], anc['b_hat']
