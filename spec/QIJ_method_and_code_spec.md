@@ -164,11 +164,27 @@ fields, row placement accounts for 0.1–0.4 % of the variance, the
 quantized fit's information matrix for 3–14 %, its parameter shift for
 2–5 % (30 % for the angle). Representing P2's receptive fields, or every
 receptive field within 0.4 of P2, by native points does not remove it;
-only the full data does. The paper's assumption A2 (I_j ≈ receptive-
-field mean of ψ) fails for this estimand and cannot be restored by a
-local change to the quantizer. A uniform scale error is harmless to the
+only the full data does. A uniform scale error is harmless to the
 method (a level-set partition is scale-free and the stencils fix the
 scale); the scatter and the angle's collapse are not.
+
+CORRECTION (28 September, the coder's finding; branch `clean`, commit
+f422fe8). The bias above was a bug in the survey's normalization, ruled
+by the planner in A8: the survey rows' weights summed to the row count
+R ≈ 3 300 instead of N. The mixture estimator's penalty strength is
+1/Σω, so the quantized fit carried a penalty several times stronger
+relative to its likelihood than the full-data fit, and was a different
+estimator. With the weights summing to N, the surveyed I_j agree with
+the true receptive-field means at r² 0.95–0.99 on every output of draw
+0, and θ_Q − θ̂ falls by one to two orders of magnitude. The planner's
+attribution to a failure of assumption A2, and the claim that no local
+change repairs it, were wrong; the "all receptive fields native" row of
+the native-rows experiment, whose weights summed to N and gave slope
+1.000, showed the cause and was misread. A second bug fixed at the same
+commit: survey evaluations were polished to the declared η = 10⁻¹²,
+below the fit's floor on draw 1, so every survey evaluation failed
+there; η_full is now measured before the survey and used on the survey
+rows under `quantized_start = full-data`.
 
 ---
 
@@ -282,8 +298,9 @@ it spends. Eight to fifteen percent (draw 0) and thirteen to thirty-six
 percent (draw 1) of V_ij lies INSIDE P2's 15–35 receptive fields, where
 no stage-1 quantity can see.
 
-**The repair, A17 (author's instruction, 28 September; spec
-`QIJ_A17_stencil_update.md`; dispatched, not yet built).** Every stencil
+**A17 (built on branch `a17-stencils` to commit ca8cbb8; REMOVED by the
+author on 28 September, branch `clean` f422fe8, after the survey bug
+above was found; kept here as the record of what it was).** Every stencil
 enters every output's Gaussian process as an exact observation of the
 linear functional (1/n_S) Σ_{i∈S} ψ_c(x_i): set covariances by linearity
 of the kernel (the same s_vec/SS sums `bin_posterior_variance` forms,
@@ -534,14 +551,28 @@ b̂ and ABC); the cost reference, S = 1 on TACC.
 
 ## 12. Open items, in order
 
-1. A17 build and its three-step acceptance (section 4).
-2. The rehearsal rerun as the TACC gate (section 8).
-3. A16 annealing: rebuild with re-injected perturbations, acceptance on
-   draws 0, 1, 3, 6, 7; until then `search = multistart`.
+State on 28 September, branch `clean` (f422fe8): A15's measured trigger,
+A16's annealing and all of A17 are removed; the refinement is the ported
+rule; the A12 multistart is restored without the search audit; the two
+survey bugs (section 2's correction) are fixed. With the demo settings at
+GLOBAL width, all five methods complete on draws 0 and 1 at N = 10 000;
+QIJ's V_btw/V_ij is 0.82–1.00 (draw 0) and 0.79–0.92 (draw 1) with 1 598
+and 3 070 refinement evaluations, a wall time near a B = 2 000 bootstrap.
+Raising M_𝒳 from 1 094 to 2 000 on draw 1 leaves the ratio at 0.76–0.93,
+so finer receptive fields alone do not close the gap.
+
+1. The refinement's shortfall on draw 1: under investigation by the
+   coder at the author's request. Local width (`gpwidth = local`, the
+   study's setting since A15) has still not been run on this dataset;
+   the planner's offline simulator put its effect at the initial-bin
+   stage on draw 0 at 0.64–0.90 → 0.87–0.92 with the (then biased)
+   survey.
+2. The rehearsal rerun as the TACC gate (section 8), once item 1 is
+   resolved.
+3. A16 annealing: as built it never left its start (the per-step
+   perturbation of item 3 was not in the code); removed. `search =
+   multistart`.
 4. The 𝒳-VQ's allocation inside P2 (15–35 receptive fields for 100
-   points) bounds what any receptive-field-level information can
-   deliver; never specified; measured only as a floor.
-5. The prototype survey's bias on this estimand (section 2) is
-   documented and, under A17, corrected by measurement rather than
-   removed; the paper's assumption A2 should be stated in the talk as
-   the method's boundary.
+   points) is the floor on what receptive-field-level information can
+   deliver; measured only as a floor; the M_𝒳 = 2 000 run says it is not
+   the binding constraint on draw 1.
