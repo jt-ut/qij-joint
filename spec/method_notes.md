@@ -409,39 +409,61 @@ no start is degenerate at birth. Successive starts draw their k-means
 seeding from the same `np.random.default_rng(seed)`, so they differ from
 each other and the whole sequence is reproducible in `(X, seed)` alone.
 
-Two phases, shaped differently on purpose. Both use the penalized
+Two stages, shaped differently on purpose. Both use the penalized
 M-step (below) for Sigma_k -- there is no unpenalized code path.
-Phase 1 (`_phase1_batch`) runs every start for a short, fixed
-`_SHORT_ITERS` budget in lockstep, batched as one `(N,6) @ (6, K*S)`
-E-step matmul and one batched M-step per iteration (`S = n_starts`),
-with no per-iteration convergence test, degeneracy check, or `ll_p`
-computation (only the trailing one, after the loop, for ranking): a
-start whose covariance goes non-PD mid-phase just turns its own
-coefficient columns to NaN/Inf, confined to that start's own block by
-the batched matmul's column layout. Degeneracy is checked once, after
-the loop, per start; any start that fails is dropped before ranking.
 
-Phase 2 (`_run_em`, via `_fit_em_multistart`) takes the best
-`_PROMOTE_N` of phase 1's survivors, by penalized weighted log-
-likelihood (`ell_p / sum(w)`), and runs each one at a time,
-sequentially, to the caller's own `max_iter` EM steps (or convergence,
-whichever comes first) via SQUAREM acceleration (below), checking
-`ell_p`'s own relative-tolerance convergence after every SQUAREM round
--- EM's monotonicity guarantee (below) is a monotonicity in `ell_p`, so
-that is what its own stopping rule must watch. The selection pool is every surviving start, converged or not:
-hitting the iteration budget means the log-likelihood surface is
-locally flat there, not that the start found a bad point, and treating
-a budget-exhausted start as a failure would make pool membership a
-step function of `w`, incompatible with `T` needing to be
-differentiable in `w`. The pool is ranked by penalized weighted log-
-likelihood; the best is canonically relabeled (`_canonical_sort`,
-ascending `mu_x`, ties on `mu_y`) BEFORE the trust-region finish, so
-`psi`/`A` need no further permutation -- without this, two starts
-landing on the same optimum with swapped labels would make `T`
-discontinuous in `w`.
-`_SHORT_ITERS = 25`, `_PROMOTE_N = 3` are chosen by measurement (not
-taste): validated to not move the winning start or `theta_hat` relative
-to running every start to full budget.
+**The racing screen** (`_phase1_batch`, spec/QIJ_estimator_search_spec.md
+2.2, replacing a fixed 25-iteration screen that ranked starts before
+overlapping components had separated). Every start takes one PLAIN EM
+step per round (`_e_step_batched`/`_m_step_batched`, no acceleration:
+the Aitken projection below assumes EM's own linear convergence, which
+SQUAREM would break), all still-live starts batched together in one
+`(N,6) @ (6, K*S)` E-step matmul and one batched M-step per round
+(`S` = the live count, shrinking as starts are discarded -- a start
+whose covariance goes non-PD mid-screen turns its own coefficient
+columns to NaN/Inf, confined to that start's own block by the batched
+matmul's column layout, and is dropped the moment it happens rather
+than only at the end). Each live start keeps its own trailing three
+per-round penalized log-likelihoods `ell_{k-2}, ell_{k-1}, ell_k`
+(`ell_p / sum(w)`); once it has three, its own Aitken projection of its
+limit is formed (`_aitken_screen`, the same extrapolation
+`_em_accelerated` uses, restated for a not-yet-accelerated, not-yet-
+linear trajectory): `c = (ell_k - ell_{k-1}) / (ell_{k-1} - ell_{k-2})`,
+`ell_inf = +infinity` when `c >= 1` (not yet in the linear regime the
+extrapolation assumes -- the start can never be discarded from this
+projection), `ell_inf = ell_k` when `c <= 0` (no monotone trend to
+extrapolate; EM's own monotonicity in `ell_p` makes a non-positive `c`
+here a plateau or floating-point noise, never a real decrease),
+otherwise the ordinary Aitken limit. A start is discarded the round its
+`2*ell_inf - ell_k` falls below `ell_best`, the best ACHIEVED (not
+projected) `ell_k` among the currently live starts: its most optimistic
+finish, credited twice, still trails what another start has already
+reached. A start with fewer than three recorded values is never
+judged. The screen ends when at most `_K_KEEP` starts remain, or at a
+`20 * p`-round safety cap (`screen_cap`; the `_K_KEEP` best by `ell_k`
+are kept instead). `_K_KEEP = 3` is the old screen's promotion count,
+carried over as the racing screen's own survivor target.
+
+**The finish** (`_run_em`, via `_fit_em_multistart`) takes the racing
+screen's survivors and runs each one, one at a time, sequentially, to
+the caller's own `max_iter` EM steps (or convergence, whichever comes
+first) via SQUAREM acceleration (below), checking `ell_p`'s own
+relative-tolerance convergence after every SQUAREM round -- EM's
+monotonicity guarantee (below) is a monotonicity in `ell_p`, so that is
+what its own stopping rule must watch. A budget-exhausted survivor is
+not treated as a failure: hitting the iteration budget means the
+log-likelihood surface is locally flat there, not that the start found
+a bad point, and excluding it would make pool membership a step
+function of `w`, incompatible with `T` needing to be differentiable in
+`w`. The finished pool is ranked by penalized weighted log-likelihood;
+the best is canonically relabeled (`_canonical_sort`, ascending `mu_x`,
+ties on `mu_y`) BEFORE the trust-region finish, so `psi`/`A` need no
+further permutation -- without this, two starts landing on the same
+optimum with swapped labels would make `T` discontinuous in `w`.
+`_fit_em_multistart` reports, beside the winning fit,
+`n_starts_screened` (starts entered), `screen_rounds` (rounds the
+screen ran), `n_survivors` (starts handed to the finish), and
+`screen_status` (`'ok'` or `'screen_cap'`).
 
 **The penalized M-step** (`_m_step`, `_m_step_batched`). `pi`, `mu` are
 the ordinary weighted-mean M-step, untouched by the penalty. `Sigma_k` is Chen
@@ -482,9 +504,10 @@ overshoot it. On a slowly, near-linearly converging trajectory (the EM
 map close to critical, `v` nearly proportional to `r`) the raw `alpha`
 is large in magnitude, which is where the long step pays; the limit
 `-m` grows as it binds, and the monotonicity safeguard rejects any
-candidate that does not improve on `theta2`. Phase 1's batched screen is not
-accelerated (it has no per-start convergence test to accelerate against
--- a fixed lockstep budget, used for ranking, not for finding a root).
+candidate that does not improve on `theta2`. The racing screen's own
+lockstep rounds are NOT accelerated: they are plain EM steps, because
+the screen's own Aitken projection (above) is read against EM's linear
+convergence rate, which SQUAREM's extrapolated step does not have.
 
 **EM's own convergence test** (`_run_em`, `_em_accelerated`). EM stops
 when the scaled gradient norm (below) is <= `sqrt(eta)` AND the
@@ -679,7 +702,7 @@ of the same X.
 (spec/QIJ_estimator_fit_spec.md 2.4). `_fit` returns `(dict_or_None,
 status)`, status one of `converged`, `em_cap`, `newton_cap`,
 `newton_stalled`, `infeasible`, `linalg`: `infeasible` when every one of
-the `n_starts` starts degenerates, so nothing survives phase 1 to rank;
+the `n_starts` starts degenerates, so nothing survives the racing screen;
 `linalg` when the winning start's `(psi_bar, A)` cannot even be formed,
 or forms but is not PD at a point the finish calls converged (above);
 `em_cap`/`newton_cap`/`newton_stalled` the EM and trust-region stages'
