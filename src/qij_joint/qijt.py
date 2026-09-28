@@ -32,9 +32,9 @@ from .core.abc import curvature as _curvature
 from .core.counter import Counter
 from .core.differences import forward_step
 from .core.eta import measure_eta_full
-from .core.tree import (active_rows, anchors, build_state, drift, grow, leaf_V_btw, leaves, node_mass,
-                        reconstruct, run_batch, within)
-from .core.xvq import SurveyRows, _measure_eta_Q, fit_xvq
+from .core.tree import (active_rows, anchors, build_state, drift, fixed_point, grow, leaf_V_btw,
+                        leaves, measure_eta_Q_tree, node_mass, reconstruct, run_batch, within)
+from .core.xvq import SurveyRows, fit_xvq
 from .parallel import fit_status
 from .qij import _wrap
 from .result import _normal_interval
@@ -67,6 +67,12 @@ class QIJTResult:
     eta_Q: float
     eta_full_failed: bool
     eta_Q_failed: bool
+    n_fp_full: int               # spec 2.2a
+    r_fp_full: float             # spec 2.2a
+    n_fp_Q: int                  # spec 2.2a
+    r_fp_Q: float                # spec 2.2a
+    n_fp_opening: int            # spec 2.2a, sum over rounds' openings
+    r_fp_opening_max: float      # spec 2.2a, max over rounds' openings
     n_rounds: int
     n_measured: int
     n_opened: int
@@ -241,9 +247,13 @@ def _anchors_table(table_rows, outputs: Tuple[str, ...]) -> pd.DataFrame:
 
 def _nan_result(outputs, measured, N, method, workers, status, theta_hat_status,
                  theta_Q_status, eta_full, eta_Q, eta_full_failed, eta_Q_failed,
-                 evals, rows, wall, t_start, counter, theta_hat) -> QIJTResult:
+                 evals, rows, wall, t_start, counter, theta_hat,
+                 n_fp_full=0, r_fp_full=0.0, n_fp_Q=0, r_fp_Q=0.0,
+                 n_fp_opening=0, r_fp_opening_max=0.0) -> QIJTResult:
     """A failed draw (spec 10): NaN variances/intervals, the status,
-    whatever stage counts were made before the failure, empty tables."""
+    whatever stage counts were made before the failure (including the
+    fixed-point products of 2.2a, when the failure happened after they
+    were computed), empty tables."""
     q = len(outputs)
     nan_q = np.full(q, np.nan)
     wall_time = time.perf_counter() - t_start
@@ -260,6 +270,9 @@ def _nan_result(outputs, measured, N, method, workers, status, theta_hat_status,
         workers=workers, status=status, theta_hat_status=theta_hat_status,
         theta_Q_status=theta_Q_status, eta_full=float(eta_full), eta_Q=float(eta_Q),
         eta_full_failed=bool(eta_full_failed), eta_Q_failed=bool(eta_Q_failed),
+        n_fp_full=int(n_fp_full), r_fp_full=float(r_fp_full),
+        n_fp_Q=int(n_fp_Q), r_fp_Q=float(r_fp_Q),
+        n_fp_opening=int(n_fp_opening), r_fp_opening_max=float(r_fp_opening_max),
         n_rounds=0, n_measured=0, n_opened=0, n_leaves=0, max_depth=0,
         n_failed=int(counter.failed), tree_status='', n_pairs_bought=0, n_quad_bought=0,
         busy_time=float(wall_time), wall_time=float(wall_time),
@@ -324,6 +337,31 @@ class QIJT:
         ev1, rw1 = counter.snapshot()
         evals['eta_full'], rows['eta_full'] = ev1 - ev0, rw1 - rw0
 
+        # --- full_fit's own fixed point (spec 2.2 item 3, 2.2a); its
+        # evaluations/rows/wall are added to 'full_fit', not 'eta_full',
+        # though they run after eta_full is measured (eta_full is the
+        # rule's tolerance). No start: skipped (r=0, no evaluation).
+        t0 = time.perf_counter()
+        if counter.takes_start:
+            theta_hat, n_fp_full, r_fp_full, ok_full = fixed_point(
+                lambda th: counter(X, np.ones(N), start=th, eta=eta_full), theta_hat, eta_full)
+        else:
+            n_fp_full, r_fp_full, ok_full = 0, 0.0, True
+        wall['full_fit'] += time.perf_counter() - t0
+        ev1b, rw1b = counter.snapshot()
+        evals['full_fit'] += ev1b - ev1
+        rows['full_fit'] += rw1b - rw1
+        if np.any(np.isnan(theta_hat)):
+            return _nan_result(outputs, measured, N, self, workers, 'theta_hat_failed',
+                                theta_hat_status, '', eta_full, float('nan'), eta_full_failed,
+                                False, evals, rows, wall, t_start, counter, theta_hat,
+                                n_fp_full=n_fp_full, r_fp_full=r_fp_full)
+        if not ok_full:
+            return _nan_result(outputs, measured, N, self, workers, 'base_unconverged',
+                                theta_hat_status, '', eta_full, float('nan'), eta_full_failed,
+                                False, evals, rows, wall, t_start, counter, theta_hat,
+                                n_fp_full=n_fp_full, r_fp_full=r_fp_full)
+
         # --- xvq (spec 9.1; Z/inverse exactly as qij.py, incl. 1-D promotion) ---
         t0 = time.perf_counter()
         Z, inverse = self.vq_transform(X) if self.vq_transform is not None else (X, lambda A: A)
@@ -338,12 +376,19 @@ class QIJT:
         state.theta_hat = theta_hat
         wall['xvq'] = time.perf_counter() - t0
         ev2, rw2 = counter.snapshot()
-        evals['xvq'], rows['xvq'] = ev2 - ev1, rw2 - rw1  # 0: fit_xvq spends no evaluation
+        evals['xvq'], rows['xvq'] = ev2 - ev1b, rw2 - rw1b  # 0: fit_xvq spends no evaluation
 
-        # --- base_Q (spec 2.2 item 3) ---
+        # --- base_Q (spec 2.2 item 4, 2.2a): the quantized base fit as
+        # a continuation of theta_hat, iterated to a fixed point on the
+        # rows. No start: one evaluation, r=0, no iteration (2.2a). ---
         t0 = time.perf_counter()
         _row_ids, rows_x, omega0 = active_rows(state)
-        theta_Q = np.asarray(counter(rows_x, omega0, start=theta_hat, eta=eta_full), dtype=float)
+        if counter.takes_start:
+            theta_Q, n_fp_Q, r_fp_Q, ok_Q = fixed_point(
+                lambda th: counter(rows_x, omega0, start=th, eta=eta_full), theta_hat, eta_full)
+        else:
+            theta_Q = np.asarray(counter(rows_x, omega0, start=theta_hat, eta=eta_full), dtype=float)
+            n_fp_Q, r_fp_Q, ok_Q = 0, 0.0, True
         theta_Q_status = fit_status(T, theta_Q)
         state.theta_Q = theta_Q
         wall['base_Q'] = time.perf_counter() - t0
@@ -353,15 +398,20 @@ class QIJT:
             return _nan_result(outputs, measured, N, self, workers, 'theta_Q_failed',
                                 theta_hat_status, theta_Q_status, eta_full, float('nan'),
                                 eta_full_failed, False, evals, rows, wall, t_start, counter,
-                                theta_hat)
+                                theta_hat, n_fp_full=n_fp_full, r_fp_full=r_fp_full,
+                                n_fp_Q=n_fp_Q, r_fp_Q=r_fp_Q)
+        if not ok_Q:
+            return _nan_result(outputs, measured, N, self, workers, 'theta_Q_unconverged',
+                                theta_hat_status, theta_Q_status, eta_full, float('nan'),
+                                eta_full_failed, False, evals, rows, wall, t_start, counter,
+                                theta_hat, n_fp_full=n_fp_full, r_fp_full=r_fp_full,
+                                n_fp_Q=n_fp_Q, r_fp_Q=r_fp_Q)
 
-        # --- eta_Q (spec 2.2 item 4, 2.3) ---
+        # --- eta_Q (spec 2.2 item 5, 2.2b, 2.3) ---
         t0 = time.perf_counter()
-        R0 = len(omega0)
         m0 = omega0 / N
         if counter.takes_start:
-            eta_Q, eta_Q_failed = _measure_eta_Q(counter, rows_x, omega0, np.arange(R0),
-                                                  m0, theta_Q, eta=eta_full)
+            eta_Q, eta_Q_failed = measure_eta_Q_tree(counter, rows_x, omega0, m0, theta_Q, eta_full)
             eta_f = eta_full
         else:
             eta_Q, eta_Q_failed = float(counter.eta), False
@@ -378,11 +428,13 @@ class QIJT:
         wall['tree'] = time.perf_counter() - t0
         ev5, rw5 = counter.snapshot()
         rw_tree_window = rw5 - rw4
-        if tree_status == 'opening_failed':
-            return _nan_result(outputs, measured, N, self, workers, 'opening_failed',
+        if tree_status in ('opening_failed', 'theta_Q_unconverged'):
+            return _nan_result(outputs, measured, N, self, workers, tree_status,
                                 theta_hat_status, theta_Q_status, eta_full, eta_Q,
                                 eta_full_failed, eta_Q_failed, evals, rows, wall, t_start,
-                                counter, theta_hat)
+                                counter, theta_hat, n_fp_full=n_fp_full, r_fp_full=r_fp_full,
+                                n_fp_Q=n_fp_Q, r_fp_Q=r_fp_Q, n_fp_opening=state.n_fp_opening,
+                                r_fp_opening_max=state.r_fp_opening_max)
         # The window also holds the openings' theta_Q re-evaluations and U
         # re-measurements (spec 5.3), counted in `opening`.
         evals['tree'], evals['opening'] = evals_tree, (ev5 - ev4) - evals_tree
@@ -405,11 +457,14 @@ class QIJT:
         ev_w0, rw_w0 = counter.snapshot()
         wr = within(state, T, counter, pool, self.budget_win, self.budget_quad, leaf_V_btw(state))
         wall['within'] = time.perf_counter() - t0  # quadratic shares this wall time
-        if wr.get('status') == 'opening_failed':
-            return _nan_result(outputs, measured, N, self, workers, 'opening_failed',
+        if wr.get('status') in ('opening_failed', 'theta_Q_unconverged'):
+            return _nan_result(outputs, measured, N, self, workers, wr['status'],
                                 theta_hat_status, theta_Q_status, eta_full, eta_Q,
                                 eta_full_failed, eta_Q_failed, evals, rows, wall,
-                                t_start, counter, theta_hat)
+                                t_start, counter, theta_hat, n_fp_full=n_fp_full,
+                                r_fp_full=r_fp_full, n_fp_Q=n_fp_Q, r_fp_Q=r_fp_Q,
+                                n_fp_opening=state.n_fp_opening,
+                                r_fp_opening_max=state.r_fp_opening_max)
         R_final = len(active_rows(state)[0])
         n_pairs, n_quads = len(wr['pairs']), len(wr['quads'])
         evals['within'], rows['within'] = n_pairs, n_pairs * R_final
@@ -470,6 +525,9 @@ class QIJT:
             workers=workers, status='ok', theta_hat_status=theta_hat_status,
             theta_Q_status=theta_Q_status, eta_full=float(eta_full), eta_Q=float(eta_Q),
             eta_full_failed=bool(eta_full_failed), eta_Q_failed=bool(eta_Q_failed),
+            n_fp_full=int(n_fp_full), r_fp_full=float(r_fp_full),
+            n_fp_Q=int(n_fp_Q), r_fp_Q=float(r_fp_Q),
+            n_fp_opening=int(state.n_fp_opening), r_fp_opening_max=float(state.r_fp_opening_max),
             n_rounds=int(n_rounds), n_measured=n_measured_nodes, n_opened=n_opened,
             n_leaves=len(leaf_ids), max_depth=max_depth, n_failed=int(counter.failed),
             tree_status=tree_status, n_pairs_bought=n_pairs, n_quad_bought=n_quads,

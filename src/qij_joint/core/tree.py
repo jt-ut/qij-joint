@@ -69,6 +69,8 @@ class TreeState:
     eta_Q: float
     delta_f: float
     z_n: float
+    n_fp_opening: int
+    r_fp_opening_max: float
 
 
 def bisect(z: np.ndarray, m: np.ndarray) -> np.ndarray:
@@ -247,6 +249,37 @@ def active_rows(state: TreeState):
     return ids, state.row_x[ids], state.omega0[ids]
 
 
+def _fp_residual(theta_prime: np.ndarray, theta: np.ndarray) -> float:
+    """r = max_o |theta'_o - theta_o| / max(|theta'_o|, |theta_o|), 0/0 ->
+    0 over every output of T (spec 2.2a)."""
+    scale = np.maximum(np.abs(theta_prime), np.abs(theta))
+    diff = np.abs(theta_prime - theta)
+    return float(np.max(np.where(scale > 0, diff / scale, 0.0)))
+
+
+def fixed_point(step, start: np.ndarray, eta: float, cap: int = 5):
+    """The fixed-point rule (spec 2.2a), for an estimator that takes a
+    start -- callers skip this when it does not (r = 0, no evaluation).
+    `step(theta)` evaluates T(rows, weights, start=theta, eta=eta) for
+    whatever (rows, weights) the caller closes over. Iterates
+    theta' = step(theta); r = `_fp_residual`(theta', theta); theta <-
+    theta' until r <= eta, at most `cap` iterations. Returns (theta,
+    n_iter, r, converged); a non-finite theta' ends the iteration at
+    once with converged=False and r=NaN (the caller reports this as a
+    fit failure, not a non-convergence)."""
+    theta = np.asarray(start, dtype=float)
+    r = float('nan')
+    for n in range(1, cap + 1):
+        theta_prime = np.asarray(step(theta), dtype=float)
+        if np.any(np.isnan(theta_prime)):
+            return theta_prime, n, float('nan'), False
+        r = _fp_residual(theta_prime, theta)
+        theta = theta_prime
+        if r <= eta:
+            return theta, n, r, True
+    return theta, cap, r, False
+
+
 def build_state(X, Z, bmu, centers_x, centers_z, measured, q_full, node_cap) -> TreeState:
     """The initial rows (one per cell, omega0 = n_j) and the cell-level
     tree, built once (spec 2.1, 3.2), root id 0, breadth-first ids."""
@@ -296,6 +329,7 @@ def build_state(X, Z, bmu, centers_x, centers_z, measured, q_full, node_cap) -> 
         open_shift=np.full((node_cap, q), np.nan),
         theta_hat=np.full(q_full, np.nan), theta_Q=np.full(q_full, np.nan),
         eta_full=float('nan'), eta_Q=float('nan'), delta_f=float('nan'), z_n=5.0,
+        n_fp_opening=0, r_fp_opening_max=0.0,
     )
     state.node_hi[0] = M
     _bfs_split(state, [0])
@@ -313,6 +347,35 @@ def set_weights(omega0: np.ndarray, member_pos: np.ndarray, p_K: float, t: float
     omega = omega0 * (1.0 - t)
     omega[member_pos] += omega0[member_pos] * t / p_K
     return omega
+
+
+def measure_eta_Q_tree(counter, rows: np.ndarray, omega0: np.ndarray, m: np.ndarray,
+                        theta_Q: np.ndarray, eta_full: float) -> Tuple[float, bool]:
+    """eta_Q for the tree (spec 2.2b): the same three evaluations as
+    `core.xvq._measure_eta_Q` (two at omega0 continued from theta_Q, one
+    at the largest-mass row perturbed by a relative 1e-6, via the same
+    `set_weights` construction as `_field_step_weights` reduces to for a
+    single-row member set), the pairwise relative differences among all
+    three, plus the relative difference of each of the two base
+    (unperturbed) evaluations from theta_Q itself -- the fixed-point
+    residual 2.2a's rule already bounds by eta_full, re-checked here
+    rather than assumed; eta_Q is the largest of these five, floored at
+    eta_full (never NaN, as `_measure_eta_Q`). `failed` is True the
+    moment any of the three evaluations is non-finite. `core.xvq.
+    _measure_eta_Q` itself is not called or modified: its logic is
+    re-run here so the two base evaluations' own values are available
+    for the residual terms, which `_measure_eta_Q` does not return."""
+    f_a = np.asarray(counter(rows, omega0, start=theta_Q, eta=eta_full), dtype=float)
+    f_b = np.asarray(counter(rows, omega0, start=theta_Q, eta=eta_full), dtype=float)
+    j_max = int(np.argmax(m))
+    p_max = float(m[j_max])
+    omega_pert = set_weights(omega0, np.array([j_max]), p_max, step_parameter(1e-6, p_max))
+    f_c = np.asarray(counter(rows, omega_pert, start=theta_Q, eta=eta_full), dtype=float)
+    if not (np.all(np.isfinite(f_a)) and np.all(np.isfinite(f_b)) and np.all(np.isfinite(f_c))):
+        return float(eta_full), True
+    candidates = [_fp_residual(f_a, f_b), _fp_residual(f_a, f_c), _fp_residual(f_b, f_c),
+                  _fp_residual(f_a, theta_Q), _fp_residual(f_b, theta_Q)]
+    return float(max(max(candidates), eta_full)), False
 
 
 def _eval_task(T, case, shared: np.ndarray, task: Tuple) -> Tuple:
@@ -387,16 +450,35 @@ def measure_nodes(state: TreeState, T, counter, pool, nodes: Sequence[int], roun
         state.node_measured[c] = True
 
 
-def reevaluate_theta_Q(state: TreeState, T, counter) -> bool:
-    """theta_Q <- T(rows, omega0, start=theta_Q, eta=eta_full) after
-    openings (spec 5.3); False (theta_Q set NaN) means 'opening_failed'."""
+def reevaluate_theta_Q(state: TreeState, T, counter) -> str:
+    """theta_Q <- fixed_point(rows, omega0, theta_Q) on the new rows
+    after openings (spec 2.2a, 5.3): the mandatory re-evaluation, then --
+    when T takes a start -- iterated to a fixed point, at most 5
+    iterations, its count and residual added to state.n_fp_opening /
+    maxed into state.r_fp_opening_max (0 / 0.0 without a start, per
+    2.2a). Returns 'ok', 'opening_failed' (a NaN evaluation; theta_Q set
+    NaN), or 'theta_Q_unconverged' (the cap, theta_Q kept at the last
+    finite iterate)."""
     _, rows_x, omega0 = active_rows(state)
-    value = np.asarray(counter(rows_x, omega0, start=state.theta_Q, eta=state.eta_full), dtype=float)
-    if np.any(np.isnan(value)):
+    if not counter.takes_start:
+        value = np.asarray(counter(rows_x, omega0, start=state.theta_Q, eta=state.eta_full),
+                            dtype=float)
+        if np.any(np.isnan(value)):
+            state.theta_Q = np.full(state.q_full, np.nan)
+            return 'opening_failed'
+        state.theta_Q = value
+        return 'ok'
+    theta, n, r, ok = fixed_point(
+        lambda th: counter(rows_x, omega0, start=th, eta=state.eta_full),
+        state.theta_Q, state.eta_full)
+    state.n_fp_opening += n
+    if not np.isnan(r):
+        state.r_fp_opening_max = max(state.r_fp_opening_max, r)
+    if np.any(np.isnan(theta)):
         state.theta_Q = np.full(state.q_full, np.nan)
-        return False
-    state.theta_Q = value
-    return True
+        return 'opening_failed'
+    state.theta_Q = theta
+    return 'ok' if ok else 'theta_Q_unconverged'
 
 
 def _open_candidates(state: TreeState, prev_round: int) -> List[int]:
@@ -492,8 +574,9 @@ def grow(state: TreeState, T, counter, pool, budget: int) -> Tuple[List[dict], s
                  and state.cell_row[state.node_cell[c]] >= 0]
         if cells:
             open_cells(state, cells)
-            if not reevaluate_theta_Q(state, T, counter):
-                return curve_rows, 'opening_failed', n_rounds, evals_tree
+            fp_status = reevaluate_theta_Q(state, T, counter)
+            if fp_status != 'ok':
+                return curve_rows, fp_status, n_rounds, evals_tree
             remeasure_opened(state, T, counter, pool, cells)
 
         round_ += 1
@@ -809,8 +892,9 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
     opened = sorted({frames[ell]['cell'] for _, ell, _ in bought if frames[ell]['single']})
     if opened:
         open_cells(state, opened)
-        if not reevaluate_theta_Q(state, T, counter):
-            return dict(pairs=[], quads=[], opened=opened, leaf_rows=[], status='opening_failed')
+        fp_status = reevaluate_theta_Q(state, T, counter)
+        if fp_status != 'ok':
+            return dict(pairs=[], quads=[], opened=opened, leaf_rows=[], status=fp_status)
         remeasure_opened(state, T, counter, pool, opened)
         row_ids, rows_x, omega0 = active_rows(state)
         row_z = state.row_z[row_ids]
