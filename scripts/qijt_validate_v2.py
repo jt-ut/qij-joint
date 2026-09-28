@@ -10,20 +10,27 @@ the end; (c) every node the tree measured at depth <= 5 is re-measured
 on the FULL data (one evaluation per node, outside the method, via
 `parallel.call_T` on a `Pool`): slope and r^2 of y^full against
 a_o*y^Q (regression through the origin, matching a_o's own least-
-squares definition, spec 6.2); the within-term pairs bought in the
-SUBJECT component's cells get the same check at the leaf/energy level
-(only the aggregate scaled A_o is persisted per leaf, not each pair's
-signed D, so the check compares A_full_ell,o -- the full-data energy
-summed over the SAME top bought eigendirections, recomputed from the
-leaf's own member points -- against the stored, already a_o^2-scaled
-A_ell,o). The subject component is P2 (cloudfil's on-filament source);
-its cells are those whose prototype lies within 3 standard deviations
-(Mahalanobis distance <= 3, using P2's own fitted covariance,
-reconstructed from the measured log_reff/log_axis_ratio/pa outputs) of
-P2's fitted mean -- a leaf counts as "in the subject component" if any
-of its member points falls in such a cell. (d) root_drift, a_scatter,
-step_ratio. (e) busy/wall at workers 14 (this run) and workers 1
-(a separate, forced single-draw run under `<out>/runs_w1`) for draw 0.
+squares definition, spec 6.2); the within-term PAIRS bought in the
+SUBJECT component's cells (the `pairs` table, section 11.2a) get the
+SAME contrast re-measured on the full data, per pair and SIGNED:
+slope/r^2 of D^full against a_o*D_o (D_o the pair's own stored,
+unscaled response). The direction is recomputed on the leaf's own
+native member points -- the j-th principal axis (j >= 1) of the
+leaf's covariance, or, for the quadratic contrast (j = 0, spec 7.3),
+the Mahalanobis quadratic form orthogonalized against every principal
+direction up to the leaf's own rank -- since a leaf that is not yet a
+single point or an opened cell has no native rows on the quantized
+side either. Also the distribution (median, 90th percentile, max) of
+|open_shift_o| / sqrt(V_ij,o) over opened cells (the `nodes` table's
+own `open_shift_o`, spec 5.3 -- no extra evaluation). The subject
+component is P2 (cloudfil's on-filament source); its cells are those
+whose prototype lies within 3 standard deviations (Mahalanobis
+distance <= 3, using P2's own fitted covariance, reconstructed from
+the measured log_reff/log_axis_ratio/pa outputs) of P2's fitted mean.
+(d) root_drift, a_scatter, step_ratio, b_hat, accel, c_q (the scalar
+row's own values). (e) busy/wall at workers 14 (this run) and workers
+1 (a separate, forced single-draw run under `<out>/runs_w1`) for
+draw 0.
 
 Every `run.py` call is wrapped in a `perl alarm` hard kill: 10 min for
 `oracle`, 20 min for `ij` (2 draws, N = 10000), 3 h for `qijt` at
@@ -176,7 +183,7 @@ def full_data_node_check(nodes_df: pd.DataFrame, points_df: pd.DataFrame, X: np.
     meas_flag = dict(zip(nodes_df['node'].astype(int), nodes_df['measured_child'].astype(int)))
     root = int(nodes_df.loc[nodes_df['depth'] == 0, 'node'].iloc[0])
     targets = sorted(
-        nodes_df.loc[nodes_df['measured'].astype(bool) & (nodes_df['depth'] <= MAX_DEPTH_C),
+        nodes_df.loc[nodes_df['node_measured'].astype(bool) & (nodes_df['depth'] <= MAX_DEPTH_C),
                      'node'].astype(int).tolist(),
         key=lambda n: depth[n])
     outputs_idx = [T.outputs.index(o) for o in outputs]
@@ -215,65 +222,106 @@ def full_data_node_check(nodes_df: pd.DataFrame, points_df: pd.DataFrame, X: np.
     return y_full
 
 
-def full_data_leaf_energy(leaves_df: pd.DataFrame, points_df: pd.DataFrame, X: np.ndarray,
-                           T, theta_hat_full: np.ndarray, eta_full: float, outputs: list,
-                           pool: Pool, in_subject: np.ndarray) -> pd.DataFrame:
-    """Per qualifying leaf (bought pairs > 0, any member point in
-    `in_subject`), A_full_o = sum over the SAME top bought
-    eigendirections of the full-data energy (1/N)*D_full_o^2/p_ell
-    (spec section 12, V2c), against the stored A_o (already
-    a_o^2-scaled). Geometry (mean, covariance, eigenpairs) is
-    recomputed on the leaf's own native member points, mass 1/N each,
-    §7.1's definition evaluated on the full data rather than the
-    quantized rows."""
+def _leaf_geometry(X: np.ndarray, member: np.ndarray) -> tuple:
+    """(Xl, mu, vals, vecs, rank) on a leaf's own native member points,
+    mass 1/N each: eigenpairs of the leaf's covariance, descending, and
+    rank = #{j : vals[j] > d_x*vals[0]*eps} (spec 7.1, evaluated on the
+    full data rather than the quantized rows)."""
+    Xl = X[member]
+    mu = Xl.mean(axis=0)
+    C = np.cov(Xl.T, bias=True)
+    vals, vecs = np.linalg.eigh(np.atleast_2d(C))
+    order = np.argsort(-vals)
+    vals, vecs = vals[order], vecs[:, order]
+    rank = int(np.sum(vals > Xl.shape[1] * vals[0] * np.finfo(float).eps)) if vals.size else 0
+    return Xl, mu, vals, vecs, rank
+
+
+def _pair_direction(Xl: np.ndarray, mu: np.ndarray, vals: np.ndarray, vecs: np.ndarray,
+                     rank: int, j: int) -> np.ndarray:
+    """The pair's own direction h (mass-normalized over the leaf, spec
+    7.2-7.3): the (j-1)-th principal axis for j >= 1, or, for j = 0
+    (the quadratic contrast), the Mahalanobis quadratic form
+    orthogonalized against every principal direction up to `rank`.
+    None if the direction cannot be built on this (full-data) geometry
+    (rank too small, or a degenerate leaf)."""
+    if j >= 1:
+        if j > rank or vals[j - 1] <= 0:
+            return None
+        return (Xl - mu) @ vecs[:, j - 1] / np.sqrt(vals[j - 1])
+    if rank == 0:
+        return None
+    diffs = Xl - mu
+    proj = diffs @ vecs[:, :rank]
+    m = np.sum(proj ** 2 / vals[:rank], axis=1)
+    h_dirs = proj / np.sqrt(vals[:rank])
+    beta = np.mean(m[:, None] * h_dirs, axis=0)
+    h_tilde = m - m.mean() - h_dirs @ beta
+    scale = np.sqrt(np.mean(h_tilde ** 2))
+    return None if scale == 0.0 else h_tilde / scale
+
+
+def full_data_pair_check(pairs_df: pd.DataFrame, points_df: pd.DataFrame, X: np.ndarray,
+                          T, theta_hat_full: np.ndarray, eta_full: float, outputs: list,
+                          pool: Pool, in_subject: np.ndarray) -> pd.DataFrame:
+    """Per bought pair (spec section 12, V2c) whose leaf has any member
+    point in `in_subject`: the SAME contrast re-measured on the full
+    data, signed. Returns `leaf, j, D_full_<o>, D_q_<o>` (D_q the
+    pair's own stored, unscaled response)."""
     outputs_idx = [T.outputs.index(o) for o in outputs]
     delta_f = forward_step(eta_full)
     N_full = X.shape[0]
     pool.share(X)
 
-    tasks, task_leaf, geometry = [], [], {}
-    for leaf in leaves_df.itertuples():
-        k = int(leaf.n_pairs_bought)
-        if k == 0:
-            continue
-        leaf_id = int(leaf.leaf)
+    geometry, tasks, task_meta = {}, [], []
+    for row in pairs_df.itertuples():
+        leaf_id = int(row.leaf)
         member = points_df.loc[points_df['leaf'] == leaf_id, 'i'].to_numpy()
         if member.size < 2 or not in_subject[member].any():
             continue
-        Xl = X[member]
-        mu = Xl.mean(axis=0)
-        C = np.cov(Xl.T, bias=True)
-        vals, vecs = np.linalg.eigh(np.atleast_2d(C))
-        order = np.argsort(-vals)
-        vals, vecs = vals[order], vecs[:, order]
-        p_ell = member.size / N_full
-        geometry[leaf_id] = p_ell
-        for j in range(min(k, int(np.sum(vals > 0)))):
-            h_local = (Xl - mu) @ vecs[:, j] / np.sqrt(vals[j])
-            t = delta_f / np.max(np.abs(h_local))
-            omega = np.ones(N_full)
-            omega[member] = 1.0 + t * h_local
-            tasks.append((leaf_id, omega, theta_hat_full, eta_full))
-            task_leaf.append((leaf_id, t))
+        if leaf_id not in geometry:
+            geometry[leaf_id] = (member,) + _leaf_geometry(X, member)
+        member, Xl, mu, vals, vecs, rank = geometry[leaf_id]
+        j = int(row.j)
+        h_local = _pair_direction(Xl, mu, vals, vecs, rank, j)
+        if h_local is None:
+            continue
+        t = delta_f / np.max(np.abs(h_local))
+        omega = np.ones(N_full)
+        omega[member] = 1.0 + t * h_local
+        tasks.append((leaf_id, omega, theta_hat_full, eta_full))
+        task_meta.append((leaf_id, j, t))
 
     if not tasks:
         return pd.DataFrame()
-    A_full = {leaf_id: np.zeros(len(outputs)) for leaf_id, _ in task_leaf}
-    for (leaf_id, t), (_, value, failed, _) in zip(task_leaf, pool.map(_full_task, tasks)):
+    rows = []
+    for (leaf_id, j, t), (_, value, failed, _) in zip(task_meta, pool.map(_full_task, tasks)):
         if failed:
             continue
-        D = (value[outputs_idx] - theta_hat_full[outputs_idx]) / t
-        A_full[leaf_id] += (1.0 / N_full) * D ** 2 / geometry[leaf_id]
-
-    rows = []
-    for leaf_id, energy in A_full.items():
-        row = {'leaf': leaf_id}
-        stored = leaves_df.loc[leaves_df['leaf'] == leaf_id].iloc[0]
+        D_full = (value[outputs_idx] - theta_hat_full[outputs_idx]) / t
+        stored = pairs_df.loc[(pairs_df['leaf'] == leaf_id) & (pairs_df['j'] == j)].iloc[0]
+        row = {'leaf': leaf_id, 'j': j}
         for i, o in enumerate(outputs):
-            row[f'A_full_{o}'] = energy[i]
-            row[f'A_q_{o}'] = float(stored[f'A_{o}'])
+            row[f'D_full_{o}'] = D_full[i]
+            row[f'D_q_{o}'] = float(stored[f'D_{o}'])
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def open_shift_stats(nodes_df: pd.DataFrame, V_ij: dict, outputs: list) -> dict:
+    """Per output: median, 90th percentile and max of |open_shift_o| /
+    sqrt(V_ij,o) over opened cells (spec 5.3's `open_shift_o`, non-NaN
+    exactly there)."""
+    stats = {}
+    for o in outputs:
+        vals = nodes_df[f'open_shift_{o}'].dropna().to_numpy()
+        scaled = np.abs(vals) / np.sqrt(V_ij[o])
+        if scaled.size == 0:
+            stats[o] = {'median': float('nan'), 'p90': float('nan'), 'max': float('nan')}
+        else:
+            stats[o] = {'median': float(np.median(scaled)),
+                         'p90': float(np.percentile(scaled, 90)), 'max': float(np.max(scaled))}
+    return stats
 
 
 def reg_through_origin(x: np.ndarray, y: np.ndarray) -> tuple:
@@ -314,7 +362,7 @@ def _draw_report(s: int, runs_root: str, T, pool: Pool, full_outputs: list, meas
 
     X = registry.case(DATASET, ESTIMATOR).draw(N, SEED + s)
     nodes_df = products.collect_array(runs_root, DATASET, ESTIMATOR, N, 'qijt', 'nodes', draws=[s])
-    leaves_df = products.collect_array(runs_root, DATASET, ESTIMATOR, N, 'qijt', 'leaves', draws=[s])
+    pairs_df = products.collect_array(runs_root, DATASET, ESTIMATOR, N, 'qijt', 'pairs', draws=[s])
     points_df = products.collect_array(runs_root, DATASET, ESTIMATOR, N, 'qijt', 'points', draws=[s])
 
     mu_p2, Sigma_p2 = _p2_ellipse(row_qijt)
@@ -334,11 +382,12 @@ def _draw_report(s: int, runs_root: str, T, pool: Pool, full_outputs: list, meas
                                        node_df.loc[node_df['output'] == o, 'y_full'].to_numpy())
                 for o in measured}
 
-    leaf_energy = full_data_leaf_energy(leaves_df, points_df, X, T, theta_hat_full,
-                                         eta_full, measured, pool, in_subject)
-    leaf_fit = {o: (reg_through_origin(leaf_energy[f'A_q_{o}'].to_numpy(),
-                                        leaf_energy[f'A_full_{o}'].to_numpy())
-                     if not leaf_energy.empty else (float('nan'), float('nan')))
+    pair_full = full_data_pair_check(pairs_df, points_df, X, T, theta_hat_full,
+                                      eta_full, measured, pool, in_subject)
+    pair_fit = {o: (reg_through_origin(
+                        float(row_qijt[f'a_scale_{o}']) * pair_full[f'D_q_{o}'].to_numpy(),
+                        pair_full[f'D_full_{o}'].to_numpy())
+                     if not pair_full.empty else (float('nan'), float('nan')))
                 for o in measured}
 
     anchors_s = anchors_df[anchors_df['s'] == s]
@@ -346,13 +395,18 @@ def _draw_report(s: int, runs_root: str, T, pool: Pool, full_outputs: list, meas
                              'min': float(anchors_s[f'step_ratio_{o}'].min()),
                              'max': float(anchors_s[f'step_ratio_{o}'].max())}
                          for o in measured}
+    open_shift = open_shift_stats(nodes_df, V_ij, measured)
 
     return {
         'a_curve': a_curve, 'V_ij': V_ij, 'V_tot_over_V_ij': ratio,
         'node_slope_r2': node_fit, 'n_nodes_checked': len(y_full),
-        'leaf_energy_slope_r2': leaf_fit, 'n_leaves_checked': int(len(leaf_energy)),
+        'pair_slope_r2': pair_fit, 'n_pairs_checked': int(len(pair_full)),
+        'open_shift': open_shift,
         'root_drift': {o: float(row_qijt[f'root_drift_{o}']) for o in measured},
         'a_scatter': {o: float(row_qijt[f'a_scatter_{o}']) for o in measured},
+        'b_hat': {o: float(row_qijt[f'b_hat_{o}']) for o in measured},
+        'accel': {o: float(row_qijt[f'accel_{o}']) for o in measured},
+        'c_q': {o: float(row_qijt[f'c_q_{o}']) for o in measured},
         'step_ratio': step_ratio_stats,
     }
 
@@ -368,15 +422,22 @@ def write_report(report: dict, measured: list, out_dir: str) -> None:
         lines.append('')
         rows = [[o, round(d['V_ij'][o], 4), round(d['V_tot_over_V_ij'][o], 4),
                  round(d['node_slope_r2'][o][0], 4), round(d['node_slope_r2'][o][1], 4),
-                 round(d['leaf_energy_slope_r2'][o][0], 4), round(d['leaf_energy_slope_r2'][o][1], 4),
-                 round(d['root_drift'][o], 4), round(d['a_scatter'][o], 4)]
+                 round(d['pair_slope_r2'][o][0], 4), round(d['pair_slope_r2'][o][1], 4),
+                 round(d['root_drift'][o], 4), round(d['a_scatter'][o], 4),
+                 round(d['b_hat'][o], 6), round(d['accel'][o], 6), round(d['c_q'][o], 6)]
                 for o in measured]
         lines.append(_md_table(['output', 'V_ij', 'V_tot/V_ij', 'node slope', 'node r2',
-                                 'leaf-energy slope', 'leaf-energy r2', 'root_drift', 'a_scatter'],
-                                rows))
+                                 'pair slope', 'pair r2', 'root_drift', 'a_scatter',
+                                 'b_hat', 'accel', 'c_q'], rows))
         lines.append('')
-        lines.append(f"{d['n_nodes_checked']} nodes and {d['n_leaves_checked']} leaves checked "
+        lines.append(f"{d['n_nodes_checked']} nodes and {d['n_pairs_checked']} pairs checked "
                       f"against the full data.")
+        lines.append('')
+        shift_rows = [[o, round(d['open_shift'][o]['median'], 4),
+                       round(d['open_shift'][o]['p90'], 4), round(d['open_shift'][o]['max'], 4)]
+                      for o in measured]
+        lines.append('|open_shift_o| / sqrt(V_ij,o) over opened cells:')
+        lines.append(_md_table(['output', 'median', 'p90', 'max'], shift_rows))
         lines.append('')
     lines.append('## busy/wall')
     lines.append(_md_table(['workers', 'busy_time', 'wall_time'],
