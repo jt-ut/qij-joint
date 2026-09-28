@@ -44,16 +44,20 @@ import time
 from dataclasses import replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import logging
+
 import numpy as np
 
 from .differences import central_step, perturbed_weights, step_parameter
 from .influence_model import (
-    _set_basis_row, _set_kernel_column, fit_rows_model, rows_bin_posterior_variance,
-    rows_point_terms, rows_solve,
+    _set_basis_row, fit_rows_model, rows_bin_posterior_variance,
+    rows_kernel_columns, rows_point_terms, rows_solve,
 )
 from .joint import _fit_scale
 from .refine import CoordinateResult, apply_split, compute_rho2, finalize_coordinate, prepare_coordinate, propose
 from .rounds import _select_round, _split_task
+
+_log = logging.getLogger(__name__)
 
 __all__ = ["run_refinement_stencils"]
 
@@ -212,11 +216,16 @@ def run_refinement_stencils(
     leaf_H: Dict[Tuple[int, int, int], np.ndarray] = {}
     n_groups = 0  # set once the one full refit fixes the group count
 
-    def _cache_leaf(i: int, lid: int, idx: np.ndarray, group_ctx: Dict[int, dict]) -> None:
+    def _cache_leaves(new: List[Tuple[int, int, np.ndarray]], group_ctx: Dict[int, dict]) -> None:
+        # One K.A pass per group for every leaf created this round.
+        if not new:
+            return
         for gi, ctx in group_ctx.items():
-            key = (gi, i, lid)
-            leaf_Kx[key] = _set_kernel_column(Zw, idx, gpwidth, ctx['param'], h_full, bmu_full, d_z)
-            leaf_H[key] = _set_basis_row(Zw, idx, ctx['m'])
+            Kx_new = rows_kernel_columns(Zw, [idx for _, _, idx in new], gpwidth, ctx['param'],
+                                         h_full, bmu_full, d_z)
+            for col, (i, lid, idx) in enumerate(new):
+                leaf_Kx[(gi, i, lid)] = Kx_new[:, col]
+                leaf_H[(gi, i, lid)] = _set_basis_row(Zw, idx, ctx['m'])
 
     def _drop_leaf(i: int, lid: int, group_ctx: Dict[int, dict]) -> None:
         for gi in group_ctx:
@@ -266,17 +275,16 @@ def run_refinement_stencils(
     for gi, ctx in group_ctx.items():
         ids_reduced = ctx['ids_reduced']
         proto_Kx[gi] = (
-            np.stack([_set_kernel_column(Zw, proto_idx_all[j], gpwidth, ctx['param'], h_full,
-                                          bmu_full, d_z) for j in ids_reduced], axis=1)
+            rows_kernel_columns(Zw, [proto_idx_all[j] for j in ids_reduced], gpwidth, ctx['param'],
+                                h_full, bmu_full, d_z)
             if ids_reduced else np.zeros((N, 0))
         )
         proto_H[gi] = (
             np.stack([_set_basis_row(Zw, proto_idx_all[j], ctx['m']) for j in ids_reduced], axis=0)
             if ids_reduced else np.zeros((0, ctx['m']))
         )
-    for i, state in states.items():
-        for lid, leaf in state.leaves.items():
-            _cache_leaf(i, lid, leaf['indices'], group_ctx)
+    _cache_leaves([(i, lid, leaf['indices']) for i, state in states.items()
+                   for lid, leaf in state.leaves.items()], group_ctx)
 
     products['first_formation_wall_time'] = time.perf_counter() - t0
 
@@ -401,6 +409,7 @@ def run_refinement_stencils(
                 counter.add(1, len(X), int(failed))
 
         any_applied = False
+        new_leaves: List[Tuple[int, int, np.ndarray]] = []
         for (_, T_val, failed, _wt), (i, leaf, kind, idx_small, idx_large, p_small, p_large,
                                        t_small, tau) in zip(eval_results, task_meta):
             state = states[i]
@@ -422,13 +431,19 @@ def run_refinement_stencils(
             sd_scale[(i, small_id)] = sd_small
             sd_scale[(i, large_id)] = (p_small / p_large) * sd_small
             del sd_scale[(i, parent_id)]
-            _cache_leaf(i, small_id, state.leaves[small_id]['indices'], group_ctx)
-            _cache_leaf(i, large_id, state.leaves[large_id]['indices'], group_ctx)
+            new_leaves.append((i, small_id, state.leaves[small_id]['indices']))
+            new_leaves.append((i, large_id, state.leaves[large_id]['indices']))
             _drop_leaf(i, parent_id, group_ctx)
 
         if any_applied:
             n_update_rounds += 1
+            t_cache = time.perf_counter()
+            _cache_leaves(new_leaves, group_ctx)
+            update_wall_time += time.perf_counter() - t_cache
             _do_round_update()
+            _log.info('round %d: %d splits, %d leaves, update %.1fs cumulative',
+                      n_rounds, len(new_leaves) // 2, sum(len(st.leaves) for st in states.values()),
+                      update_wall_time)
 
     for i, state in states.items():
         cr = finalize_coordinate(state)

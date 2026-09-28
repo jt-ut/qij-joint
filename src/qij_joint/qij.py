@@ -88,7 +88,7 @@ from . import registry
 from .core import abc as core_abc
 from .core.counter import Counter
 from .core.eta import measure_eta_full
-from .core.influence_model import _set_kernel_column, fit_influence_model, fit_rows_model, rows_point_terms
+from .core.influence_model import fit_influence_model, fit_rows_model, rows_kernel_columns, rows_point_terms
 from .core.influence_model import psi0 as _psi0
 from .core.influence_model import uncertainty as _uncertainty
 from .core.joint import run_joint
@@ -337,10 +337,9 @@ class QIJ:
                 width_by_c: Dict[int, float] = {}
                 for gi, sh in stage1_shared.items():
                     cols_g = sh['cols']
-                    Kx_g = np.stack(
-                        [_set_kernel_column(Zw, idx, self.gpwidth, sh['param'], stage1_aux['h_full'],
-                                             stage1_aux['bmu_full'], stage1_aux['d_z'])
-                         for idx in sh['all_idx']], axis=1)
+                    Kx_g = rows_kernel_columns(Zw, sh['all_idx'], self.gpwidth, sh['param'],
+                                               stage1_aux['h_full'], stage1_aux['bmu_full'],
+                                               stage1_aux['d_z'])
                     psi0_g, sigma_g, _Rg = rows_point_terms(stage1_per_coord, cols_g, Kx_g, Zw, sh['m'])
                     for c in cols_g:
                         psi0_all[:, c] = psi0_g[c]

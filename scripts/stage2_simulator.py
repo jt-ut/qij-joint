@@ -48,7 +48,7 @@ import pandas as pd
 from qij_joint import products, registry
 from qij_joint.core.counter import Counter
 from qij_joint.core.influence_model import (
-    _set_kernel_column, fit_influence_model, fit_rows_model, psi0 as _psi0,
+    rows_kernel_columns, fit_influence_model, fit_rows_model, psi0 as _psi0,
     rows_point_terms, uncertainty as _uncertainty,
 )
 from qij_joint.core.refine import run_refinement
@@ -187,10 +187,8 @@ def run_one_draw(args, s: int, oracle_variance_pa=None):
         sigma_all = np.empty((N, q))
         for gi, sh in stage1_shared.items():
             cols_g = sh['cols']
-            Kx_g = np.stack(
-                [_set_kernel_column(Zw, idx, args.gpwidth, sh['param'], stage1_aux['h_full'],
-                                     stage1_aux['bmu_full'], stage1_aux['d_z'])
-                 for idx in sh['all_idx']], axis=1)
+            Kx_g = rows_kernel_columns(Zw, sh['all_idx'], args.gpwidth, sh['param'],
+                                       stage1_aux['h_full'], stage1_aux['bmu_full'], stage1_aux['d_z'])
             psi0_g, sigma_g, _R = rows_point_terms(stage1_per_coord, cols_g, Kx_g, Zw, sh['m'])
             for c in cols_g:
                 psi0_all[:, c] = psi0_g[c]
@@ -305,6 +303,8 @@ def _find_oracle_variance(runs, dataset, estimator, N, draws, output_name):
 
 
 def main(argv=None):
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', stream=sys.stderr)
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--runs', required=True, help='directory holding the stored oracle/ij products')

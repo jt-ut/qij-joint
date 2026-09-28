@@ -32,12 +32,15 @@ alpha` from the same Cholesky solve `fit_influence_model` performs).
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.linalg import LinAlgError, cho_factor, cho_solve
+from scipy.linalg import LinAlgError, cho_factor, cho_solve, solve_triangular
+from scipy.sparse import csr_matrix
+from threadpoolctl import threadpool_limits
 from scipy.optimize import brentq, minimize_scalar
 from scipy.spatial.distance import cdist
 
@@ -1175,11 +1178,70 @@ def _rows_kernel_matrix(
     row-against-row values back), formed FRESH -- the hyperparameter
     search calls this once per candidate, since the covariance itself
     depends on the width/c being searched over."""
-    Kx = np.stack(
-        [_set_kernel_column(Zw, idx, gpwidth, param, h_full, bmu, d_z) for idx in all_idx],
-        axis=1,
-    )
-    return assemble_K_ss(Kx, all_idx)
+    return assemble_K_ss(rows_kernel_columns(Zw, all_idx, gpwidth, param, h_full, bmu, d_z), all_idx)
+
+
+_KA_CHUNK = 1024  # point rows per chunk of the one N x N kernel pass in `rows_kernel_columns`
+
+
+def _averaging_matrix(N: int, all_idx: Sequence[np.ndarray]):
+    """A (N, n), sparse: column S holds 1/n_S on S's members."""
+    rows = np.concatenate([np.asarray(idx) for idx in all_idx])
+    cols = np.concatenate([np.full(len(idx), s) for s, idx in enumerate(all_idx)])
+    vals = np.concatenate([np.full(len(idx), 1.0 / len(idx)) for idx in all_idx])
+    return csr_matrix((vals, (rows, cols)), shape=(N, len(all_idx)))
+
+
+def rows_kernel_columns(
+    Zw: np.ndarray, all_idx: Sequence[np.ndarray], gpwidth: str, param: float,
+    h_full: Optional[np.ndarray], bmu: Optional[np.ndarray], d_z: int,
+) -> np.ndarray:
+    """Kx = K . A (N, n) in one chunked pass over the N x N point kernel:
+    each chunk of rows is evaluated against all N points once and
+    averaged onto every set by the sparse A (E4: never an N x N array),
+    instead of one kernel call per set. Equals stacking
+    `_set_kernel_column` over `all_idx`, to rounding."""
+    N = Zw.shape[0]
+    At = _averaging_matrix(N, all_idx).T.tocsr()
+    Kx = np.empty((N, len(all_idx)), dtype=float)
+    if gpwidth == 'local':
+        ell_all = param * h_full[bmu]
+    for start in range(0, N, _KA_CHUNK):
+        sl = slice(start, start + _KA_CHUNK)
+        D = cdist(Zw[sl], Zw)
+        if gpwidth == 'global':
+            Kc = _matern32(D, param)
+        else:
+            Kc = _matern32_nonstationary(D, ell_all[sl], ell_all, d_z)
+        Kx[sl] = (At @ Kc.T).T
+    return Kx
+
+
+def _blas_threads():
+    """All cores for the row model's dense algebra, which runs in the
+    parent process while the evaluation pool is idle (the parent is
+    pinned to one BLAS thread for the pool's sake)."""
+    return threadpool_limits(limits=os.cpu_count() or 1, user_api='blas')
+
+
+def _chol_quad_diag(chol, B: np.ndarray) -> np.ndarray:
+    """diag(B M^{-1} B^T) for M = LL^T given as `cho_factor`'s (c, lower):
+    one triangular solve and a column sum of squares, half the work of
+    `cho_solve` followed by an einsum."""
+    c, lower = chol
+    W = solve_triangular(c, B.T, lower=lower, trans='N' if lower else 'T', check_finite=False)
+    return np.einsum('ij,ij->j', W, W)
+
+
+def _with_blas_threads(fn):
+    """Run `fn` under `_blas_threads()`."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _blas_threads():
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _rows_grid_candidate(
@@ -1322,6 +1384,7 @@ def _rows_group_fit(
     return per_coord, shared
 
 
+@_with_blas_threads
 def fit_rows_model(
     Z: np.ndarray, xvq, I_proto: np.ndarray, theta_Q: np.ndarray, eta: float,
     gptrend: str = 'affine', gpwidth: str = 'global',
@@ -1469,6 +1532,7 @@ def fit_rows_model(
     return per_coordinate, shared_by_group, constant, aux
 
 
+@_with_blas_threads
 def rows_solve(
     Kx: np.ndarray, all_idx: Sequence[np.ndarray], Hb: np.ndarray, n_proto: int, m_g: int,
     cols_g: Sequence[int], response: Dict[int, np.ndarray], lam_by_c: Dict[int, float],
@@ -1516,6 +1580,7 @@ def rows_solve(
     return per_coord
 
 
+@_with_blas_threads
 def rows_point_terms(
     per_coordinate: Dict[int, dict], cols_g: Sequence[int], Kx: np.ndarray, Zw: np.ndarray,
     m_g: int,
@@ -1546,12 +1611,10 @@ def rows_point_terms(
         for c in cols_g:
             st = per_coordinate[c]
             psi0_out[c][sl] = Hc @ st['beta'] + Kc @ st['alpha']
-            AinvK = cho_solve(st['chol'], Kc.T)
-            term1 = np.einsum('ij,ji->i', Kc, AinvK)
+            term1 = _chol_quad_diag(st['chol'], Kc)
             Rc = Hc - Kc @ st['ainv_hb']
             R_out[c][sl] = Rc
-            GinvRcT = cho_solve(st['g_chol'], Rc.T)
-            term2 = np.einsum('ij,ji->i', Rc, GinvRcT)
+            term2 = _chol_quad_diag(st['g_chol'], Rc)
             sigma2 = st['s2'] * (1.0 - term1 + term2)
             sigma2 = np.maximum(sigma2, 0.0)
             sigma_out[c][sl] = np.sqrt(sigma2)
@@ -1559,6 +1622,7 @@ def rows_point_terms(
     return psi0_out, sigma_out, R_out
 
 
+@_with_blas_threads
 def rows_bin_posterior_variance(
     per_coordinate: Dict[int, dict], coordinate: int, groups: Sequence[np.ndarray],
     sigma_c: np.ndarray, Zw: np.ndarray, R_full: np.ndarray, Kx: np.ndarray,
