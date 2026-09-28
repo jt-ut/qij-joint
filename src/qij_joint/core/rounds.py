@@ -71,16 +71,18 @@ def _select_round(states: dict, active: set) -> dict:
     A14). An output with nothing to select is dropped from `active` in
     place -- a fixed point it can never leave (module docstring).
 
-    Under `refine_trigger='measured'` (A15 item 1, round 2: flagging is
+    Under `refine_trigger='measured'` (A15 item 1: flagging is
     entry-only, so `l['flagged']` is only ever true for an as-yet-
     unsplit initial bin), every flagged open leaf is placed FIRST, in
     descending measured-discrepancy order (ties: lower leaf id), ahead
     of the ported gain-qualifying leaves: 'flagged bins are split in the
     round they're flagged, all in the round's pool batch' -- unlike the
     queue, a round need not wait for the flagged leaves alone; the
-    remaining budget still admits gain-qualifying leaves (flagged-
-    lineage descendants included, once past their own first split) from
-    the same output in the same batch."""
+    remaining budget still admits gain-qualifying leaves in the same
+    batch -- an unflagged leaf's 'g' is the ported predicted gain, a
+    flagged lineage's own descendant's 'g' is the measured Delta/2
+    `refine.apply_split` set at its creation (item 3), both compared to
+    tau the same way here."""
     selections = {}
     for i in list(active):
         state = states[i]

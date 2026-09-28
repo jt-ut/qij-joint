@@ -946,6 +946,22 @@ is misplaced exactly where it matters.
    bins with their measured discrepancy, unflagged bins with the ported
    expected gain; (iv) closing by the ported two-strike rule everywhere;
    (v) unflagged bins refined exactly as ported. Guard unchanged.
+   **Round 3 result (draw 0):** 0.93–0.96 on six outputs, the angle at
+   0.77, 793 evaluations, lineages closing on their own, geometric splits
+   doing all the flagged work. Short because a principal-axis split is
+   blind to the influence: its realized gains are erratic and two erratic
+   misses close a lineage that still holds variance.
+   **Round 4 (28 September), amending (ii) only: the geometric split
+   follows the MEASURED local gradient.** In a flagged lineage, take the
+   measured cells under the cell's nearest ancestor with at least three
+   measured descendant cells (whitened centroids c_j, measured U_j for the
+   output being refined, masses p_j), fit the mass-weighted least-squares
+   plane U = α + g·c, and split the cell at the median of its members'
+   projections onto g; with fewer than three such cells, the
+   principal-axis split. The paper's level split with measured local
+   levels in place of the GP's; model-free; no extra evaluation. Local to
+   the sub-lineage because a quadrupole's gradient vanishes at the core's
+   centre but not within each half after the first bisection.
 2. ~~Zero-level closing.~~ **Removed in round 3.** One below-τ split
    cannot distinguish a constant bin from an evenly divided one, which is
    why the paper waits for two; round 2 showed what one strike costs.
@@ -1027,22 +1043,42 @@ default until A16 is accepted; `anneal`).
    decides whether it is fine enough, and the only permitted change is a
    finer factor.
 2. Start: all K components at the sample mean and covariance with equal
-   weights, with a deterministic symmetry break: component k's mean
-   displaced by (k − (K+1)/2) × 10⁻³ σ₁ along the data's first principal
-   axis (σ₁ its standard deviation). Symmetric EM would otherwise keep the
-   components identical forever.
-3. At each β: the E-step uses tempered responsibilities,
+   weights. **Amended 28 September after the first build failed on all
+   five draws:** a symmetry break injected ONCE is not deterministic
+   annealing. With identical covariances the tempered EM contracts a
+   mean-only perturbation by exactly β per step (the builder's derivation,
+   checked numerically), so a seed injected at β = 0.02 is below float64
+   long before the critical temperatures of the small structures, and all
+   K components collapse to one saddle that the gate correctly refuses.
+   Rose's procedure re-injects the perturbation at every temperature:
+   below a structure's critical temperature it contracts, above it the
+   same perturbation grows into the split.
+3. At EVERY β step, before that step's EM, every component is perturbed
+   deterministically: its mean displaced by 10⁻³ σ_k along its own first
+   principal axis, with the sign alternating with the component index so
+   that identical copies move apart, and its covariance scaled by
+   (1 + 10⁻³) or (1 − 10⁻³) along that axis for alternating copies. Then
+   the E-step uses tempered responsibilities,
    r_ik(β) ∝ [π_k φ(x_i; μ_k, Σ_k)]^β normalized over k; the M-step is the
    penalized weighted M-step as built (SQUAREM allowed); iterate to the
-   ported convergence tolerance, warm from the previous β.
+   ported convergence tolerance, warm from the previous β. Copies
+   re-collapse below their critical temperature and separate above it; the
+   perturbation size, 10⁻³ of the local scale, is the one constant.
+   Products add, per β, the effective component count by pairwise
+   Bhattacharyya distance above 10⁻⁶ (copies below that count as one), so
+   the β-trace shows the splits.
 4. At β = 1: the Newton gate and polish as built, acceptance at the
    measured η_full.
 5. Under `anneal` there are no k-means starts, no greedy insertion, no
-   families and no screen. **Amended 28 September:** annealing is built as
-   the ONLY cold search from the start; seeding.py, the k-means starts and
-   the screen are removed with the build (git holds them), and the
-   multistart's already-recorded results on draws 0, 1, 3, 6 and 7 are the
-   comparison side of the acceptance. There is no `search` switch.
+   families and no screen. **Amended twice on 28 September:** the first
+   build removed the multistart with the anneal and the anneal then failed
+   on all five draws, leaving the tree with no cold search, a sequencing
+   error of the planner's. The multistart is restored from commit 8153393
+   as `search = 'multistart'`, the DEFAULT until the anneal passes its five
+   draws; `search = 'anneal'` is the candidate. Once accepted, the
+   multistart code comes out under §5 R3 and anneal becomes the only
+   search. The multistart's recorded results on draws 0, 1, 3, 6 and 7
+   remain the comparison side of the acceptance.
    Continuations with `start` never anneal: they run EM from their start
    on its branch, since annealing would erase the branch a derivative
    depends on; that cold/warm distinction is the design.
@@ -1272,3 +1308,17 @@ the joint count. No bootstrap. One table. Report as found.
 Wave A first, audited and measured; then wave B on top of it. B assumes
 A's switches exist but does not depend on their values. Item 4 is ruled
 (A4) and item 7 is closed (B6); nothing in either wave waits on a ruling.
+
+### A17. The stencils update the influence model (author's instruction, 28 September)
+
+Specified in full in `QIJ_A17_stencil_update.md`; the diagnosis it rests
+on is `QIJ_stage2_groundup.md`. In one sentence: every full-data stencil
+(initial bin or refinement split) is an exact observation of the mean of
+the influence over a known set of points for every output, and it enters
+every output's influence model as such, so every open leaf of every
+output is re-proposed from a model corrected by what has been measured.
+New switch `refine_update` (`none` = ported, default; `stencils` = the
+demo). A15 items 1–5 (`refine_trigger` and the flagged-lineage
+machinery) are superseded and removed; A15's η_full, local width and
+bookkeeping fixes stand. Acceptance runs first on the planner's exact
+offline simulator, then as the A15 rehearsal gate.

@@ -25,7 +25,10 @@ def _oracle_task(T, case, X, task):
     drawn fresh in this worker since draws are shared only by (N, seed),
     not by value, when the pool runs across draws. `failed` is also set
     on a NaN return that raised no exception (a gate failing quietly),
-    not only on an exception."""
+    not only on an exception. `registry.cold_fit_diagnostics`, called
+    immediately after (A16 items 6-7's one shared helper), reads
+    `T.last_fit_info` before any other call touches it and spends the
+    search audit's own continuation evaluation, in this same worker."""
     s, N, base_seed = task
     seed = base_seed + s
     t0 = time.perf_counter()
@@ -36,7 +39,9 @@ def _oracle_task(T, case, X, task):
     except Exception:
         theta_hat = np.full(len(T.outputs), np.nan)
         failed = True
-    return s, seed, theta_hat, failed, time.perf_counter() - t0
+    wall = time.perf_counter() - t0
+    diag = registry.cold_fit_diagnostics(T, Xd, theta_hat, case.dataset, case.estimator)
+    return s, seed, theta_hat, failed, wall, diag
 
 
 def _ij_task(T, case, X, task):
@@ -44,19 +49,31 @@ def _ij_task(T, case, X, task):
     `V_ij = mean(psi**2, axis=0) / N`, the infinitesimal-jackknife
     variance of theta_hat. `failed` is also set on a NaN return that
     raised no exception (a gate failing quietly), not only on an
-    exception."""
+    exception. When `T` has a restart search, `fit_and_influence` gets
+    `theta_hat` from the SAME fit `psi` already costs (never a second
+    cold search, R6/E6), so `registry.cold_fit_diagnostics` (A16
+    items 6-7) has it at no extra evaluation beyond the search audit's
+    own continuation."""
     s, N, base_seed = task
     seed = base_seed + s
     t0 = time.perf_counter()
     Xd = case.draw(N, seed)
+    theta_hat = None
     try:
-        psi = np.asarray(T.influence(Xd, np.ones(N)), dtype=float)
+        if getattr(T, 'takes_start', False) and hasattr(T, 'fit_and_influence'):
+            theta_hat, psi = T.fit_and_influence(Xd, np.ones(N))
+            theta_hat = np.asarray(theta_hat, dtype=float)
+        else:
+            psi = T.influence(Xd, np.ones(N))
+        psi = np.asarray(psi, dtype=float)
         failed = bool(np.any(np.isnan(psi)))
     except Exception:
         psi = np.full((N, len(T.outputs)), np.nan)
         failed = True
+    wall = time.perf_counter() - t0
     V_ij = np.mean(psi ** 2, axis=0) / N
-    return s, seed, V_ij, psi, failed, time.perf_counter() - t0
+    diag = registry.cold_fit_diagnostics(T, Xd, theta_hat, case.dataset, case.estimator)
+    return s, seed, V_ij, psi, failed, wall, diag
 
 
 def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
@@ -71,10 +88,11 @@ def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed:
     if pending:
         pool = Pool(workers, case=(dataset, estimator))
         tasks = [(s, N, seed) for s in pending]
-        for s, dseed, theta_hat, failed, wall in pool.map(_oracle_task, tasks):
+        for s, dseed, theta_hat, failed, wall, diag in pool.map(_oracle_task, tasks):
             row = {'dataset': dataset, 'estimator': estimator, 'N': N,
                    's': s, 'seed': dseed, 'n_failed': int(failed),
                    'wall_time': wall, 'busy_time': wall, 'workers': workers}
+            row.update(diag)
             for j, o in enumerate(outputs):
                 row[f'theta_true_{o}'] = float(theta_true[j])
                 row[f'theta_hat_{o}'] = float(theta_hat[j])
@@ -96,10 +114,11 @@ def run_ij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int
     if pending:
         pool = Pool(workers, case=(dataset, estimator))
         tasks = [(s, N, seed) for s in pending]
-        for s, dseed, V_ij, psi, failed, wall in pool.map(_ij_task, tasks):
+        for s, dseed, V_ij, psi, failed, wall, diag in pool.map(_ij_task, tasks):
             row = {'dataset': dataset, 'estimator': estimator, 'N': N,
                    's': s, 'seed': dseed, 'n_failed': int(failed),
                    'wall_time': wall, 'busy_time': wall, 'workers': workers}
+            row.update(diag)
             for j, o in enumerate(outputs):
                 row[f'V_ij_{o}'] = float(V_ij[j])
             psi_df = pd.DataFrame({f'psi_{o}': psi[:, j] for j, o in enumerate(outputs)})
@@ -123,11 +142,13 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
             continue
         dseed = seed + s
         X = case.draw(N, dseed)
-        res = Bootstrap(B=B, seed=dseed).fit(X, T, pool=pool)
+        res = Bootstrap(B=B, seed=dseed).fit(X, T, pool=pool, dataset=dataset, estimator=estimator)
         row = {'dataset': dataset, 'estimator': estimator, 'N': N,
                's': s, 'seed': dseed, 'n_degenerate': res.n_degenerate,
                'wall_time': res.wall_time, 'busy_time': res.busy_time,
-               'workers': res.workers, 'eta_full': float(res.eta_full)}
+               'workers': res.workers, 'eta_full': float(res.eta_full),
+               'beta_star': res.beta_star, 'cold_ll': res.cold_ll,
+               'search_gap': res.search_gap, 'search_failed': bool(res.search_failed)}
         rep_df = pd.DataFrame({f'theta_{o}': res.replicates[:, j]
                                 for j, o in enumerate(res.outputs)})
         products.write_draw(md, s, row, {'replicates': rep_df})
@@ -159,7 +180,9 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
            'quantized_start': res.quantized_start, 'eta_Q': float(res.eta_Q),
            'eta_full': float(res.eta_full),
            'refine_schedule': res.refine_schedule, 'n_rounds': int(res.n_rounds),
-           'refine_trigger': res.refine_trigger}
+           'refine_trigger': res.refine_trigger,
+           'beta_star': res.beta_star, 'cold_ll': res.cold_ll,
+           'search_gap': res.search_gap, 'search_failed': bool(res.search_failed)}
     for stage in ('prototype', 'full_data', 'refinement', 'curvature', 'eta_full', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
@@ -323,7 +346,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
                   refine_schedule=refine_schedule, refine_trigger=refine_trigger).fit(
-                      X, T, pool=pool)
+                      X, T, pool=pool, dataset=dataset, estimator=estimator)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         arrays = {'step_ratio': _qij_step_ratio(res)}
         # `bin_U` (A14) is its own product name, distinct from the
@@ -357,7 +380,9 @@ def _ijfd_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> d
            's': s, 'seed': seed, 'point_curvature': bool(res.point_curvature),
            'eta_full': float(res.eta_full), 'nan_fraction': float(res.nan_fraction),
            'wall_time_total': float(res.wall_time_total),
-           'busy_time_total': float(res.busy_time_total), 'workers': int(res.workers)}
+           'busy_time_total': float(res.busy_time_total), 'workers': int(res.workers),
+           'beta_star': res.beta_star, 'cold_ll': res.cold_ll,
+           'search_gap': res.search_gap, 'search_failed': bool(res.search_failed)}
     for stage in ('cold', 'eta_full', 'forward', 'backward', 'abc', 'check', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
@@ -410,7 +435,8 @@ def run_ijfd(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
             continue
         dseed = seed + s
         X = case.draw(N, dseed)
-        res = IJFD(point_curvature=point_curvature).fit(X, T, pool=pool)
+        res = IJFD(point_curvature=point_curvature).fit(
+            X, T, pool=pool, dataset=dataset, estimator=estimator)
         row = _ijfd_row(dataset, estimator, N, s, dseed, res)
         arrays = {'step_ratio': _ijfd_step_ratio(res), 'psi': _ijfd_points(res)}
         products.write_draw(md, s, row, arrays)

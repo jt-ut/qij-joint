@@ -127,6 +127,10 @@ class QIJResult:
     n_flagged: np.ndarray          # (q,) int; initial bins flagged; 0 under 'gain'
     n_flag_evals: np.ndarray       # (q,) int; evaluations on flagged lineages; 0 under 'gain'
     n_geom_splits: np.ndarray      # (q,) int; GEOMETRIC splits taken; 0 under 'gain'
+    beta_star: float               # A16 item 6, from theta_hat's own T.last_fit_info
+    cold_ll: float                 # A16 item 6, theta_hat's own final penalized log-likelihood
+    search_gap: float              # A16.7's search audit
+    search_failed: bool            # A16.7's search audit
 
     @property
     def variance(self) -> np.ndarray:
@@ -172,6 +176,10 @@ class BootstrapResult:
     busy_time: float
     workers: int
     eta_full: float
+    beta_star: float         # A16 item 6, from theta_hat's own T.last_fit_info
+    cold_ll: float           # A16 item 6, theta_hat's own final penalized log-likelihood
+    search_gap: float        # A16.7's search audit
+    search_failed: bool      # A16.7's search audit
 
     @property
     def variance(self) -> np.ndarray:
