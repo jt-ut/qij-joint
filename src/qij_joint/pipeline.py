@@ -161,18 +161,17 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     """One `qij` scalar row: `QIJResult`'s scalars flattened to columns
     per stage and per output, plus `ivqbins`, `survey`, `quantized_start`,
     `refine_schedule`/`n_rounds` (the marginal path's own schedule,
-    spec/QIJ_mods_waves.md A14), `refine_trigger` and its own A15 item 6
-    products (`a_c_<o>`, `n_flagged_<o>`, `n_flag_evals_<o>`,
-    `n_geom_splits_<o>`), `eta_full` (A15), the ABC interval's
-    ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`, `eta_Q`,
-    spec/QIJ_mods_waves.md A10) and the joint scalars from the joint
-    second stage (spec/method_notes.md section 6) -- the joint scalars
-    inert under `ivqbins='marginal'`. The joint check's own scale factor
-    (B6, also lettered `a` in the spec) is `joint_a_<o>` here, kept
-    distinct from A10's `a_<o>` (the ABC acceleration, populated under
-    both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
-    measured trigger's own scale factor, B4's formula reused at one
-    output)."""
+    spec/QIJ_mods_waves.md A14), `refine_update`/`n_update_rounds`/
+    `update_wall_time` and its own `a_c_<o>` product
+    (spec/QIJ_A17_stencil_update.md), `eta_full` (A15), the ABC
+    interval's ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`,
+    `eta_Q`, spec/QIJ_mods_waves.md A10) and the joint scalars from the
+    joint second stage (spec/method_notes.md section 6) -- the joint
+    scalars inert under `ivqbins='marginal'`. The joint check's own
+    scale factor (B6, also lettered `a` in the spec) is `joint_a_<o>`
+    here, kept distinct from A10's `a_<o>` (the ABC acceleration,
+    populated under both `ivqbins` values) and from the stencil
+    update's own `a_c_<o>` (B4's formula reused at one output)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
@@ -180,7 +179,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
            'quantized_start': res.quantized_start, 'eta_Q': float(res.eta_Q),
            'eta_full': float(res.eta_full),
            'refine_schedule': res.refine_schedule, 'n_rounds': int(res.n_rounds),
-           'refine_trigger': res.refine_trigger,
+           'refine_update': res.refine_update, 'n_update_rounds': int(res.n_update_rounds),
+           'update_wall_time': float(res.update_wall_time),
            'beta_star': res.beta_star, 'cold_ll': res.cold_ll,
            'search_gap': res.search_gap, 'search_failed': bool(res.search_failed)}
     for stage in ('prototype', 'full_data', 'refinement', 'curvature', 'eta_full', 'total'):
@@ -221,9 +221,6 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'c_q_{o}'] = float(res.c_q[j])
         row[f'c_q_one_sided_{o}'] = bool(res.c_q_one_sided[j])
         row[f'a_c_{o}'] = float(res.a_c[j])
-        row[f'n_flagged_{o}'] = int(res.n_flagged[j])
-        row[f'n_flag_evals_{o}'] = int(res.n_flag_evals[j])
-        row[f'n_geom_splits_{o}'] = int(res.n_geom_splits[j])
     return row
 
 
@@ -315,7 +312,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
             M_X: Optional[int] = None, ivqbins: str = 'marginal',
             survey: str = 'points', quantized_start: str = 'multistart',
-            refine_schedule: str = 'queue', refine_trigger: str = 'gain') -> Tuple[int, int]:
+            refine_schedule: str = 'queue', refine_update: str = 'none') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -325,11 +322,12 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     `workers`. `survey` picks the prototype survey's receptive-field
     representation (spec/method_notes.md section 2); `quantized_start`
     picks theta_Q's starting point (spec/QIJ_mods_waves.md A9 item 5);
-    `refine_trigger` picks the marginal refinement's own leaf-selection
-    rule (spec/QIJ_mods_waves.md A15). Every draw also writes a
-    `step_ratio` array (A9 item 4) and, under `ivqbins='marginal'`, a
-    `bin_U` array (spec/QIJ_mods_waves.md A14), neither gated behind
-    `--diag-draws` like `points`/`prototypes`/`bins` are."""
+    `refine_update` picks what steers the marginal refinement, `'none'`
+    (ported) or `'stencils'` (spec/QIJ_A17_stencil_update.md; requires
+    `refine_schedule='rounds'`). Every draw also writes a `step_ratio`
+    array (A9 item 4) and, under `ivqbins='marginal'`, a `bin_U` array
+    (spec/QIJ_mods_waves.md A14), neither gated behind `--diag-draws`
+    like `points`/`prototypes`/`bins` are."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -345,7 +343,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
-                  refine_schedule=refine_schedule, refine_trigger=refine_trigger).fit(
+                  refine_schedule=refine_schedule, refine_update=refine_update).fit(
                       X, T, pool=pool, dataset=dataset, estimator=estimator)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         arrays = {'step_ratio': _qij_step_ratio(res)}

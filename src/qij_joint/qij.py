@@ -54,11 +54,15 @@ pool batch per round across outputs. Under `ivqbins='joint'` the switch
 is inert -- the joint path's own check already advances in rounds, not
 a queue.
 
-`refine_trigger` (spec/QIJ_mods_waves.md A15) picks the marginal path's
-own leaf-selection rule, under either `refine_schedule`: `'gain'`
-(ported, the default, bit-identical) or `'measured'` (the demo's
-setting, `core.refine`/`core.rounds` module docstrings). Inert under
-`ivqbins='joint'`.
+`refine_update` (spec/QIJ_A17_stencil_update.md) picks what steers the
+marginal path's refinement: `'none'` (default, bit-identical -- the
+ported rule, `core.refine`/`core.rounds`) or `'stencils'` (every
+full-data stencil enters every measured output's influence model as an
+exact observation, and every open leaf is re-proposed from the updated
+model between rounds, `core.stencils`). `'stencils'` requires
+`refine_schedule='rounds'` (`QIJ.__init__` raises `ValueError`
+otherwise: a refit per split under `'queue'` is not paid for). Inert
+under `ivqbins='joint'`.
 
 `eta_full` (spec/QIJ_mods_waves.md A15, A13 step 2) is measured once
 per draw, right after `theta_hat`, by `core.eta.measure_eta_full`, and
@@ -87,8 +91,9 @@ from .core.influence_model import fit_influence_model
 from .core.influence_model import psi0 as _psi0
 from .core.influence_model import uncertainty as _uncertainty
 from .core.joint import run_joint
-from .core.refine import run_refinement, whiten_columns
+from .core.refine import run_refinement
 from .core.rounds import run_refinement_rounds
+from .core.stencils import run_refinement_stencils
 from .core.xvq import cost_rule_M, run_xvq
 from .parallel import prepared
 from .result import QIJResult
@@ -115,9 +120,7 @@ def _marginal_defaults(N: int, q: int) -> dict:
         n_adjacency_splits=np.zeros(q, dtype=int), rho=np.full(q, np.nan),
         n_refine_evals=np.zeros(q, dtype=int),
         psi_hat=np.full((N, q), np.nan), bin_label=np.full((N, q), -1, dtype=int),
-        bin_U=(),
-        a_c=np.full(q, np.nan), n_flagged=np.zeros(q, dtype=int),
-        n_flag_evals=np.zeros(q, dtype=int), n_geom_splits=np.zeros(q, dtype=int),
+        bin_U=(), a_c=np.full(q, np.nan),
     )
 
 
@@ -163,20 +166,19 @@ def _theta_hat_task(T, case, X: np.ndarray, task):
 
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
-                  sv, quantized_start, refine_schedule, refine_trigger) -> QIJResult:
+                  sv, quantized_start, refine_schedule, refine_update) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
     `survey_step_ratio` come from `sv`, since the survey (stage 1) ran
     to completion before the influence model's own fit failed; the ABC
     interval's ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`) and
-    `eta_full` (spec/QIJ_mods_waves.md A15), which need stage 2 and the
-    curvature/eta_full stages none of which ever ran, are NaN/False. The
-    second stage never ran under either value of `ivqbins`, so both the
-    marginal and the joint fields are inert. `I_proto` and `sv.step_ratio`
-    are the full-width survey products; `measured` restricts them to the
-    reported outputs, exactly as the successful path does (spec
-    QIJ_mods_waves.md A11)."""
+    `eta_full`, which need stage 2 and the curvature/eta_full stages
+    none of which ever ran, are NaN/False. The second stage never ran
+    under either value of `ivqbins`, so both the marginal and the joint
+    fields are inert. `I_proto` and `sv.step_ratio` are the full-width
+    survey products; `measured` restricts them to the reported outputs,
+    exactly as the successful path does (spec QIJ_mods_waves.md A11)."""
     q = len(outputs)
     nan_q, false_q = np.full(q, np.nan), np.zeros(q, dtype=bool)
     nan_Nq = np.full((N, q), np.nan)
@@ -203,7 +205,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        refine_trigger=refine_trigger,
+        refine_update=refine_update, n_update_rounds=0, update_wall_time=0.0,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_NO_COLD_DIAG,
     )
 
@@ -216,7 +218,11 @@ class QIJ:
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
                  refine_schedule: str = 'queue',
-                 refine_trigger: str = 'gain') -> None:
+                 refine_update: str = 'none') -> None:
+        if refine_update == 'stencils' and refine_schedule != 'rounds':
+            # spec/QIJ_A17_stencil_update.md section 4: a refit per split
+            # under 'queue' is not paid for.
+            raise ValueError("refine_update='stencils' requires refine_schedule='rounds'")
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -226,7 +232,7 @@ class QIJ:
         self.ivqbins = ivqbins
         self.survey = survey
         self.refine_schedule = refine_schedule
-        self.refine_trigger = refine_trigger
+        self.refine_update = refine_update
         self.quantized_start = quantized_start
 
     def fit(self, X: np.ndarray, T, pool=None, dataset: str = None,
@@ -326,7 +332,7 @@ class QIJ:
             return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                  self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                  self.survey, sv, self.quantized_start, self.refine_schedule,
-                                 self.refine_trigger)
+                                 self.refine_update)
         psi0_all = _psi0(model, Z)
         sigma_all = _uncertainty(model, Z)
         wall_time_prototype = time.perf_counter() - t0
@@ -387,10 +393,11 @@ class QIJ:
         # stage 2's own evaluations only for an estimator with restarts;
         # None is a no-op for every other estimator (bit-identical).
         start_second_stage = theta_hat if getattr(T, 'takes_start', False) else None
-        Z_white = whiten_columns(Z) if self.refine_trigger == 'measured' else None
 
         t0 = time.perf_counter()
         n_rounds = 0
+        n_update_rounds = 0
+        update_wall_time = 0.0
         if self.ivqbins == 'joint':
             # `psi0_all`/`sigma_all`/`model` are already the measured
             # subset (this call's own `fit_influence_model` above), so
@@ -445,7 +452,19 @@ class QIJ:
             # scheduled: `'queue'` runs each output's own queue in turn,
             # serial evaluations only; `'rounds'` runs them together,
             # batching every round's evaluations across outputs onto `pool`.
-            if self.refine_schedule == 'rounds':
+            # `refine_update='stencils'` (spec/QIJ_A17_stencil_update.md)
+            # requires `'rounds'` (`__init__` already enforced this) and
+            # runs through `core.stencils` instead.
+            if self.refine_update == 'stencils':
+                coordinates, n_rounds, n_update_rounds, update_wall_time = run_refinement_stencils(
+                    X, counter, theta_hat, list(measured), list(outputs),
+                    [psi0_all[:, j] for j in range(q)], [float(model.offset[j]) for j in range(q)],
+                    [sigma_all[:, j] for j in range(q)], [I_proto[:, c] for c in measured],
+                    xvq.bmu, xvq.bmu2, eta_full, self.eps, xvq.M_used,
+                    [bool(model.constant_path[j]) for j in range(q)], Z, model, list(range(q)),
+                    pool, start=start_second_stage,
+                )
+            elif self.refine_schedule == 'rounds':
                 coordinates, n_rounds = run_refinement_rounds(
                     X, counter, theta_hat, list(measured), list(outputs),
                     [psi0_all[:, j] for j in range(q)], [float(model.offset[j]) for j in range(q)],
@@ -453,7 +472,6 @@ class QIJ:
                     xvq.bmu, xvq.bmu2, eta_full, self.eps, xvq.M_used,
                     [bool(model.constant_path[j]) for j in range(q)], Z, model, list(range(q)),
                     pool, start=start_second_stage,
-                    refine_trigger=self.refine_trigger, Z_white=Z_white,
                 )
             else:
                 coordinates = [
@@ -463,7 +481,6 @@ class QIJ:
                         I_proto[:, c], xvq.bmu, xvq.bmu2,
                         eta_full, self.eps, xvq.M_used, bool(model.constant_path[j]), Z, model, pool,
                         start=start_second_stage, model_index=j,
-                        refine_trigger=self.refine_trigger, Z_white=Z_white,
                     )
                     for j, (c, name) in enumerate(zip(measured, outputs))
                 ]
@@ -507,12 +524,10 @@ class QIJ:
                 # measured columns; one (L_c, q) array per output, L_c its
                 # own final bin count.
                 bin_U=tuple(cr.bin_U[:, measured] for cr in coordinates),
-                # A15 item 6's products, per output; NaN/0 for every
-                # coordinate under `refine_trigger='gain'`.
+                # The stencil update's scale factor (spec/QIJ_A17_
+                # stencil_update.md section 3); NaN under `refine_update=
+                # 'none'`.
                 a_c=np.array([cr.a_c for cr in coordinates]),
-                n_flagged=np.array([cr.n_flagged for cr in coordinates]),
-                n_flag_evals=np.array([cr.n_flag_evals for cr in coordinates]),
-                n_geom_splits=np.array([cr.n_geom_splits for cr in coordinates]),
             )
             joint_fields = _joint_defaults(N, q)
         wall_time_refinement = time.perf_counter() - t0
@@ -574,6 +589,7 @@ class QIJ:
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
-            refine_trigger=self.refine_trigger,
+            refine_update=self.refine_update, n_update_rounds=n_update_rounds,
+            update_wall_time=update_wall_time,
             **second_stage_fields, **joint_fields, **cold_diag,
         )

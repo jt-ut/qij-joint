@@ -180,3 +180,53 @@ Per output: `a_c` (kept), `n_update_rounds` (shared), `update_wall_time`
 
 If step 2 fails, stop and report the table; the next step is the
 planner's, not another steering rule.
+
+## 8. Amendments after the coder's review (28 September, evening)
+
+These supersede the corresponding statements above.
+
+1. **No linear dependence in the design.** (a) The design holds only
+   each output's CURRENT leaves: when a leaf is split, its row leaves
+   the design and its two children's rows enter (a parent's mean is
+   exactly the mass-weighted mean of its children's). (b) Set rows are
+   not exact. A stencil carries finite-difference error, declared by the
+   same rule the survey's noise floor uses: noise sd √2 · η_full · |θ̂_c|
+   / t_S for a set measured at step t_S (the initial bins' central
+   stencils at their t_k; a split's smaller child at t_small; the larger
+   child inherits the smaller's noise scaled by p_small/p_large through
+   mass balance). Each set row's noise variance is that sd squared,
+   divided by s²_c to enter the model's λ scale. (c) The solve is an
+   eigendecomposition of the augmented covariance with a relative cut
+   at 10⁻¹⁰ of the largest eigenvalue, never a bare Cholesky: every
+   output's partition still sums to the global-mean functional, and
+   those near-redundant rows must be handled, not assumed away.
+2. **The survey rows are set observations too.** From the first update
+   on, prototype j's influence I_jc / a_c enters as an observation of
+   the mean of ψ_c over receptive field j (noise λ_c), not as ψ_c at the
+   prototype's position. Every set covariance, receptive field or leaf,
+   is formed as K · A with A the N × n_sets averaging matrix (column S
+   holds 1/n_S on S's points), in row chunks of bounded size; the same
+   product gives k(x, S) for re-prediction. The stage-1 fit itself
+   (hyperparameters, the first ψ̂₀ for the initial bins) is unchanged.
+3. **λ_c is re-estimated once.** After a_c, one-dimensional REML on λ_c
+   per output with the set rows in the design at their declared noise,
+   the width (ℓ or c) and s²_c held at their stage-1 values; a
+   log-spaced grid of five candidates and one bounded refinement, as
+   the width search does. Not repeated at later rounds.
+4. **Kernel sharing.** Under `gpwidth = local` the factor c is fitted
+   per coordinate group (outputs sharing the same finite prototype
+   design); the kernel and its set terms are formed once per group, the
+   noise and responses per output. One group when every prototype is
+   finite for every output; otherwise one per group.
+5. **Stopping.** The loop stops when a round selects nothing across all
+   outputs, or every output is at its guard.
+6. **The simulator's role.** Section 7 step 2 is a PRE-SCREEN, one-sided:
+   a fail stops the rehearsal; a pass permits it and proves nothing
+   more, since the harness runs on the analytic influence with a linear
+   T, which is not the method and not available to a user. Its inputs
+   are regenerable from products (the dataset function for X, the `ij`
+   product for Ψ, the oracle for θ̂, a diagnostic qij run's
+   `prototypes`/`points` products for the survey, the model refit from
+   those); the session-scratch pickle is not required. If kept, the
+   harness lives in `scripts/` and calls the code as it stands after
+   this document's removals.

@@ -30,53 +30,17 @@ sharing one pool batch. The two share this module's per-output setup
 everything but the selection and batching is the ported rule either
 way.
 
-`refine_trigger` (spec/QIJ_mods_waves.md A15) switches the marginal
-path's own leaf-selection rule: `'gain'` (default, bit-identical) is
-the ported rule above; `'measured'` is a FLAGGED LINEAGE, started at an
-initial bin found to disagree with the model, run entirely differently
-from an unflagged one.
-
-1. **Entry** (item 1, unchanged since round 1): the initial bins alone
-   (never a child -- `flag_leaf` is called only from
-   `prepare_coordinate`) are tested against B4's flag test
-   (`joint._flag_mask`, reused here at one output); a flagged initial
-   bin gets priority at the front of the queue/round, ordered by
-   measured discrepancy, bypassing the tau gate, until it is split.
-2. **A flagged lineage ALWAYS splits GEOMETRICALLY** (item 2, round 4):
-   `propose_geometric` -- a LEVEL split of the mass-weighted
-   least-squares plane U = alpha + g.c fit over the cell's nearest
-   ancestor with at least three currently live descendant cells
-   (`_ancestor_gradient`/`_fit_plane_gradient`, c the cells' own mean
-   whitened positions, no extra evaluation), split at the median of the
-   cell's own members' projection onto g (`_median_projection_split`);
-   `joint.two_means_split` on the whitened data coordinates
-   (`whiten_columns`), deterministic principal-axis two-means, when no
-   such ancestor exists (including a flagged lineage's own first split,
-   which has no ancestor at all) or either step above is degenerate.
-   Neither rule reads a posterior quantity (`leaf['v']`/`u`) at all.
-   `from_flagged_lineage` (set True at a flagged initial bin's own
-   creation, propagated parent to both children by `apply_split`,
-   forever) is what marks a leaf as belonging to one; `_propose_dispatch`
-   reads it to route to `propose_geometric` instead of the ported
-   `propose`. `leaf['direction_rule']` records which of the two rules a
-   cell's own split used, for the trace (not a product).
-3. **Priority in a flagged lineage is MEASURED** (item 3): a flagged
-   initial bin's own priority is its measured discrepancy (item 1,
-   above, unaffected by this item); each of ITS CHILDREN, and every
-   descendant after, enters with `leaf['g'] = Delta/2`, Delta the split
-   that created it (`apply_split`, set directly -- never priced by a
-   `propose`-style call, since there is no posterior-based expected gain
-   to price). This 'g' is then compared to tau exactly as an unflagged
-   leaf's predicted 'g' is (`_run_queue`/`core.rounds._select_round`
-   make no distinction once past the front-of-queue initial bins).
-4. **Closing** (item 4): the ported two-strike rule, everywhere,
-   flagged lineage or not -- no zero-level shortcut (removed).
-5. **Unflagged bins** (item 5): the ported refinement, unchanged --
-   kind rule, priority, two strikes, exactly as under 'gain'.
-
-`flag_leaf` and `propose_geometric` are `_run_queue`'s and
-`core.rounds`'s shared implementation of this, exactly as
-`propose`/`apply_split` are shared for the ported rule.
+`QIJ`'s `refine_update` switch (spec/QIJ_A17_stencil_update.md) picks
+what steers this same machinery: `'none'` (default, bit-identical --
+this module's own rule, unchanged) or `'stencils'` (`core.stencils`,
+A17: every stencil enters every measured output's influence model as
+an exact observation, and every open leaf is re-proposed from the
+updated model between rounds). `apply_split`'s `price` argument is
+`'stencils'`'s own hook into this module: under `refine_update='none'`
+a split's two children are priced (`v` and a proposed `g`) the instant
+they are created, as ported; under `'stencils'` pricing is deferred to
+`core.stencils`'s own update-and-re-propose step, since the model a
+leaf would be priced against is about to change.
 """
 
 from __future__ import annotations
@@ -91,16 +55,11 @@ from .differences import forward_step, perturbed_weights, step_parameter
 from .influence_model import bin_posterior_variance
 from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences, build_bins, kmeans_1d
 
-# `core.joint` imports this module at its own top level (the CADJ gain
-# helpers below); importing it back here at the top would be circular,
-# so every use below (`flag_leaf`, `propose_geometric`, `prepare_coordinate`)
-# imports it locally instead, by which point both modules are loaded.
-
 __all__ = [
     "CoordinateResult", "RefineState", "run_refinement",
     "prepare_coordinate", "finalize_coordinate", "apply_split",
-    "new_leaf", "propose", "propose_geometric", "flag_leaf", "batch_v",
-    "compute_rho2", "split_gamma", "whiten_columns",
+    "new_leaf", "propose", "batch_v",
+    "compute_rho2", "split_gamma",
     "level_gain_value", "adjacency_gain_value",
     "level_split_gain", "adjacency_split_gain",
 ]
@@ -148,19 +107,12 @@ class CoordinateResult:
                         tasks spent beyond `bin_differences`'s own
                         elapsed time (method_notes section 4); 0.0
                         without a pool.
-    a_c                 (spec/QIJ_mods_waves.md A15 item 6) the measured
-                        trigger's fitted scale factor (B4's `a_c`), from
-                        this coordinate's own initial bins; NaN under
-                        `refine_trigger='gain'`.
-    n_flagged, n_flag_evals, n_unflag_evals, n_geom_splits
-                        (A15 item 6, round 3) initial bins flagged by the
-                        measured trigger's flag test, evaluations spent
-                        splitting a flagged lineage, evaluations spent
-                        splitting an unflagged one (n_flag_evals +
-                        n_unflag_evals == n_refine_evals), and GEOMETRIC
-                        splits actually taken (every one of them in a
-                        flagged lineage, item 2); all 0 under
-                        `refine_trigger='gain'`.
+    a_c                 (spec/QIJ_A17_stencil_update.md section 3) the
+                        fitted scale factor B4's formula gives from this
+                        coordinate's own initial bins against the frozen
+                        model, used by `core.stencils` to rescale the
+                        survey before the first update; NaN under
+                        `refine_update='none'`.
     """
 
     coordinate: int
@@ -184,10 +136,6 @@ class CoordinateResult:
     failed: bool = False
     busy_delta: float = 0.0
     a_c: float = float('nan')
-    n_flagged: int = 0
-    n_flag_evals: int = 0
-    n_unflag_evals: int = 0
-    n_geom_splits: int = 0
 
 
 @dataclass
@@ -229,31 +177,13 @@ class RefineState:
     B_hat, a_bca, M_used, busy_delta
                         carried through from the initial-bin measurement
                         into the final `CoordinateResult`.
-    refine_trigger      'gain' (ported) or 'measured' (A15 item 1:
-                        entry-only flagging, always-GEOMETRIC flagged
-                        lineages, measured priority -- see `flag_leaf`/
-                        `propose_geometric`/`apply_split` below).
-    a_c                 the measured trigger's fitted scale factor (B4),
-                        from the initial bins, kept only for the final
-                        `CoordinateResult` product (A15 item 6); NaN
-                        under 'gain'. Never read after `prepare_coordinate`
-                        sets it -- the entry-only flag test that needed it
-                        runs once, there.
-    Z_white             Z divided by its own per-column std
-                        (`whiten_columns`), a flagged lineage's ALWAYS
-                        split (A15 item 1); None under 'gain'.
-    parent_id, children_of
-                        A flagged lineage's own tree, id to parent id and
-                        id to its two child ids (A15 item 1, round 4):
-                        `apply_split` populates both, only for a flagged
-                        lineage's splits, so `propose_geometric` can walk
-                        a cell's ancestors and gather a nearby ancestor's
-                        currently live descendant cells for its plane
-                        fit. Empty dicts under 'gain'; unused entirely
-                        for an unflagged leaf either way.
-    n_flagged, n_flag_evals, n_unflag_evals, n_geom_splits
-                        the measured trigger's own running counts (A15
-                        item 6); always 0 under 'gain'.
+    a_c                 B4's fitted scale factor from this output's own
+                        initial bins against the frozen model
+                        (spec/QIJ_A17_stencil_update.md section 3); NaN
+                        under `refine_update='none'`. Read once by
+                        `core.stencils` before its first update, then
+                        kept only for the final `CoordinateResult`
+                        product.
     """
 
     X: np.ndarray
@@ -292,15 +222,7 @@ class RefineState:
     a_bca: np.ndarray
     M_used: int
     busy_delta: float
-    refine_trigger: str
     a_c: float
-    Z_white: Optional[np.ndarray]
-    parent_id: Dict[int, int]
-    children_of: Dict[int, Tuple[int, int]]
-    n_flagged: int
-    n_flag_evals: int
-    n_unflag_evals: int
-    n_geom_splits: int
 
 
 def _variance(values: np.ndarray) -> float:
@@ -405,54 +327,33 @@ def new_leaf(leaf_id: int, idx: np.ndarray, U: np.ndarray, gamma: float, strike:
              psi0_c: np.ndarray, psi_centered: np.ndarray) -> dict:
     """A leaf's Var(psi0) and mean depend only on its own fixed
     indices, so both are computed once here, at creation, and read
-    back everywhere else (spec/method_notes.md section 4). The measured
-    trigger's own state (A15 item 1, round 3), always at its
-    'gain'-inert default here: `flagged`/`discrepancy` (the one-time
-    entry flag test's own priority marker and ordering key -- an
-    initial bin only, `flag_leaf`; never set for a child, so a child
-    never re-enters the front of the queue) and `from_flagged_lineage`
-    (whether this leaf descends from -- or is -- a flagged initial bin:
-    ALWAYS split geometrically, priced by measured Delta/2, never a
-    posterior quantity; propagated parent to child by `apply_split`,
-    never by `new_leaf`, since a fresh leaf starts as its own,
-    unflagged, lineage of one until proven otherwise) and
-    `direction_rule` (A15 item 1, round 4: 'gradient' or
-    'principal_axis', which of `propose_geometric`'s two direction
-    rules this leaf's own proposed split used; None until proposed, and
-    for every non-flagged-lineage leaf -- kept for the trace, not a
-    product)."""
+    back everywhere else (spec/method_notes.md section 4). Under
+    `refine_update='stencils'` (spec/QIJ_A17_stencil_update.md) these
+    two are stale the instant the model updates; `core.stencils`
+    overwrites them, for every OPEN leaf, from the updated psi0 before
+    re-proposing (section 4 step 6) -- this function itself never
+    changes."""
     return dict(
         id=leaf_id, indices=idx, n=int(idx.size), U=U,
         var_k=_variance(psi0_c[idx]), ubar=float(psi_centered[idx].mean()),
         open=True, split=None, g=0.0, gamma=gamma, strike=strike,
-        flagged=False, discrepancy=0.0, from_flagged_lineage=False, direction_rule=None,
     )
 
 
 def batch_v(leaf_list: List[dict], model, Z: np.ndarray, model_index: int,
-            sigma_c: np.ndarray, with_mean: bool = False) -> None:
+            sigma_c: np.ndarray) -> None:
     """Set leaf['v'] -- the within-bin posterior variance v_k -- on
     every leaf in `leaf_list` that holds more than one point, in ONE
     call to `bin_posterior_variance` over all of them. A leaf with
     n_k <= 1 never has its `v` read (`propose` closes it first), so it
-    is skipped here. `with_mean=True` (the measured trigger, A15 item 1)
-    also sets leaf['u'], the posterior variance of the bin mean B4's
-    flag test needs -- the same call's own second return, no second
-    pass; the default path's own call and result are unchanged."""
+    is skipped here."""
     qualifying = [leaf for leaf in leaf_list if leaf['n'] > 1]
     if not qualifying:
         return
     groups = [leaf['indices'] for leaf in qualifying]
-    if with_mean:
-        v_vals, u_vals = bin_posterior_variance(model, Z, model_index, groups, sigma_c,
-                                                 with_mean=True)
-        for leaf, v, u in zip(qualifying, v_vals, u_vals):
-            leaf['v'] = float(v)
-            leaf['u'] = float(u)
-    else:
-        v_vals = bin_posterior_variance(model, Z, model_index, groups, sigma_c)
-        for leaf, v in zip(qualifying, v_vals):
-            leaf['v'] = float(v)
+    v_vals = bin_posterior_variance(model, Z, model_index, groups, sigma_c)
+    for leaf, v in zip(qualifying, v_vals):
+        leaf['v'] = float(v)
 
 
 def compute_rho2(V_btw: float, sum_pubar2: float, N: int) -> float:
@@ -460,16 +361,6 @@ def compute_rho2(V_btw: float, sum_pubar2: float, N: int) -> float:
     when that denominator is 0."""
     denom = sum_pubar2 / N
     return (V_btw / denom) if denom != 0.0 else float('nan')
-
-
-def whiten_columns(Z: np.ndarray) -> np.ndarray:
-    """Z divided by each column's own standard deviation over all N
-    rows (spec/QIJ_mods_waves.md A15 item 1's GEOMETRIC split: 'the
-    members' whitened data coordinates'); a zero-std (constant) column
-    passes through unscaled rather than dividing by zero."""
-    std = np.std(Z, axis=0)
-    safe = np.where(std > 0.0, std, 1.0)
-    return Z / safe
 
 
 def _ported_kind_split(
@@ -480,10 +371,7 @@ def _ported_kind_split(
     """The ported split-kind rule (spec/method_notes.md section 4): a
     level split (two-means on psi0) when Var_k(psi0) > v_k, else an
     adjacency split, falling back to level when adjacency is
-    infeasible. None when no split is feasible. Used by `propose`
-    (the rule as ported, for every unflagged leaf under either
-    `refine_trigger` -- a flagged lineage never calls this, item 2:
-    `propose_geometric` is its own, separate, always-GEOMETRIC rule)."""
+    infeasible. None when no split is feasible. Used by `propose`."""
     if var_k > v_k:
         result = level_split_gain(idx, psi0_c, psi_centered, N, p_k, ubar_k, rho2_local)
         kind = 'level'
@@ -536,182 +424,11 @@ def propose(leaf: dict, rho2_current: float, psi0_c: np.ndarray, psi_centered: n
     leaf['open'] = True
 
 
-def flag_leaf(leaf: dict, coordinate: int, N: int, a_c: float, V_hat_c: float,
-              L: int, eps: float, m_c: float) -> bool:
-    """The measured trigger's ENTRY-ONLY flag test (A15 item 1: the flag
-    test runs exactly ONCE, on an initial bin, and never again on a
-    child), B4's own formula reused at this single output:
-    `joint._flag_mask`, called with this coordinate's own p_k/U_kc/
-    m_kc/u_kc at q=1. m_kc, the mean of psi0_c over the leaf (B4), is
-    leaf['ubar'] + m_c rather than a second array, since `ubar` is
-    already the mean of psi0_c - m_c. Sets leaf['flagged'] and, when
-    flagged, leaf['discrepancy'] = p_k*(U_kc-a_c*m_kc)^2, the queue's
-    own ordering key for an as-yet-unsplit flagged initial bin; returns
-    the flag. Called only from `prepare_coordinate`, on the initial bins
-    -- `apply_split` never calls this on a child (item 1's whole point:
-    once split, a flagged bin starts a flagged LINEAGE, tracked by
-    `from_flagged_lineage`, not re-flagged). A leaf with n_k <= 1 is
-    never flagged (`batch_v` never gives it a `u`, and `propose`/
-    `propose_geometric` close it outright regardless, the ported rule)."""
-    if leaf['n'] <= 1:
-        leaf['flagged'] = False
-        return False
-    from .joint import _flag_mask  # local: `joint` imports this module (module docstring)
-    p_k = leaf['n'] / N
-    m_kc = leaf['ubar'] + m_c
-    U_c = float(leaf['U'][coordinate])
-    flagged = bool(_flag_mask(
-        np.array([p_k]), np.array([[U_c]]), np.array([[m_kc]]),
-        np.array([a_c]), np.array([V_hat_c]), np.array([[leaf['u']]]), L, eps,
-    )[0])
-    leaf['flagged'] = flagged
-    if flagged:
-        leaf['discrepancy'] = p_k * (U_c - a_c * m_kc) ** 2
-    return flagged
-
-
-def _live_descendants(state: "RefineState", node_id: int) -> List[int]:
-    """Every CURRENTLY LIVE leaf id (open or closed, i.e. still present
-    in `state.leaves`) descending from `node_id`, via `state.children_of`
-    (child ids recorded at the split that created them, A15 item 1 round
-    4 -- flagged-lineage bookkeeping only). An id not yet split has no
-    entry in `children_of` and is itself the live leaf reached there. An
-    explicit stack, not recursion: the flagged lineage's own depth is
-    unbounded in principle."""
-    result: List[int] = []
-    stack = list(state.children_of.get(node_id, ()))
-    while stack:
-        nid = stack.pop()
-        kids = state.children_of.get(nid)
-        if kids is None:
-            result.append(nid)
-        else:
-            stack.extend(kids)
-    return result
-
-
-def _fit_plane_gradient(state: "RefineState", leaf_ids: List[int]) -> Optional[np.ndarray]:
-    """The mass-weighted least-squares plane U = alpha + g.c over the
-    cells named by `leaf_ids` (A15 item 1, round 4): c_j each cell's own
-    mean whitened position (`state.Z_white` over its members), U_j its
-    own measured derivative on `state.coordinate`, p_j its mass -- no
-    extra evaluation, every quantity already on the cell. Solved by
-    weighted `lstsq` (rows scaled by sqrt(p_j)); returns g (d,), or None
-    when the fit is degenerate (a non-finite or exactly-zero gradient --
-    the cells' centroids carry no usable direction)."""
-    N = state.N
-    coordinate = state.coordinate
-    Z_white = state.Z_white
-    rows = [state.leaves[lid] for lid in leaf_ids]
-    C = np.array([Z_white[leaf['indices']].mean(axis=0) for leaf in rows])
-    U = np.array([leaf['U'][coordinate] for leaf in rows])
-    p = np.array([leaf['n'] for leaf in rows], dtype=float) / N
-    sw = np.sqrt(p)
-    A = np.concatenate([np.ones((len(rows), 1)), C], axis=1) * sw[:, None]
-    b = U * sw
-    try:
-        beta, *_ = np.linalg.lstsq(A, b, rcond=None)
-    except np.linalg.LinAlgError:
-        return None
-    g = beta[1:]
-    if not np.all(np.isfinite(g)) or not np.any(g):
-        return None
-    return g
-
-
-def _ancestor_gradient(state: "RefineState", leaf: dict) -> Optional[np.ndarray]:
-    """The plane-fit gradient at `leaf`'s NEAREST ancestor with at least
-    three currently live descendant cells (A15 item 1, round 4), walking
-    `state.parent_id` up from `leaf`'s own parent; None all the way to
-    the lineage's root (including when `leaf` IS that root, which has no
-    parent at all -- its own first split always falls back to principal
-    axis, `propose_geometric`)."""
-    ancestor = state.parent_id.get(leaf['id'])
-    while ancestor is not None:
-        descendants = _live_descendants(state, ancestor)
-        if len(descendants) >= 3:
-            return _fit_plane_gradient(state, descendants)
-        ancestor = state.parent_id.get(ancestor)
-    return None
-
-
-def _median_projection_split(
-    idx: np.ndarray, Z_white: np.ndarray, g: np.ndarray,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """A level split of the measured linear model (A15 item 1, round 4):
-    `idx`'s own members split at the MEDIAN of their projection onto
-    `g` (`Z_white[idx] @ g`); None if that leaves one side empty (every
-    member's projection ties at the median)."""
-    proj = Z_white[idx] @ g
-    med = np.median(proj)
-    mask_a = proj <= med
-    idx_a, idx_b = idx[mask_a], idx[~mask_a]
-    if idx_a.size == 0 or idx_b.size == 0:
-        return None
-    return idx_a, idx_b
-
-
-def propose_geometric(state: "RefineState", leaf: dict) -> None:
-    """A flagged lineage's proposed split (A15 item 1, round 4): a LEVEL
-    split of the measured linear model at the cell's nearest ancestor
-    with at least three live descendant cells (`_ancestor_gradient`,
-    `_median_projection_split`) when one is found; otherwise (including
-    a flagged lineage's own first split, which has no ancestor at all,
-    or a degenerate plane fit, or a median split that ties at one side)
-    the principal-axis two-means split, as round 3 -- no posterior
-    quantity (`leaf['v']`) enters either rule. Sets leaf['split'] and
-    leaf['direction_rule'] ('gradient' or 'principal_axis', for the
-    trace, not a product); leaf['g'] is `apply_split`'s own concern
-    (item 3). No ported fallback when GEOMETRIC is itself infeasible
-    either way -- the leaf simply closes, per item 2's 'no level/
-    geometric choice'."""
-    idx = leaf['indices']
-    if leaf['n'] <= 1:
-        leaf['open'] = False
-        leaf['split'] = None
-        return
-
-    g = _ancestor_gradient(state, leaf)
-    if g is not None:
-        split = _median_projection_split(idx, state.Z_white, g)
-        if split is not None:
-            idx_a, idx_b = split
-            leaf['split'] = ('geometric', idx_a, idx_b)
-            leaf['direction_rule'] = 'gradient'
-            leaf['open'] = True
-            return
-
-    from .joint import two_means_split  # local: see `flag_leaf`
-    leaf['direction_rule'] = 'principal_axis'
-    geo = two_means_split(state.Z_white[idx])
-    if geo is None:
-        leaf['open'] = False
-        leaf['split'] = None
-        return
-    idx_a, idx_b = idx[geo[0]], idx[geo[1]]
-    leaf['split'] = ('geometric', idx_a, idx_b)
-    leaf['open'] = True
-
-
-def _propose_dispatch(state: "RefineState", leaf: dict, rho2_current: float) -> None:
-    """Propose one leaf's split: `propose_geometric` for a flagged
-    lineage under `refine_trigger='measured'` (item 1), else the ported
-    `propose`, EXACTLY as under 'gain' (item 5: unflagged bins are the
-    ported refinement, unchanged) -- the single dispatch
-    `prepare_coordinate` and `apply_split` both use, so a leaf's
-    proposal never depends on which of the two called it (module
-    docstring)."""
-    if state.refine_trigger == 'measured' and leaf['from_flagged_lineage']:
-        propose_geometric(state, leaf)
-    else:
-        propose(leaf, rho2_current, state.psi0_c, state.psi_centered,
-                state.I_proto_c, state.bmu, state.bmu2, state.N)
-
-
 def apply_split(
     state: RefineState, leaf: dict, kind: str,
     idx_small: np.ndarray, idx_large: np.ndarray, p_small: float, p_large: float,
     t_small: float, T_small: np.ndarray, failed: bool, tau_at_selection: float,
+    price: bool = True,
 ) -> None:
     """
     Apply one split's realized evaluation to `state`
@@ -722,35 +439,22 @@ def apply_split(
     children, close or propose them, and insert them (proposed with the
     rho^2 in force after this split, unless closed).
 
-    The ported two-strike closing rule applies EVERYWHERE, flagged
-    lineage or not, under either trigger (A15 item 1, item 4: zero-level
-    closing is removed). The two children's priority differs
-    by lineage under `refine_trigger='measured'` (item 3): a child of a
-    flagged-lineage split gets leaf['g'] = Delta/2, THIS split's own
-    realized gain -- a MEASURED priority, no posterior quantity, set
-    here directly rather than by a `propose`-style pricing call; an
-    unflagged child's g is priced by `_propose_dispatch`'s ported
-    `propose` call, as under 'gain'. `from_flagged_lineage` propagates
-    from parent to both children (never reset by `new_leaf`, whose
-    default is unflagged) -- `n_flag_evals`/`n_unflag_evals` count every
-    split by which lineage the LEAF BEING SPLIT belongs to, however many
-    splits deep. `leaf['v']` (posterior within-bin variance) is priced
-    for every leaf regardless of lineage -- `finalize_coordinate`'s
-    V_win_hat gather needs it for every FINAL bin; item 2's 'no
-    posterior quantity' is about the split-kind/pricing decision, not
-    this unavoidable within-variance estimate. Shared by the queue's
-    one-split-at-a-time loop (`run_refinement`) and the
-    synchronized-round algorithm (`core.rounds`,
-    spec/QIJ_mods_waves.md A14), which differ only in how many of these
-    are applied, and in what order, between one tau recomputation and
-    the next.
+    `price` (default True, the ported rule): whether the two children
+    are priced (`batch_v`'s v_k, then a proposed split and expected g)
+    the instant they are created. `refine_update='stencils'`
+    (`core.stencils`, spec/QIJ_A17_stencil_update.md section 4 step 3)
+    passes `price=False`: the model every leaf is priced against is
+    about to be updated with this whole round's new sets, so pricing
+    here would be thrown away immediately -- the two children are still
+    created, closed by the same two-strike rule, and left WITHOUT a
+    `v` or a proposed `g` until `core.stencils`'s own update-and-
+    re-propose step sets them. Shared by the queue's one-split-at-a-time
+    loop (`run_refinement`), the synchronized-round algorithm
+    (`core.rounds`, spec/QIJ_mods_waves.md A14) and `core.stencils`,
+    which differ only in how many of these are applied, in what order,
+    and (stencils only) whether pricing happens here or later.
     """
     state.n_refine_evals += 1
-    from_flagged_lineage = bool(leaf['from_flagged_lineage'])
-    if from_flagged_lineage:
-        state.n_flag_evals += 1
-    else:
-        state.n_unflag_evals += 1
     if failed:
         leaf['open'] = False
         return
@@ -774,15 +478,12 @@ def apply_split(
         state.n_level_splits += 1
     elif kind == 'adjacency':
         state.n_adjacency_splits += 1
-    else:
-        state.n_geom_splits += 1
 
     gamma_children = split_gamma(Delta, leaf['g'])
 
-    # Ported two-strike closing rule (spec section 4), everywhere (A15
-    # item 4): a below-tolerance split flags its children rather than
-    # closing them outright; only a SECOND consecutive below-tolerance
-    # split in the same lineage closes both.
+    # Ported two-strike closing rule (spec section 4): a below-tolerance
+    # split flags its children rather than closing them outright; only a
+    # SECOND consecutive below-tolerance split closes both.
     children_strike = Delta < tau_at_selection
     close_children = children_strike and leaf['strike']
 
@@ -792,8 +493,6 @@ def apply_split(
                            state.psi0_c, state.psi_centered)
     leaf_large = new_leaf(state.next_id + 1, idx_large, U_large, gamma_children, children_strike,
                            state.psi0_c, state.psi_centered)
-    leaf_small['from_flagged_lineage'] = from_flagged_lineage
-    leaf_large['from_flagged_lineage'] = from_flagged_lineage
     state.next_id += 2
     state.leaves[leaf_small['id']] = leaf_small
     state.leaves[leaf_large['id']] = leaf_large
@@ -803,33 +502,27 @@ def apply_split(
         - p_parent * leaf['ubar'] ** 2
     )
 
+    if not price:
+        # `core.stencils` prices every open leaf itself, after this
+        # round's new sets are folded into the model (spec section 4
+        # steps 4-6); leaf_small/leaf_large are left open, unpriced.
+        return
+
     # Both children need v_k regardless of what happens next: a child
     # closed immediately below is still a final bin if it is never
     # split again, and the V_win_hat gather reuses this same cached
-    # value. One call prices both, every lineage alike (docstring).
+    # value.
     batch_v([leaf_small, leaf_large], state.model, state.Z, state.model_index, state.sigma_c)
-
-    if from_flagged_lineage:
-        # Item 3: measured priority, this split's own realized gain
-        # halved -- no posterior-priced expected gain anywhere in a
-        # flagged lineage.
-        leaf_small['g'] = Delta / 2.0
-        leaf_large['g'] = Delta / 2.0
-        # Round 4: this lineage's own tree, for `propose_geometric`'s
-        # ancestor search -- the parent leaf's id is already gone from
-        # `state.leaves` (just deleted above), but its place in the tree
-        # lives on here.
-        state.children_of[leaf['id']] = (leaf_small['id'], leaf_large['id'])
-        state.parent_id[leaf_small['id']] = leaf['id']
-        state.parent_id[leaf_large['id']] = leaf['id']
 
     if close_children:
         leaf_small['open'] = False
         leaf_large['open'] = False
     else:
         rho2 = compute_rho2(state.V_btw, state.sum_pubar2, N)
-        _propose_dispatch(state, leaf_small, rho2)
-        _propose_dispatch(state, leaf_large, rho2)
+        propose(leaf_small, rho2, state.psi0_c, state.psi_centered,
+                state.I_proto_c, state.bmu, state.bmu2, N)
+        propose(leaf_large, rho2, state.psi0_c, state.psi_centered,
+                state.I_proto_c, state.bmu, state.bmu2, N)
 
 
 def _degenerate_result(coordinate: int, name: str, N: int, bins0: BinSet, M_X_used: int,
@@ -894,21 +587,21 @@ def prepare_coordinate(
     pool=None,
     start: np.ndarray = None,
     model_index: int = None,
-    refine_trigger: str = 'gain',
-    Z_white: Optional[np.ndarray] = None,
 ) -> Union[CoordinateResult, RefineState]:
     """
     One estimand coordinate's initial I-VQ, its full-data measurement,
     and its leaves' first proposals (spec/method_notes.md section 4):
-    the setup shared by the queue (`run_refinement`, below) and the
+    the setup shared by the queue (`run_refinement`, below), the
     synchronized-round algorithm (`core.rounds`, spec/QIJ_mods_waves.md
-    A14), which differ only in how they select and batch what this
-    setup proposes. Returns a terminal `CoordinateResult` when stage 1
-    collapsed or the initial-bin measurement failed (spec section 5);
-    otherwise a `RefineState`, its every open leaf already proposed a
-    split. Arguments mirror `run_refinement`'s own. `refine_trigger`/
-    `Z_white` are A15's own (module docstring); under 'gain' this
-    function is exactly the ported setup.
+    A14) and `core.stencils` (spec/QIJ_A17_stencil_update.md), which
+    differ only in how they select and batch what this setup proposes.
+    Returns a terminal `CoordinateResult` when stage 1 collapsed or the
+    initial-bin measurement failed (spec section 5); otherwise a
+    `RefineState`, its every open leaf already proposed a split against
+    `model` as given -- `core.stencils` immediately re-predicts and
+    re-proposes every one of them against the updated model (spec
+    section 4's 'before round 1' step), so the proposal made here is
+    thrown away there, never read.
     """
     if model_index is None:
         model_index = coordinate
@@ -945,23 +638,6 @@ def prepare_coordinate(
     # E8-approved reordering (spec/method_notes.md section 4).
     sum_pubar2 = sum((leaf['n'] / N) * leaf['ubar'] ** 2 for leaf in leaves.values())
 
-    measured = refine_trigger == 'measured'
-    a_c = float('nan')
-    V_hat_c = float('nan')
-    n_flagged = 0
-    if measured:
-        # B4's scale factor at this coordinate's own initial bins
-        # (`joint._fit_scale`, local import: `joint` imports this
-        # module, module docstring): m0 is the RAW (uncentered) bin
-        # mean of psi0_c B4 itself is built from, from the same
-        # `bincount`s `joint._bin_stats` uses.
-        from .joint import _fit_scale
-        counts0 = bins0.n.astype(float)
-        sums0 = np.bincount(bins0.labels, weights=psi0_c, minlength=bins0.M_used)
-        m0 = sums0 / counts0
-        a_c = float(_fit_scale(bins0.p, bins0.U[:, coordinate:coordinate + 1], m0[:, None])[0])
-        V_hat_c = float(np.var(psi0_c))
-
     state = RefineState(
         X=X, counter=counter, theta_hat=theta_hat, start=start,
         coordinate=coordinate, name=name, N=N, q=q,
@@ -973,32 +649,12 @@ def prepare_coordinate(
         n_refine_evals=0, n_level_splits=0, n_adjacency_splits=0,
         sum_measured_delta=0.0, sum_expected_g=0.0, sum_pubar2=sum_pubar2,
         B_hat=B_hat, a_bca=a_bca, M_used=bins0.M_used, busy_delta=busy_delta,
-        refine_trigger=refine_trigger, a_c=a_c,
-        Z_white=Z_white, parent_id={}, children_of={},
-        n_flagged=0, n_flag_evals=0, n_unflag_evals=0, n_geom_splits=0,
+        a_c=float('nan'),
     )
-    # `with_mean=True` under 'measured' only: the entry-only flag test
-    # (item 1) needs every initial leaf's own `u`; a child never needs
-    # it (`apply_split`'s own `batch_v` call never asks for it), since a
-    # child is never flag-tested.
-    batch_v(list(leaves.values()), model, Z, model_index, sigma_c, with_mean=measured)
-    if measured:
-        L0 = bins0.M_used
-        for leaf in leaves.values():
-            # Entry-only (item 1): a flagged initial bin starts its own
-            # flagged lineage right here -- it is itself split
-            # geometrically (`_propose_dispatch` reads
-            # `from_flagged_lineage`, set below), counted into
-            # n_flag_evals from its very first split on. An unflagged
-            # one is the ported refinement, unchanged (item 5).
-            flagged = flag_leaf(leaf, coordinate, N, a_c, V_hat_c, L0, eps, float(m_c))
-            leaf['from_flagged_lineage'] = flagged
-            if flagged:
-                n_flagged += 1
-        state.n_flagged = n_flagged
+    batch_v(list(leaves.values()), model, Z, model_index, sigma_c)
     rho2 = compute_rho2(state.V_btw, state.sum_pubar2, N)
     for leaf in leaves.values():
-        _propose_dispatch(state, leaf, rho2)
+        propose(leaf, rho2, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N)
     return state
 
 
@@ -1052,51 +708,30 @@ def finalize_coordinate(state: RefineState) -> CoordinateResult:
         rho=float(rho), gain_ratio=float(gain_ratio),
         B_hat=state.B_hat, a_bca=state.a_bca,
         M_X=state.M_X_used, M_used=state.M_used, n_refine_evals=state.n_refine_evals,
-        bin_U=U_arr, busy_delta=state.busy_delta,
-        a_c=state.a_c, n_flagged=state.n_flagged, n_flag_evals=state.n_flag_evals,
-        n_unflag_evals=state.n_unflag_evals, n_geom_splits=state.n_geom_splits,
+        bin_U=U_arr, busy_delta=state.busy_delta, a_c=state.a_c,
     )
 
 
 def _run_queue(state: RefineState) -> None:
     """
-    The queue algorithm, `refine_schedule='queue'`: under
-    `refine_trigger='gain'` (the default and the ported behaviour,
-    spec/method_notes.md section 4) the single open leaf with the
-    largest expected gain is split, one evaluation, tau recomputed
-    before the next leaf is even considered. Under `'measured'` (A15
-    item 1: flagging is entry-only, so `l['flagged']` is only ever true
-    for an as-yet-unsplit, initial bin) every flagged open leaf is split
-    BEFORE any gain-queued one, in descending measured-discrepancy order
-    (ties: lower leaf id, the ported tie-break) -- a flagged initial bin
-    bypasses the tau gate entirely, since it still disagrees with the
-    model. Once no flagged initial bin remains, the gain queue above
-    runs exactly as ported, for every OTHER leaf alike: an unflagged
-    leaf's 'g' is the ported predicted gain, a flagged lineage's is the
-    measured Delta/2 `apply_split` set at its own creation (item 3) --
-    both compared to tau the same way, neither given priority over the
-    other here.
+    The queue algorithm, `refine_schedule='queue'` (spec/method_notes.md
+    section 4): the single open leaf with the largest expected gain is
+    split, one evaluation, tau recomputed before the next leaf is even
+    considered.
     """
     leaves = state.leaves
     N = state.N
-    measured = state.refine_trigger == 'measured'
     while True:
         open_leaves = [l for l in leaves.values() if l['open']]
         if not open_leaves:
             break
         tau = state.eps * state.V_btw / len(leaves)
 
-        flagged_open = [l for l in open_leaves if l['flagged']] if measured else []
-        if flagged_open:
-            best = max(flagged_open, key=lambda l: (l['discrepancy'], -l['id']))
-            if state.n_refine_evals >= state.evals_cap:
-                break
-        else:
-            best = min(open_leaves, key=lambda l: (-l['g'], l['id']))
-            if not (best['g'] >= tau):
-                break
-            if state.n_refine_evals >= state.evals_cap:
-                break
+        best = min(open_leaves, key=lambda l: (-l['g'], l['id']))
+        if not (best['g'] >= tau):
+            break
+        if state.n_refine_evals >= state.evals_cap:
+            break
 
         kind, idx_a, idx_b = best['split']
         if idx_a.size <= idx_b.size:
@@ -1140,8 +775,6 @@ def run_refinement(
     pool=None,
     start: np.ndarray = None,
     model_index: int = None,
-    refine_trigger: str = 'gain',
-    Z_white: Optional[np.ndarray] = None,
 ) -> CoordinateResult:
     """
     Refinement for one estimand coordinate, `refine_schedule='queue'`
@@ -1167,18 +800,17 @@ def run_refinement(
     as pool tasks (method_notes section 4); the queue's own split
     evaluations below always stay serial regardless -- `core.rounds`
     (spec/QIJ_mods_waves.md A14) is the schedule that batches them onto
-    a pool. `start` (A9's continuation rule, spec/QIJ_mods_waves.md A9)
-    and `eta` (A15's eta_full, the caller's own value) are passed to
-    every full-data evaluation here -- the initial-bin stencils and
-    every refinement split; `start=None` reproduces today's evaluations
-    bit for bit. `refine_trigger`/`Z_white` select the leaf-selection
-    rule (module docstring, A15); 'gain' with `Z_white=None` is the
-    ported, bit-identical path.
+    a pool (`refine_update='stencils'`, spec/QIJ_A17_stencil_update.md,
+    requires `refine_schedule='rounds'` and runs through `core.stencils`
+    instead of this function). `start` (A9's continuation rule,
+    spec/QIJ_mods_waves.md A9) and `eta` (A15's eta_full, the caller's
+    own value) are passed to every full-data evaluation here -- the
+    initial-bin stencils and every refinement split; `start=None`
+    reproduces today's evaluations bit for bit.
     """
     setup = prepare_coordinate(
         X, counter, theta_hat, coordinate, name, psi0_c, m_c, sigma_c, I_proto_c, bmu, bmu2,
         eta, eps, M_X_used, constant_path, Z, model, pool, start, model_index,
-        refine_trigger, Z_white,
     )
     if isinstance(setup, CoordinateResult):
         return setup
