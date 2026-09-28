@@ -167,6 +167,8 @@ class BootstrapResult:
     busy_time: float
     workers: int
     eta_full: float
+    theta_hat_status: str        # `parallel.fit_status` of theta_hat's own fit
+    replicate_status: list       # (B,) `parallel.fit_status` of each replicate
 
     @property
     def variance(self) -> np.ndarray:

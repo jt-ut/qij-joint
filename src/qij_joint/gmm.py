@@ -2,7 +2,7 @@
 covariances) with an analytic influence function via Louis's (1982)
 identity.
 
-`GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`
+`GMM2D(K, n_starts=20, seed=0, reference=None)`
 fits by multi-start weighted EM (SQUAREM-accelerated), then finishes the
 winning start with a trust-region Newton step
 (`scipy.optimize.minimize(method='trust-exact')`, no gate, no halving
@@ -79,18 +79,19 @@ import numpy as np
 from scipy.cluster.vq import kmeans2
 from scipy.optimize import linear_sum_assignment, minimize
 
-from .gmm_param import (chain, coordinate_scales, from_unconstrained,
+from .gmm_param import (chain, coordinate_scales, from_unconstrained, jacobian,
                          scaled_gradient_norm, to_unconstrained)
 from .seeding import greedy_em_start, scaled_variants
-from .gmm_param import to_unconstrained, coordinate_scales, scaled_gradient_norm, jacobian
 
 _LOG2PI = float(np.log(2.0 * np.pi))
-_COND_MAX = 1e12
-# GMM2D's own declared reproducibility floor (the constructor's default
-# `eta`, overridable per call) -- unrelated to any fixed iteration or
-# tolerance constant of the fit itself, all of which are now measured
-# against `eta` or `p` (spec/QIJ_estimator_fit_spec.md 5).
-_ETA = 1e-12
+# The constructor's defaults for the two precision settings. `eta`, the
+# fit's convergence tolerance on the scaled gradient, defaults to the
+# square root of machine precision (the standard gradient tolerance, and
+# the step a forward difference balances against it); a caller's
+# measured eta overrides it per call. `cond_max` is the largest condition
+# number of the observed information the influence accepts.
+_ETA_DEFAULT = float(np.sqrt(np.finfo(float).eps))
+_COND_MAX_DEFAULT = 1e12
 
 # Phase 1's fixed screening budget and phase 2's promotion count, set by
 # measurement (module report): fastest choice that never moved the
@@ -119,7 +120,7 @@ _D = {
 }
 _STYPES = ('S11', 'S12', 'S22')
 
-_Cfg = namedtuple('_Cfg', ['K', 'n_starts', 'seed', 'tol', 'max_iter', 'p'])
+_Cfg = namedtuple('_Cfg', ['K', 'n_starts', 'seed', 'p'])
 
 
 def _make_outputs(K: int) -> tuple:
@@ -488,7 +489,7 @@ def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m):
     return pis2, mus2, Ss2, ll2, 2, m
 
 
-def _em_accelerated(X, Q, XP, w, W, pis, mus, Ss, ll, eta, Scov, a_pen, K):
+def _em_accelerated(X, Q, XP, w, W, pis, mus, Ss, ll, eta, Scov, a_pen, K, budget=None):
     """SQUAREM rounds (`_squarem_round`) from (pis, mus, Ss) with its own
     `ll`, until BOTH halves of the stop test pass or the 20*p iteration
     cap fires (spec/QIJ_estimator_fit_spec.md section 5 items 1-2):
@@ -512,11 +513,13 @@ def _em_accelerated(X, Q, XP, w, W, pis, mus, Ss, ll, eta, Scov, a_pen, K):
     method_notes section 5), `status` 'converged' or 'em_cap',
     `score_scaled` the last scaled gradient norm evaluated, and
     `last_step_u` the unconstrained-coordinate difference between the
-    last two iterates (agent C's initial trust radius). Raises
+    last two iterates (the finish's initial trust radius). `budget`,
+    when given, replaces the 20*p cap: the greedy seeding's fixed-step
+    insertions. Raises
     np.linalg.LinAlgError on a degenerate covariance anywhere along the
     trajectory."""
     p = (K - 1) + 5 * K
-    iter_cap = 20 * p
+    iter_cap = 20 * p if budget is None else int(budget)
     sqrt_eta = np.sqrt(eta)
     eps = np.finfo(float).eps
     s = coordinate_scales(K, Scov)
@@ -558,12 +561,18 @@ def _em_accelerated(X, Q, XP, w, W, pis, mus, Ss, ll, eta, Scov, a_pen, K):
             # without bound). Either way the projection is not trusted
             # this round and EM keeps iterating -- the cap is the
             # backstop, never a false "converged".
+            tol_ell = eta * max(abs(ell_k), 1.0)
             if abs(denom) > eps * max(abs(ell_km1), abs(ell_km2), 1.0):
                 c_k = (ell_k - ell_km1) / denom
                 one_minus_c = 1.0 - c_k
                 if abs(one_minus_c) > eps * max(abs(c_k), 1.0):
                     ell_inf = ell_km1 + (ell_k - ell_km1) / one_minus_c
-                    aitken_ok = abs(ell_inf - ell_k) <= eta * max(abs(ell_k), 1.0)
+                    aitken_ok = abs(ell_inf - ell_k) <= tol_ell
+            else:
+                # ell has stopped moving: the remaining gain is the last
+                # increment itself; the gradient test below still guards
+                # against a plateau beside a saddle.
+                aitken_ok = abs(ell_k - ell_km1) <= tol_ell
             if aitken_ok:
                 psi_bar = _score_info_penalized(X, Q, w, K, pis, mus, Ss,
                                                  Scov, a_pen, W)[3]
@@ -720,12 +729,12 @@ def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
     return out
 
 
-def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter, Scov, a_pen):
+def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, eta, Scov, a_pen):
     """Pool = every surviving start, ranked by penalized weighted log-
     likelihood (ell_p/W), via the two-phase screen: phase 1 runs
     every start's short budget in lockstep (`_phase1_batch`); the best
-    few are carried, one at a time, to `max_iter` (phase 2, sequential
-    `_run_em`). Starts are the `n_starts` k-means starts (`_starts`),
+    few are carried, one at a time, to `_run_em`'s own stop test
+    (phase 2, sequential `_run_em`). Starts are the `n_starts` k-means starts (`_starts`),
     the greedy-EM insertion start of A12 at `seeding.py`'s own 50*K
     cells, a second at `_GREEDY_CELL_FACTOR_2`*K cells (A15), and that
     second start's own `_GREEDY_VARIANT_FACTORS` covariance-scaled
@@ -736,14 +745,14 @@ def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter, Scov, a_pe
     this module (seeding.py must not import gmm.py, which already
     imports it)."""
     starts = _starts(X, K, n_starts, seed)
-    starts += greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, tol, max_iter,
+    starts += greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, eta,
                                em_accelerated=_em_accelerated, penalized_ll=_penalized_ll)
-    greedy2 = greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, tol, max_iter,
+    greedy2 = greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, eta,
                                em_accelerated=_em_accelerated, penalized_ll=_penalized_ll,
                                cell_factor=_GREEDY_CELL_FACTOR_2)
     if greedy2:
         starts += greedy2 + scaled_variants(greedy2[0], _GREEDY_VARIANT_FACTORS)
-    phase1_budget = min(_SHORT_ITERS, max_iter)
+    phase1_budget = _SHORT_ITERS
 
     screened = _phase1_batch(Q, XP, w, starts, K, phase1_budget, Scov, a_pen)
     if not screened:
@@ -753,8 +762,7 @@ def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter, Scov, a_pe
     top = screened[:min(_PROMOTE_N, len(screened))]
     finished = []
     for r in top:
-        res = _run_em(Q, XP, w, r['pis'], r['mus'], r['Ss'], tol, max_iter,
-                       Scov, a_pen)
+        res = _run_em(X, Q, XP, w, r['pis'], r['mus'], r['Ss'], eta, Scov, a_pen)
         if res is not None:
             finished.append(res)
     if not finished:
@@ -1015,7 +1023,8 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     after (labelling against `start`, the trust-region finish) is
     unchanged, so the perturbed fit is the continuation of `start`,
     never a fresh multi-start winner, and never relabelled away from
-    it. Without `start`, unchanged (bit-identical).
+    it. Without `start`, the multi-start search, each start run by the
+    same EM stop test and finished the same way.
 
     The trust-region finish (2.2, 5) runs only when EM's OWN status is
     'converged' (`_run_em`'s stopping rule, not this function's, fired):
@@ -1033,7 +1042,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
 
     if start is None:
         best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
-                                   cfg.tol, cfg.max_iter, Scov, a_pen)
+                                   eta, Scov, a_pen)
     else:
         pis0, mus0, Ss0 = _unpack(cfg.K, start)
         best = _run_em(X, Q, XP, w, pis0, mus0, Ss0, eta, Scov, a_pen)
@@ -1080,15 +1089,10 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
         # rationale both assume an iterate EM itself calls converged.
         return _stopped('em_cap', pis, mus, Ss, A, ll, score, 0)
 
-    if score <= eta:
-        # EM's own endpoint already meets 2.3; nothing for the
-        # trust-region finish to do.
-        if not _cholesky_ok(A):
-            return None, 'linalg'
-        extra = _penalty_influence_extra(Ss, Scov, a_pen, W, d)
-        fit, _ = _stopped('converged', pis, mus, Ss, A, ll, score, 0)
-        fit['psi'] = psi + extra
-        return fit, 'converged'
+    # The finish always takes at least one step, even when EM's endpoint
+    # already meets 2.3: a Newton step from there converges quadratically,
+    # so the returned fit is reproducible well below eta, which the
+    # finite differences built on it need.
 
     # Trust-region finish (2.2, 5.3-5.6), in v = u / s so the algorithm's
     # own trust radius, and every step it takes, is already in the
@@ -1143,6 +1147,10 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
             stall['converged'] = True
             raise StopIteration
         step = float(np.linalg.norm(v - stall['v']))
+        if step == 0.0:
+            # A rejected step: the point did not move and the trust
+            # region shrinks and tries again. Not evidence of a stall.
+            return
         stall['v'] = v
         stall['n'] = stall['n'] + 1 if step < eta else 0
         # A step below the fit's own reproducibility, twice in a row (so
@@ -1162,7 +1170,16 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     final = _eval(np.asarray(result.x, dtype=float))
     resid = scaled_gradient_norm(final['g_u'], s, final['ll'])
 
-    if stall['converged'] or resid <= eta:
+    # A finish that stalls has reached the precision floor: its steps are
+    # below the fit's own reproducibility and cannot lower the gradient
+    # further. It counts as converged when the gradient there is within
+    # sqrt(eta), the level EM's own stop test accepts; a stall farther
+    # from a maximum than that is still a failure.
+    # scipy's own status 2 (its model can no longer predict an
+    # improvement: the trust region has collapsed) is the same floor.
+    stalled = stall['stalled'] or result.status == 2
+    at_floor = stalled and resid <= math.sqrt(eta)
+    if stall['converged'] or resid <= eta or at_floor:
         if not _cholesky_ok(final['A']):
             return None, 'linalg'
         extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
@@ -1211,8 +1228,8 @@ def _fit_info(fit, status) -> FitInfo:
 class GMM2D:
     """See module docstring. `T(X, w) -> ndarray(p,)`, `T.influence(X,
     w) -> ndarray(N, p)`, `T.fit_and_influence(X, w) -> (ndarray(p,),
-    ndarray(N, p))`; all three accept `K`, `n_starts`, `seed`, `tol`,
-    `max_iter` as per-call keyword overrides, an optional `prep` from
+    ndarray(N, p))`; all three accept `K`, `n_starts`, `seed` as per-call
+    keyword overrides, an optional `prep` from
     `T.prepare(X)`, an optional `start` (theta (p,) in `T`'s own
     output layout: a continuation of a previous fit, see module
     docstring), and an optional `eta`: when given, it replaces
@@ -1239,18 +1256,17 @@ class GMM2D:
     name = 'gmm2d'
     takes_start = True
 
-    def __init__(self, K: int, n_starts: int = 20, seed: int = 0,
-                 tol: float = 1e-8, max_iter: int = 500, reference=None):
+    def __init__(self, K: int, n_starts: int = 20, seed: int = 0, reference=None,
+                 eta: float = _ETA_DEFAULT, cond_max: float = _COND_MAX_DEFAULT):
         self.K = int(K)
         self.n_starts = int(n_starts)
         self.seed = int(seed)
-        self.tol = float(tol)
-        self.max_iter = int(max_iter)
         self.reference = reference
 
         self.p = (self.K - 1) + 5 * self.K
         self.outputs = _make_outputs(self.K)
-        self.eta = _ETA
+        self.eta = float(eta)
+        self.cond_max = float(cond_max)
         self.last_fit_info = None
 
     def _resolve(self, kwargs: dict) -> _Cfg:
@@ -1259,8 +1275,6 @@ class GMM2D:
             K=K,
             n_starts=int(kwargs.get('n_starts', self.n_starts)),
             seed=int(kwargs.get('seed', self.seed)),
-            tol=float(kwargs.get('tol', self.tol)),
-            max_iter=int(kwargs.get('max_iter', self.max_iter)),
             p=(K - 1) + 5 * K,
         )
 
@@ -1314,7 +1328,7 @@ class GMM2D:
             if status != 'converged':
                 return np.full((N, cfg.p), np.nan)
             A = fit['A']
-            if np.linalg.cond(A) > _COND_MAX:
+            if np.linalg.cond(A) > self.cond_max:
                 return np.full((N, cfg.p), np.nan)
             IF = np.linalg.solve(A, fit['psi'].T).T
             if not np.all(np.isfinite(IF)):
@@ -1348,7 +1362,7 @@ class GMM2D:
                 theta[mx] += xmean[0]
                 theta[my] += xmean[1]
             A = fit['A']
-            if np.linalg.cond(A) > _COND_MAX:
+            if np.linalg.cond(A) > self.cond_max:
                 return theta, nan_psi
             IF = np.linalg.solve(A, fit['psi'].T).T
             if not np.all(np.isfinite(IF)):

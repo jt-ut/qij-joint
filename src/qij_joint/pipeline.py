@@ -16,7 +16,7 @@ import pandas as pd
 from . import products, registry
 from .bootstrap import Bootstrap
 from .ijfd import IJFD
-from .parallel import Pool
+from .parallel import Pool, fit_status
 from .qij import QIJ
 
 
@@ -33,10 +33,12 @@ def _oracle_task(T, case, X, task):
     try:
         theta_hat = np.asarray(T(Xd, np.ones(N)), dtype=float)
         failed = bool(np.any(np.isnan(theta_hat)))
+        status = fit_status(T, theta_hat)
     except Exception:
         theta_hat = np.full(len(T.outputs), np.nan)
         failed = True
-    return s, seed, theta_hat, failed, time.perf_counter() - t0
+        status = fit_status(T, theta_hat, raised=True)
+    return s, seed, theta_hat, failed, status, time.perf_counter() - t0
 
 
 def _ij_task(T, case, X, task):
@@ -52,11 +54,13 @@ def _ij_task(T, case, X, task):
     try:
         psi = np.asarray(T.influence(Xd, np.ones(N)), dtype=float)
         failed = bool(np.any(np.isnan(psi)))
+        status = fit_status(T, psi)
     except Exception:
         psi = np.full((N, len(T.outputs)), np.nan)
         failed = True
+        status = fit_status(T, psi, raised=True)
     V_ij = np.mean(psi ** 2, axis=0) / N
-    return s, seed, V_ij, psi, failed, time.perf_counter() - t0
+    return s, seed, V_ij, psi, failed, status, time.perf_counter() - t0
 
 
 def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
@@ -71,9 +75,9 @@ def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed:
     if pending:
         pool = Pool(workers, case=(dataset, estimator))
         tasks = [(s, N, seed) for s in pending]
-        for s, dseed, theta_hat, failed, wall in pool.map(_oracle_task, tasks):
+        for s, dseed, theta_hat, failed, status, wall in pool.map(_oracle_task, tasks):
             row = {'dataset': dataset, 'estimator': estimator, 'N': N,
-                   's': s, 'seed': dseed, 'n_failed': int(failed),
+                   's': s, 'seed': dseed, 'n_failed': int(failed), 'fit_status': status,
                    'wall_time': wall, 'busy_time': wall, 'workers': workers}
             for j, o in enumerate(outputs):
                 row[f'theta_true_{o}'] = float(theta_true[j])
@@ -96,9 +100,9 @@ def run_ij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int
     if pending:
         pool = Pool(workers, case=(dataset, estimator))
         tasks = [(s, N, seed) for s in pending]
-        for s, dseed, V_ij, psi, failed, wall in pool.map(_ij_task, tasks):
+        for s, dseed, V_ij, psi, failed, status, wall in pool.map(_ij_task, tasks):
             row = {'dataset': dataset, 'estimator': estimator, 'N': N,
-                   's': s, 'seed': dseed, 'n_failed': int(failed),
+                   's': s, 'seed': dseed, 'n_failed': int(failed), 'fit_status': status,
                    'wall_time': wall, 'busy_time': wall, 'workers': workers}
             for j, o in enumerate(outputs):
                 row[f'V_ij_{o}'] = float(V_ij[j])
@@ -127,9 +131,11 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
         row = {'dataset': dataset, 'estimator': estimator, 'N': N,
                's': s, 'seed': dseed, 'n_degenerate': res.n_degenerate,
                'wall_time': res.wall_time, 'busy_time': res.busy_time,
-               'workers': res.workers, 'eta_full': float(res.eta_full)}
+               'workers': res.workers, 'eta_full': float(res.eta_full),
+               'fit_status': res.theta_hat_status}
         rep_df = pd.DataFrame({f'theta_{o}': res.replicates[:, j]
                                 for j, o in enumerate(res.outputs)})
+        rep_df['fit_status'] = res.replicate_status
         products.write_draw(md, s, row, {'replicates': rep_df})
         written += 1
     pool.close()

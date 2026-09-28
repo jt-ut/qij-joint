@@ -112,7 +112,7 @@ def _mixture_density(Z: np.ndarray, pis: np.ndarray, mus: np.ndarray, Ss: np.nda
 
 def greedy_em_start(X: np.ndarray, w: np.ndarray, K: int, seed: int,
                      Q: np.ndarray, XP: np.ndarray, Scov: np.ndarray, a_pen: float,
-                     tol: float, max_iter: int, em_accelerated, penalized_ll,
+                     eta: float, em_accelerated, penalized_ll,
                      trace: list = None, cell_factor: int = _DEFAULT_CELL_FACTOR) -> list:
     """One greedy-EM start of A12 (round 6, weight-aware), over-
     segmented at `cell_factor`*K k-means cells (A15: `gmm.py` calls this
@@ -150,8 +150,8 @@ def greedy_em_start(X: np.ndarray, w: np.ndarray, K: int, seed: int,
         ll0 = penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen)
         if not np.isfinite(ll0):
             return []
-        pis, mus, Ss, ll, _, _ = em_accelerated(
-            Q, XP, w, W, pis, mus, Ss, ll0, tol, max_iter, Scov, a_pen, 1)
+        pis, mus, Ss, ll = em_accelerated(
+            X, Q, XP, w, W, pis, mus, Ss, ll0, eta, Scov, a_pen, 1)[:4]
 
         for m in range(1, K):
             f = _mixture_density(centres, pis, mus, Ss)
@@ -171,8 +171,9 @@ def greedy_em_start(X: np.ndarray, w: np.ndarray, K: int, seed: int,
             ll0 = penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen)
             if not np.isfinite(ll0):
                 return []
-            pis, mus, Ss, ll, _, _ = em_accelerated(
-                Q, XP, w, W, pis, mus, Ss, ll0, tol, _INSERT_EM_STEPS, Scov, a_pen, m + 1)
+            pis, mus, Ss, ll = em_accelerated(
+                X, Q, XP, w, W, pis, mus, Ss, ll0, eta, Scov, a_pen, m + 1,
+                budget=_INSERT_EM_STEPS)[:4]
     except np.linalg.LinAlgError:
         return []
 

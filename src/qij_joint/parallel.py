@@ -71,6 +71,19 @@ def call_T(T, X: np.ndarray, w: np.ndarray, start: Optional[np.ndarray] = None,
     return T(X, w, **kwargs)
 
 
+def fit_status(T, value, raised: bool = False) -> str:
+    """The status of `T`'s last evaluation, for the products: 'exception'
+    when the call raised; otherwise `T.last_fit_info.status` when `T`
+    reports one (GMM2D, P2Mixture); otherwise 'nan' when the returned
+    value holds a NaN, else 'ok'."""
+    if raised:
+        return 'exception'
+    info = getattr(T, 'last_fit_info', None)
+    if info is not None and getattr(info, 'status', None) is not None:
+        return str(info.status)
+    return 'nan' if np.any(np.isnan(np.asarray(value, dtype=float))) else 'ok'
+
+
 def _init_worker(T, case_key: Optional[Tuple[str, str]]) -> None:
     """Pool initializer: pin the five BLAS thread variables, then build
     this process's estimator, either the object `Pool` was given directly

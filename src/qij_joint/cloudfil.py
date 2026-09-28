@@ -113,14 +113,14 @@ def _derived_outputs(theta: np.ndarray, K: int, s: int) -> np.ndarray:
     return np.array([mu_s[0], mu_s[1], log_reff, log_axis_ratio, pa, logit_w, log_contrast])
 
 
-def _jacobian(theta: np.ndarray, K: int, s: int) -> np.ndarray:
+def _jacobian(theta: np.ndarray, K: int, s: int, fd_step: float) -> np.ndarray:
     """(7, p) Jacobian of `_derived_outputs` at `theta`, `s` held fixed
     -- central finite differences of the deterministic closed forms
     (spec/QIJ_mods_waves.md A11)."""
     p = theta.shape[0]
     J = np.empty((len(_DERIVED_NAMES), p))
     for c in range(p):
-        h = _FD_STEP * max(1.0, abs(theta[c]))
+        h = fd_step * max(1.0, abs(theta[c]))
         theta_p, theta_m = theta.copy(), theta.copy()
         theta_p[c] += h
         theta_m[c] -= h
@@ -142,8 +142,11 @@ class P2Mixture:
     name = 'p2mixture'
     takes_start = True
 
-    def __init__(self, reference=None, measured=None):
-        self._gmm = GMM2D(K=_K, reference=reference)
+    def __init__(self, reference=None, measured=None, eta: float = None,
+                 cond_max: float = None, fd_step: float = _FD_STEP):
+        kw = {k: v for k, v in (('eta', eta), ('cond_max', cond_max)) if v is not None}
+        self._gmm = GMM2D(K=_K, reference=reference, **kw)
+        self.fd_step = float(fd_step)
         self.eta = self._gmm.eta
         self.outputs = self._gmm.outputs + _DERIVED_NAMES
         n_raw = self._gmm.p
@@ -181,6 +184,6 @@ class P2Mixture:
             return np.full((len(X), self._gmm.p + n_derived), np.nan)
         K = self._gmm.K
         s = _select_p2(theta, K)
-        J = _jacobian(theta, K, s)
+        J = _jacobian(theta, K, s, self.fd_step)
         IF_derived = IF_raw @ J.T
         return np.concatenate([IF_raw, IF_derived], axis=1)

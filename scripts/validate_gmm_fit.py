@@ -71,6 +71,12 @@ def _ij_psi(s: int, outputs) -> np.ndarray:
 
 def _status_of(theta: np.ndarray, T) -> tuple:
     info = getattr(T, 'last_fit_info', None)
+    if hasattr(info, '_asdict'):
+        # The new code's FitInfo namedtuple, under the field names the
+        # reports use.
+        f = info._asdict()
+        info = dict(status=f['status'], score_scaled=f['score'],
+                    em_iters=f['n_iter_em'], newton_iters=f['n_iter_newton'])
     finite = bool(np.all(np.isfinite(np.asarray(theta, dtype=float))))
     if isinstance(info, dict) and 'status' in info:
         return str(info['status']), info
@@ -263,7 +269,7 @@ def run_item3(mod, args):
     X = datasets.cloudfil_G_B6_P3_v1(N_CLOUDFIL, s)
     T = case.make_T()
     theta_hat = _oracle_theta_hat(s, T.outputs)
-    eta_full, _ = measure_eta_full(T, X, theta_hat)
+    eta_full = measure_eta_full(T, X, theta_hat)[0]
 
     rng = np.random.default_rng(0)  # fixed rng seed, per spec item 3
     probs = np.full(N_CLOUDFIL, 1.0 / N_CLOUDFIL)

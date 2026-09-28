@@ -28,7 +28,7 @@ from typing import Optional
 import numpy as np
 
 from .core.eta import measure_eta_full
-from .parallel import Pool, call_T
+from .parallel import Pool, call_T, fit_status
 from .result import BootstrapResult
 
 
@@ -39,33 +39,39 @@ def _theta_hat_task(T, case, X: np.ndarray, _task):
     chunks rather than blocking them, and computed outside the resample
     loop's own RNG stream. A failing evaluation is caught here, this
     task's own declared failure boundary. Returns (evaluation, this
-    call's own wall time)."""
+    call's own wall time, its `fit_status`)."""
     t0 = time.perf_counter()
     try:
         result = np.asarray(call_T(T, X, np.ones(len(X))), dtype=float)
+        status = fit_status(T, result)
     except Exception:
         result = np.full(len(T.outputs), np.nan)
-    return result, time.perf_counter() - t0
+        status = fit_status(T, result, raised=True)
+    return result, time.perf_counter() - t0, status
 
 
 def _boot_task(T, case, X: np.ndarray, task):
     """Evaluate `T` at each row of `counts`, warm-started from `start`
     at polish tolerance `eta` (`call_T` applies the `T.takes_start` gate
     to both, so an estimator without it never sees either); returns the
-    chunk's replicates and this call's own wall time. A failing
+    chunk's replicates, each replicate's `fit_status`, and this call's
+    own wall time. A failing
     evaluation is caught here, the one place an estimator's exception is
     allowed to turn into a NaN replicate rather than aborting the
     chunk."""
     counts, start, eta = task
     m, q = counts.shape[0], len(T.outputs)
     out = np.empty((m, q), dtype=float)
+    status = []
     t0 = time.perf_counter()
     for i in range(m):
         try:
             out[i] = call_T(T, X, counts[i], start=start, eta=eta)
+            status.append(fit_status(T, out[i]))
         except Exception:
             out[i] = np.nan
-    return out, time.perf_counter() - t0
+            status.append(fit_status(T, out[i], raised=True))
+    return out, status, time.perf_counter() - t0
 
 
 class Bootstrap:
@@ -101,13 +107,14 @@ class Bootstrap:
         theta_hat = None
         eta_full = T.eta
         if warm:
-            theta_hat, theta_wall = theta_future.result()
+            theta_hat, theta_wall, theta_status = theta_future.result()
             busy_time += theta_wall
             t_eta0 = time.perf_counter()
             eta_full, _, _ = measure_eta_full(T, X, theta_hat)
             busy_time += time.perf_counter() - t_eta0
 
         replicates = np.empty((self.B, q), dtype=float)
+        replicate_status = [''] * self.B
         t_start = time.perf_counter()
 
         def draw(m: int) -> np.ndarray:
@@ -129,12 +136,13 @@ class Bootstrap:
             done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
             for fut in done:
                 offset, m = inflight.pop(fut)
-                out, wall = fut.result()
+                out, status, wall = fut.result()
                 replicates[offset:offset + m] = out
+                replicate_status[offset:offset + m] = status
                 busy_time += wall
 
         if not warm:
-            theta_hat, theta_wall = theta_future.result()
+            theta_hat, theta_wall, theta_status = theta_future.result()
             busy_time += theta_wall
         wall_time = time.perf_counter() - t_start
         if own_pool:
@@ -145,4 +153,5 @@ class Bootstrap:
             outputs=T.outputs, theta_hat=theta_hat, replicates=replicates,
             n_degenerate=n_degenerate, wall_time=wall_time, busy_time=busy_time,
             workers=workers, eta_full=eta_full,
+            theta_hat_status=theta_status, replicate_status=replicate_status,
         )
