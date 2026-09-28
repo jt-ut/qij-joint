@@ -93,12 +93,12 @@ _LOG2PI = float(np.log(2.0 * np.pi))
 _ETA_DEFAULT = float(np.sqrt(np.finfo(float).eps))
 _COND_MAX_DEFAULT = 1e12
 
-# Phase 1's fixed screening budget and phase 2's promotion count, set by
-# measurement (module report): fastest choice that never moved the
-# winning start or theta_hat relative to running every start to full
-# budget.
-_SHORT_ITERS = 25
-_PROMOTE_N = 3
+# The racing screen's survivor count (spec/QIJ_estimator_search_spec.md
+# 2.2, 5): "the old promotion count carried over" from the fixed
+# 25-iteration screen's own promotion count -- now the racing screen's
+# stopping target (it ends when at most this many starts remain) and
+# the round cap's fallback keep-count.
+_K_KEEP = 3
 
 # The second greedy-EM start's over-segmentation resolution
 # (spec/QIJ_mods_waves.md A15), beside `seeding.py`'s own 50*K default,
@@ -679,71 +679,157 @@ def _m_step_batched(w: np.ndarray, R: np.ndarray, XP: np.ndarray, K: int, S: int
     return pis, mus, Ss
 
 
+def _aitken_screen(ell_km2: float, ell_km1: float, ell_k: float):
+    """The racing screen's own Aitken projection (spec/
+    QIJ_estimator_search_spec.md 2.2), restated for a plain-EM
+    trajectory (no acceleration, so the sequence is only linearly
+    convergent once it settles into that regime -- the two special
+    cases below are what the fixed-budget screen's replacement needs
+    that `_em_accelerated`'s own Aitken test does not): c = (ell_k -
+    ell_km1) / (ell_km1 - ell_km2); ell_inf = +inf when c >= 1 (not yet
+    in the linear regime: the extrapolation is not to be trusted, and
+    the spec's rule is that such a start is never discarded); ell_inf =
+    ell_k when c <= 0 (no monotone trend to extrapolate -- plain EM's
+    penalized ll is monotone non-decreasing, so a non-positive
+    numerator or denominator here is a plateau or floating-point noise,
+    never a real decrease); otherwise the standard extrapolation
+    (McLachlan and Krishnan section 4.9). Returns (ell_inf, u) with
+    u = ell_inf - ell_k the start's own claimed remaining gain (+inf or
+    0 in the two special cases)."""
+    denom = ell_km1 - ell_km2
+    c = 0.0 if denom <= 0.0 else (ell_k - ell_km1) / denom
+    if c >= 1.0:
+        return float('inf'), float('inf')
+    if c <= 0.0:
+        return ell_k, 0.0
+    ell_inf = ell_km1 + (ell_k - ell_km1) / (1.0 - c)
+    return ell_inf, ell_inf - ell_k
+
+
 def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
-                   K: int, iters: int, Scov: np.ndarray, a_pen: float):
-    """Run every start in `starts` for exactly `iters` EM iterations,
-    batched in lockstep (one E-step matmul, one M-step matmul per
-    iteration, S = len(starts)), M-step the penalized one; no
-    convergence test, no per-iteration bookkeeping (so no per-iteration
-    penalized `ll` either -- only the trailing one, used for ranking).
-    Degeneracy is checked once, after the loop, start by start -- the
-    batched matmuls are column-blocked per start, so a NaN in one
-    start's columns cannot reach another's. Returns a list of dicts
-    (`_run_em`'s shape, `converged=False`, `n_iter=iters` always), one
-    per surviving start."""
-    S = len(starts)
+                   K: int, Scov: np.ndarray, a_pen: float):
+    """The racing screen (spec/QIJ_estimator_search_spec.md 2.2),
+    replacing the fixed-budget screen this function used to be. Every
+    start in `starts` takes one PLAIN EM step per round (`_e_step_batched`/
+    `_m_step_batched`, no acceleration: the Aitken projection assumes
+    EM's own linear convergence, which SQUAREM would break), all still-
+    live starts batched together in one E-step matmul and one M-step
+    matmul (S = the live count, shrinking as starts are discarded --
+    the batched matmuls are column-blocked per start, so a NaN in one
+    start's columns, checked every round rather than once at the end,
+    cannot reach another's). After each round, every live start's own
+    trailing three per-round penalized log-likelihoods (kept per start,
+    where the old fixed-budget screen kept only the final one) go to
+    `_aitken_screen`; a start is discarded when 2*ell_inf - ell_k falls
+    below ell_best, the best ACHIEVED ell_k among live starts (not a
+    projection) -- a start with fewer than three recorded values, or
+    whose projection is not yet in the linear regime, is never
+    discarded. The screen ends when at most `_K_KEEP` starts remain, or
+    at the 20*p round cap (`screen_cap`; the `_K_KEEP` best by ell_k are
+    kept). Returns (survivors, screen_rounds, screen_status):
+    `survivors` is the list of dicts (pis, mus, Ss) for `_run_em` to
+    finish, one per start the screen kept."""
+    p = (K - 1) + 5 * K
+    round_cap = 20 * p
     W = float(w.sum())
+
+    def batched_ll(pis, mus, Ss, S):
+        with np.errstate(all='ignore'):
+            a, b, c, det = _sigma_terms_batched(Ss)
+            R, log_norm = _e_step_batched(Q, pis, mus, a, b, c, det, K, S)
+            ll_raw = (w @ log_norm) / W
+            ll = ll_raw - a_pen * _penalty_sum_batched(a, b, c, det, Scov, K, S) / W
+        return R, ll
+
+    def finite_split(pis, mus, Ss, ll, S):
+        """Per-start finiteness/PD check (the old screen's one-time
+        check, done every round): a NaN or non-PD covariance confined
+        to its own start's columns never contaminates another's."""
+        pis3, mus3, Ss3 = pis.reshape(S, K), mus.reshape(S, K, 2), Ss.reshape(S, K, 3)
+        ok = (np.isfinite(ll) & np.all(np.isfinite(pis3), axis=1)
+              & np.all(np.isfinite(mus3), axis=(1, 2)))
+        for s in range(S):
+            if ok[s]:
+                try:
+                    _sigma_terms(Ss3[s])
+                except np.linalg.LinAlgError:
+                    ok[s] = False
+        return ok, pis3, mus3, Ss3
+
+    # Round 0: each start's own initial penalized ll, before any EM
+    # step -- the Aitken triple's first recorded value.
+    S = len(starts)
     pis = np.concatenate([s[0] for s in starts])
     mus = np.concatenate([s[1] for s in starts], axis=0)
     Ss = np.concatenate([s[2] for s in starts], axis=0)
+    _, ll0 = batched_ll(pis, mus, Ss, S)
+    ok, pis3, mus3, Ss3 = finite_split(pis, mus, Ss, ll0, S)
+    live = [dict(pis=pis3[s], mus=mus3[s], Ss=Ss3[s], hist=[float(ll0[s])])
+            for s in range(S) if ok[s]]
 
-    with np.errstate(all='ignore'):
-        for _ in range(iters):
+    screen_rounds = 0
+    screen_status = 'ok'
+    while len(live) > _K_KEEP and screen_rounds < round_cap:
+        S = len(live)
+        pis = np.concatenate([s['pis'] for s in live])
+        mus = np.concatenate([s['mus'] for s in live], axis=0)
+        Ss = np.concatenate([s['Ss'] for s in live], axis=0)
+        with np.errstate(all='ignore'):
             a, b, c, det = _sigma_terms_batched(Ss)
             R, _ = _e_step_batched(Q, pis, mus, a, b, c, det, K, S)
             pis, mus, Ss = _m_step_batched(w, R, XP, K, S, Scov, a_pen)
+        _, ll_new = batched_ll(pis, mus, Ss, S)
+        screen_rounds += 1
+        ok, pis3, mus3, Ss3 = finite_split(pis, mus, Ss, ll_new, S)
 
-        # One trailing E-step pairs the reported ll with the last M-step.
-        a, b, c, det = _sigma_terms_batched(Ss)
-        _, log_norm = _e_step_batched(Q, pis, mus, a, b, c, det, K, S)
-        ll_raw = (w @ log_norm) / W  # (S,)
-        ll = ll_raw - a_pen * _penalty_sum_batched(a, b, c, det, Scov, K, S) / W
+        survivors = []
+        for s in range(S):
+            if not ok[s]:
+                continue
+            hist = live[s]['hist'] + [float(ll_new[s])]
+            if len(hist) > 3:
+                hist.pop(0)
+            survivors.append(dict(pis=pis3[s], mus=mus3[s], Ss=Ss3[s], hist=hist))
+        live = survivors
+        if not live:
+            break
 
-    pis_s = pis.reshape(S, K)
-    mus_s = mus.reshape(S, K, 2)
-    Ss_s = Ss.reshape(S, K, 3)
+        ell_best = max(s['hist'][-1] for s in live)
+        keep = []
+        for s in live:
+            if len(s['hist']) == 3:
+                ell_inf, _u = _aitken_screen(*s['hist'])
+                if 2.0 * ell_inf - s['hist'][-1] < ell_best:
+                    continue  # its most optimistic finish, credited twice, still trails the best achieved
+            keep.append(s)
+        live = keep
 
-    out = []
-    for s in range(S):
-        ll_i = float(ll[s])
-        pis_i, mus_i, Ss_i = pis_s[s], mus_s[s], Ss_s[s]
-        if not (np.isfinite(ll_i) and np.all(np.isfinite(pis_i))
-                and np.all(np.isfinite(mus_i))):
-            continue
-        try:
-            _sigma_terms(Ss_i)
-        except np.linalg.LinAlgError:
-            continue
-        out.append(dict(pis=pis_i.copy(), mus=mus_i.copy(), Ss=Ss_i.copy(),
-                         ll=ll_i, converged=False, n_iter=iters))
-    return out
+    if screen_rounds >= round_cap and len(live) > _K_KEEP:
+        screen_status = 'screen_cap'
+        live.sort(key=lambda s: -s['hist'][-1])
+        live = live[:_K_KEEP]
+
+    survivors = [dict(pis=s['pis'], mus=s['mus'], Ss=s['Ss']) for s in live]
+    return survivors, screen_rounds, screen_status
 
 
 def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, eta, Scov, a_pen):
-    """Pool = every surviving start, ranked by penalized weighted log-
-    likelihood (ell_p/W), via the two-phase screen: phase 1 runs
-    every start's short budget in lockstep (`_phase1_batch`); the best
-    few are carried, one at a time, to `_run_em`'s own stop test
-    (phase 2, sequential `_run_em`). Starts are the `n_starts` k-means starts (`_starts`),
-    the greedy-EM insertion start of A12 at `seeding.py`'s own 50*K
-    cells, a second at `_GREEDY_CELL_FACTOR_2`*K cells (A15), and that
-    second start's own `_GREEDY_VARIANT_FACTORS` covariance-scaled
-    variants (A12 item 6) -- appended after the k-means starts and the
-    50*K one, so their presence never reorders or drops any start the
-    ported pool already had. `seeding.greedy_em_start` takes this module's own
+    """Pool = every surviving start, raced down by the screen
+    (`_phase1_batch`, spec/QIJ_estimator_search_spec.md 2.2) to at most
+    `_K_KEEP` survivors, each then run to convergence by `_run_em`'s
+    own accelerated EM and Aitken stop; the best of those is kept.
+    Starts are the `n_starts` k-means starts (`_starts`), the greedy-EM
+    insertion start of A12 at `seeding.py`'s own 50*K cells, a second at
+    `_GREEDY_CELL_FACTOR_2`*K cells (A15), and that second start's own
+    `_GREEDY_VARIANT_FACTORS` covariance-scaled variants (A12 item 6) --
+    appended after the k-means starts and the 50*K one, so their
+    presence never reorders or drops any start the ported pool already
+    had. `seeding.greedy_em_start` takes this module's own
     `_em_accelerated`/`_penalized_ll` as arguments rather than importing
     this module (seeding.py must not import gmm.py, which already
-    imports it)."""
+    imports it). Returns `_run_em`'s dict for the winner, plus
+    `n_starts_screened`, `screen_rounds`, `n_survivors`, `screen_status`
+    (spec 2.2, 2.4)."""
     starts = _starts(X, K, n_starts, seed)
     starts += greedy_em_start(X, w, K, seed, Q, XP, Scov, a_pen, eta,
                                em_accelerated=_em_accelerated, penalized_ll=_penalized_ll)
@@ -752,22 +838,26 @@ def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, eta, Scov, a_pen):
                                cell_factor=_GREEDY_CELL_FACTOR_2)
     if greedy2:
         starts += greedy2 + scaled_variants(greedy2[0], _GREEDY_VARIANT_FACTORS)
-    phase1_budget = _SHORT_ITERS
 
-    screened = _phase1_batch(Q, XP, w, starts, K, phase1_budget, Scov, a_pen)
-    if not screened:
+    n_starts_screened = len(starts)
+    survivors, screen_rounds, screen_status = _phase1_batch(Q, XP, w, starts, K, Scov, a_pen)
+    n_survivors = len(survivors)
+    if not survivors:
         return None
 
-    screened.sort(key=lambda r: -r['ll'])
-    top = screened[:min(_PROMOTE_N, len(screened))]
     finished = []
-    for r in top:
+    for r in survivors:
         res = _run_em(X, Q, XP, w, r['pis'], r['mus'], r['Ss'], eta, Scov, a_pen)
         if res is not None:
             finished.append(res)
     if not finished:
         return None
-    return max(finished, key=lambda r: r['ll'])
+    best = max(finished, key=lambda r: r['ll'])
+    best['n_starts_screened'] = n_starts_screened
+    best['screen_rounds'] = screen_rounds
+    best['n_survivors'] = n_survivors
+    best['screen_status'] = screen_status
+    return best
 
 
 def _canonical_sort(pis, mus, Ss):
