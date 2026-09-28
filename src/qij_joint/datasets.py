@@ -16,7 +16,6 @@ from typing import Callable, Tuple
 
 import h5py
 import numpy as np
-from structsynhd import ChaconMixGenerator
 
 _DATA_DIR = pathlib.Path(__file__).parent / 'data'
 
@@ -64,7 +63,10 @@ def mix11(N: int, seed: int) -> np.ndarray:
     means/covariances and component order), weights replaced by
     `MIX11_WEIGHTS` -- the talk's demo mixture, not one of the paper's
     four draws. `expand_dimension` is never called (GMM2D is 2-D), so
-    overriding the instance's own `weights` before `sample` is enough."""
+    overriding the instance's own `weights` before `sample` is enough.
+    structsynhd is imported here, not at module level: only mix11 needs
+    it, and the package must import where it is not installed."""
+    from structsynhd import ChaconMixGenerator
     gen = ChaconMixGenerator(MIX11_MIXNUM)
     gen.weights = MIX11_WEIGHTS
     X, _ = gen.sample(N, random_state=seed)
