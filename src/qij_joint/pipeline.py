@@ -515,8 +515,8 @@ def run_qijt(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
                    seed=dseed, vq_transform=case.vq_transform).fit(X, T, pool=pool)
         row = _qijt_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat, dataset, estimator))
-        arrays = {'nodes': res.nodes, 'leaves': res.leaves,
-                  'curve': res.curve, 'anchors': res.anchors}
+        arrays = {'nodes': res.nodes, 'leaves': res.leaves, 'curve': res.curve,
+                  'anchors': res.anchors, 'pairs': res.pairs}
         if s in diag:
             arrays['points'] = _qijt_points(res)
         products.write_draw(md, s, row, arrays)

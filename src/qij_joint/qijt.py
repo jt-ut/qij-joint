@@ -32,7 +32,8 @@ from .core.abc import curvature as _curvature
 from .core.counter import Counter
 from .core.differences import forward_step
 from .core.eta import measure_eta_full
-from .core.tree import active_rows, anchors, build_state, drift, grow, leaves, node_mass, reconstruct, within
+from .core.tree import (active_rows, anchors, build_state, drift, grow, leaf_V_btw, leaves, node_mass,
+                        reconstruct, within)
 from .core.xvq import SurveyRows, _measure_eta_Q, fit_xvq
 from .parallel import fit_status
 from .qij import _theta_hat_task, _wrap
@@ -94,6 +95,7 @@ class QIJTResult:
     leaves: pd.DataFrame
     curve: pd.DataFrame
     anchors: pd.DataFrame
+    pairs: pd.DataFrame
     psi_hat: np.ndarray               # (N, q)
     leaf_of_point: np.ndarray         # (N,)
 
@@ -132,26 +134,29 @@ def _acceleration(psi_points: np.ndarray) -> np.ndarray:
     return out
 
 
-def _V_btw_unscaled(state) -> np.ndarray:
-    """Sum of counted E over measured nodes, ascending id (spec 8.2);
-    `state.node_measured` is already ordered by node id."""
-    mask = state.node_measured[:state.n_nodes]
-    return state.E[:state.n_nodes][mask].sum(axis=0)
-
-
-def _tree_opening_cost(curve_rows) -> Tuple[int, int]:
-    """The tree-growth `opening` evals/rows (spec 5.3), derived from the
-    curve table: a round whose R grew from the previous round spent one
-    extra theta_Q re-evaluation over the new (post-opening) rows."""
-    evals_opening, rows_opening = 0, 0
-    R_prev = None
+def _tree_rows(curve_rows) -> int:
+    """Rows of the tree's own node measurements: each round's new
+    evaluations times that round's (post-opening) row count."""
+    total, prev = 0, 0
     for row in curve_rows:
-        R = row['R']
-        if R_prev is not None and R > R_prev:
-            evals_opening += 1
-            rows_opening += R
-        R_prev = R
-    return evals_opening, rows_opening
+        total += (row['evals_tree'] - prev) * row['R']
+        prev = row['evals_tree']
+    return total
+
+
+def _pairs_table(pairs, quads, outputs: Tuple[str, ...], measured: np.ndarray) -> pd.DataFrame:
+    """§11.2a: one row per bought contrast, j = 0 for the quadratic
+    (D unscaled; Q in the D column)."""
+    rows = []
+    for rec, j, resp in ([(p, p['j'], p['D']) for p in pairs]
+                         + [(qd, 0, qd['Q']) for qd in quads]):
+        row = dict(leaf=int(rec['leaf']), j=int(j), t=float(rec['t']))
+        for k, o in enumerate(outputs):
+            row[f'D_{o}'] = float(resp[measured[k]])
+            row[f's_{o}'] = float(rec['s'][k])
+            row[f'pass_{o}'] = bool(rec['passed'][k])
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _nodes_table(state, outputs: Tuple[str, ...], curve_rows) -> pd.DataFrame:
@@ -175,17 +180,18 @@ def _nodes_table(state, outputs: Tuple[str, ...], curve_rows) -> pd.DataFrame:
         row = dict(node=int(c), parent=int(parent[c]), depth=int(state.node_depth[c]),
                    kind=('cells' if state.node_kind[c] == 0 else 'points'),
                    cell=int(state.node_cell[c]), n_cells=n_cells, n_points=n_points,
-                   p=float(node_mass(state, c)), measured=bool(measured_mask[c]),
+                   p=float(node_mass(state, c)), node_measured=bool(measured_mask[c]),
                    round=int(state.node_round[c]), measured_child=int(state.meas_child[c]),
                    t=float(state.node_t[c]),
                    evals_rows=int(round_to_R.get(int(state.node_round[c]), 0)),
                    status=str(state.node_status[c]))
         for j, o in enumerate(outputs):
-            row[f'U_{o}'] = float(state.U[c, j])
+            row[f'U_{o}'] = float(state.U[c, state.measured[j]])
             row[f'y_{o}'] = float(state.y[c, j])
             row[f's_{o}'] = float(state.s[c, j])
             row[f'E_{o}'] = float(state.E[c, j])
             row[f'pass_{o}'] = bool(state.passes[c, j])
+            row[f'open_shift_{o}'] = float(state.open_shift[c, j])
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -261,6 +267,7 @@ def _nan_result(outputs, measured, N, method, workers, status, theta_hat_status,
         theta_hat=np.asarray(theta_hat, dtype=float), V_btw=nan_q, V_win=nan_q, V_tot=nan_q,
         a_scale=nan_q, a_scatter=nan_q, root_drift=nan_q, accel=nan_q, b_hat=nan_q, c_q=nan_q,
         nodes=pd.DataFrame(), leaves=pd.DataFrame(), curve=pd.DataFrame(), anchors=pd.DataFrame(),
+        pairs=pd.DataFrame(),
         psi_hat=np.full((N, q), np.nan), leaf_of_point=np.full(N, -1, dtype=int),
     )
 
@@ -379,10 +386,11 @@ class QIJT:
                                 theta_hat_status, theta_Q_status, eta_full, eta_Q,
                                 eta_full_failed, eta_Q_failed, evals, rows, wall, t_start,
                                 counter, theta_hat)
-        ev_open, rw_open = _tree_opening_cost(curve_rows)
-        evals['tree'], evals['opening'] = evals_tree, ev_open
-        rows['opening'] = rw_open
-        rows['tree'] = rw_tree_window - rw_open
+        # The window also holds the openings' theta_Q re-evaluations and U
+        # re-measurements (spec 5.3), counted in `opening`.
+        evals['tree'], evals['opening'] = evals_tree, (ev5 - ev4) - evals_tree
+        rows['tree'] = _tree_rows(curve_rows)
+        rows['opening'] = rw_tree_window - rows['tree']
 
         # --- anchors + bias (spec 6.1-6.2, 6.4); one N call, split by count ---
         t0 = time.perf_counter()
@@ -397,8 +405,8 @@ class QIJT:
 
         # --- within + quadratic (spec 7.2-7.3); `opening`'s within share ---
         t0 = time.perf_counter()
-        V_btw_unscaled = _V_btw_unscaled(state)
-        wr = within(state, T, counter, pool, self.budget_win, self.budget_quad, V_btw_unscaled)
+        ev_w0, rw_w0 = counter.snapshot()
+        wr = within(state, T, counter, pool, self.budget_win, self.budget_quad, leaf_V_btw(state))
         wall['within'] = time.perf_counter() - t0  # quadratic shares this wall time
         if wr.get('status') == 'opening_failed':
             return _nan_result(outputs, measured, N, self, workers, 'opening_failed',
@@ -409,14 +417,14 @@ class QIJT:
         n_pairs, n_quads = len(wr['pairs']), len(wr['quads'])
         evals['within'], rows['within'] = n_pairs, n_pairs * R_final
         evals['quadratic'], rows['quadratic'] = n_quads, n_quads * R_final
-        opened_within = 1 if wr['opened'] else 0
-        evals['opening'] += opened_within
-        rows['opening'] += opened_within * R_final
+        ev_w1, rw_w1 = counter.snapshot()
+        evals['opening'] += (ev_w1 - ev_w0) - n_pairs - n_quads
+        rows['opening'] += (rw_w1 - rw_w0) - (n_pairs + n_quads) * R_final
 
         W_sum = np.sum([p['W'] for p in wr['pairs']], axis=0) if wr['pairs'] else np.zeros(q)
         Q_sum = np.sum([qd['contribution'] for qd in wr['quads']], axis=0) if wr['quads'] else np.zeros(q)
         V_win = a_scale ** 2 * (W_sum + Q_sum)
-        V_btw = a_scale ** 2 * V_btw_unscaled
+        V_btw = a_scale ** 2 * leaf_V_btw(state)
         V_tot = V_btw + V_win
 
         # --- drift (spec 6.3) ---
@@ -436,7 +444,7 @@ class QIJT:
         ev8, rw8 = counter.snapshot()
         row_ids_f, rows_x_f, omega0_f = active_rows(state)
         sv = SurveyRows(rows=rows_x_f, row_field=np.arange(len(row_ids_f)), omega0=omega0_f,
-                         eta_Q=(eta_Q if counter.takes_start else float('nan')),
+                         eta_Q=eta_Q,
                          step_ratio=np.full((5, q_full), np.nan),
                          quantized_start='full-data', eta_rows=eta_full)
         c_q, _eps, curv_busy, _one_sided = _curvature(
@@ -477,5 +485,6 @@ class QIJT:
             leaves=_leaves_table(wr['leaf_rows'], outputs, a_scale),
             curve=_curve_table(curve_rows, outputs, a_scale),
             anchors=_anchors_table(anc['table'], outputs),
+            pairs=_pairs_table(wr['pairs'], wr['quads'], outputs, measured),
             psi_hat=psi_points, leaf_of_point=leaf_of_point,
         )

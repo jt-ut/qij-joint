@@ -62,6 +62,7 @@ class TreeState:
     s: np.ndarray
     E: np.ndarray
     passes: np.ndarray
+    open_shift: np.ndarray
     theta_hat: np.ndarray
     theta_Q: np.ndarray
     eta_full: float
@@ -292,6 +293,7 @@ def build_state(X, Z, bmu, centers_x, centers_z, measured, q_full, node_cap) -> 
         node_status=np.full(node_cap, '', dtype=object),
         U=U, y=np.full((node_cap, q), np.nan), s=np.full((node_cap, q), np.nan),
         E=np.full((node_cap, q), np.nan), passes=np.zeros((node_cap, q), dtype=bool),
+        open_shift=np.full((node_cap, q), np.nan),
         theta_hat=np.full(q_full, np.nan), theta_Q=np.full(q_full, np.nan),
         eta_full=float('nan'), eta_Q=float('nan'), delta_f=float('nan'), z_n=5.0,
     )
@@ -418,11 +420,44 @@ def _priority(E_parent: np.ndarray, V_btw: np.ndarray) -> float:
     return float(np.max(ratio)) if ratio.size else 0.0
 
 
+def remeasure_opened(state: TreeState, T, counter, pool, cells: Sequence[int]) -> None:
+    """Each opened cell's U re-measured on the new rows (spec 5.3): one
+    evaluation per cell along its native points, base the new theta_Q.
+    The new U replaces the parent-derived one for everything below the
+    cell; the shift is recorded. A failed task (counted by run_batch's
+    counter) leaves its cell's old U."""
+    row_ids, rows_x, omega0 = active_rows(state)
+    tasks, info = [], []
+    for j in cells:
+        X_node = int(state.cell_node[j])
+        p_X = node_mass(state, X_node)
+        t = step_parameter(state.delta_f, p_X)
+        pos = np.searchsorted(row_ids, node_rows(state, X_node))
+        tasks.append((X_node, set_weights(omega0, pos, p_X, t), state.theta_Q, state.eta_full))
+        info.append((X_node, t))
+    for (_, value, failed, _status, _wall), (X_node, t) in zip(
+        run_batch(T, counter, pool, rows_x, tasks), info,
+    ):
+        if failed:
+            continue
+        U_new = (value - state.theta_Q) / t
+        state.open_shift[X_node] = (U_new - state.U[X_node])[state.measured]
+        state.U[X_node] = U_new
+
+
+def leaf_V_btw(state: TreeState) -> np.ndarray:
+    """(1/N) sum over the leaves of p_l U_l^2, leaves in ascending id
+    (spec 8.2): the between-leaf variance from the leaf means, unscaled."""
+    ids = leaves(state)
+    p = np.array([node_mass(state, c) for c in ids])
+    return (p[:, None] * state.U[ids][:, state.measured] ** 2).sum(axis=0) / state.N
+
+
 def _curve_row(round_: int, evals_tree: int, R: int, state: TreeState, this_round: Sequence[int]) -> dict:
-    """One curve row (spec 11.4): V_btw sums every measured node's E in
-    ascending id (boolean masking preserves index order, spec 9.2)."""
+    """One curve row (spec 11.4): V_btw is the leaf sum of 8.2 for the
+    leaves as they stand after the round."""
     n_open = sum(1 for c in this_round if state.passes[c].any())
-    V_btw = state.E[state.node_measured].sum(axis=0)
+    V_btw = leaf_V_btw(state)
     return {'round': round_, 'evals_tree': evals_tree, 'R': R, 'n_open': n_open, 'V_btw': V_btw}
 
 
@@ -450,11 +485,16 @@ def grow(state: TreeState, T, counter, pool, budget: int) -> Tuple[List[dict], s
         order = sorted(range(len(candidates)), key=lambda i: (-priority[i], candidates[i]))
         selected = [candidates[order[i]] for i in range(min(len(candidates), remaining))]
 
-        cells = [int(state.node_cell[c]) for c in selected if state.node_cell[c] != -1]
+        # Only still-unopened cell nodes open; within-cell nodes carry
+        # their cell's id too.
+        cells = [int(state.node_cell[c]) for c in selected
+                 if state.node_kind[c] == 0 and state.node_cell[c] != -1
+                 and state.cell_row[state.node_cell[c]] >= 0]
         if cells:
             open_cells(state, cells)
             if not reevaluate_theta_Q(state, T, counter):
                 return curve_rows, 'opening_failed', n_rounds, evals_tree
+            remeasure_opened(state, T, counter, pool, cells)
 
         round_ += 1
         measure_nodes(state, T, counter, pool, selected, round_)
@@ -725,7 +765,7 @@ def _response(state: TreeState, value: np.ndarray, failed: bool, t: float,
     s = np.sqrt(2.0) * state.eta_Q * np.abs(state.theta_Q[meas]) / t
     passed = (not failed) & (np.abs(resp[meas]) > state.z_n * s)
     contribution = np.where(passed, resp[meas] ** 2 / (state.N * p_l), 0.0)
-    return resp, contribution
+    return resp, contribution, s, passed
 
 
 def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
@@ -767,6 +807,7 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
         open_cells(state, opened)
         if not reevaluate_theta_Q(state, T, counter):
             return dict(pairs=[], quads=[], opened=opened, leaf_rows=[], status='opening_failed')
+        remeasure_opened(state, T, counter, pool, opened)
         row_ids, rows_x, omega0 = active_rows(state)
         row_z = state.row_z[row_ids]
         pos = np.full(state.n_rows, -1, dtype=int)
@@ -786,8 +827,8 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
     A: Dict[int, np.ndarray] = {}
     for (_, value, failed, status, _wall), (ell, j, t) in zip(results, meta):
         p_l = frames[ell]['p']
-        D, W = _response(state, value, failed, t, p_l)
-        pairs.append(dict(leaf=ell, j=j, D=D, W=W, t=t, status=status))
+        D, W, s, passed = _response(state, value, failed, t, p_l)
+        pairs.append(dict(leaf=ell, j=j, D=D, W=W, t=t, s=s, passed=passed, status=status))
         A[ell] = A.get(ell, np.zeros_like(V_btw_unscaled)) + W
 
     quad_scored = sorted(
@@ -809,8 +850,9 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
     quads: List[Dict[str, Any]] = []
     for (_, value, failed, status, _wall), (ell, t) in zip(q_results, meta):
         p_l = frames[ell]['p']
-        Qv, contribution = _response(state, value, failed, t, p_l)
-        quads.append(dict(leaf=ell, Q=Qv, contribution=contribution, status=status))
+        Qv, contribution, s, passed = _response(state, value, failed, t, p_l)
+        quads.append(dict(leaf=ell, Q=Qv, contribution=contribution, t=t, s=s, passed=passed,
+                          status=status))
 
     n_pairs: Dict[int, int] = {}
     for pr in pairs:
@@ -849,11 +891,11 @@ def reconstruct(state: TreeState, pairs: List[Dict[str, Any]], quads: List[Dict[
     for pr in pairs:
         fr = frames[pr['leaf']]
         pos_l, h = _pair_h(fr, pr['j'], row_z, pos)
-        psi_rows[np.ix_(pos_l, meas)] += np.outer(h, a * pr['D'][meas] / fr['p'])
+        psi_rows[np.ix_(pos_l, meas)] += np.outer(h, np.where(pr['passed'], a * pr['D'][meas] / fr['p'], 0.0))
     for qd in quads:
         fr = frames[qd['leaf']]
         pos_l, h = _quad_h(fr, row_z, pos, omega0, state.N)
-        psi_rows[np.ix_(pos_l, meas)] += np.outer(h, a * qd['Q'][meas] / fr['p'])
+        psi_rows[np.ix_(pos_l, meas)] += np.outer(h, np.where(qd['passed'], a * qd['Q'][meas] / fr['p'], 0.0))
 
     point_to_row = np.full(state.N, -1, dtype=int)
     rp = state.row_point[row_ids]
