@@ -161,6 +161,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
     wall = time.perf_counter() - t_start
     return QIJResult(
         outputs=outputs, N=N, theta_hat=nan_q,
+        theta_hat_full=np.full(np.asarray(I_proto).shape[1], np.nan),
         V_btw=nan_q, V_win_hat=nan_q, V_tot_hat=nan_q, gain_ratio=nan_q,
         ell=nan_q, lam=nan_q, ell_bound=false_q, lam_bound=false_q,
         gptrend=gptrend, gpwidth=gpwidth, c=nan_q, c_bound=false_q,
@@ -532,7 +533,7 @@ class QIJ:
         c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
 
         return QIJResult(
-            outputs=outputs, N=N, theta_hat=theta_hat[measured],
+            outputs=outputs, N=N, theta_hat=theta_hat[measured], theta_hat_full=theta_hat,
             ell=np.array(model.width), lam=np.array(model.lam),
             ell_bound=ell_bound, lam_bound=model.at_bound[:, 1].copy(),
             gptrend=self.gptrend, gpwidth=self.gpwidth,

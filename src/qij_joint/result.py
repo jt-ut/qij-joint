@@ -52,6 +52,7 @@ class QIJResult:
     outputs: Tuple[str, ...]
     N: int
     theta_hat: np.ndarray          # (q,)
+    theta_hat_full: np.ndarray     # (q_full,) every T output; the search audit's input
     V_btw: np.ndarray              # (q,)
     V_win_hat: np.ndarray          # (q,)
     V_tot_hat: np.ndarray          # (q,)

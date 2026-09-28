@@ -16,6 +16,7 @@ import pandas as pd
 from . import products, registry
 from .bootstrap import Bootstrap
 from .ijfd import IJFD
+from .audit import search_audit
 from .parallel import Pool, fit_status
 from .qij import QIJ
 
@@ -38,7 +39,9 @@ def _oracle_task(T, case, X, task):
         theta_hat = np.full(len(T.outputs), np.nan)
         failed = True
         status = fit_status(T, theta_hat, raised=True)
-    return s, seed, theta_hat, failed, status, time.perf_counter() - t0
+    wall = time.perf_counter() - t0
+    audit = search_audit(T, Xd, theta_hat, case.dataset, case.estimator)
+    return s, seed, theta_hat, failed, status, wall, audit
 
 
 def _ij_task(T, case, X, task):
@@ -75,10 +78,10 @@ def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed:
     if pending:
         pool = Pool(workers, case=(dataset, estimator))
         tasks = [(s, N, seed) for s in pending]
-        for s, dseed, theta_hat, failed, status, wall in pool.map(_oracle_task, tasks):
+        for s, dseed, theta_hat, failed, status, wall, audit in pool.map(_oracle_task, tasks):
             row = {'dataset': dataset, 'estimator': estimator, 'N': N,
                    's': s, 'seed': dseed, 'n_failed': int(failed), 'fit_status': status,
-                   'wall_time': wall, 'busy_time': wall, 'workers': workers}
+                   'wall_time': wall, 'busy_time': wall, 'workers': workers, **audit}
             for j, o in enumerate(outputs):
                 row[f'theta_true_{o}'] = float(theta_true[j])
                 row[f'theta_hat_{o}'] = float(theta_hat[j])
@@ -132,7 +135,8 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
                's': s, 'seed': dseed, 'n_degenerate': res.n_degenerate,
                'wall_time': res.wall_time, 'busy_time': res.busy_time,
                'workers': res.workers, 'eta_full': float(res.eta_full),
-               'fit_status': res.theta_hat_status}
+               'fit_status': res.theta_hat_status,
+               **search_audit(T, X, res.theta_hat, dataset, estimator)}
         rep_df = pd.DataFrame({f'theta_{o}': res.replicates[:, j]
                                 for j, o in enumerate(res.outputs)})
         rep_df['fit_status'] = res.replicate_status
@@ -323,6 +327,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   refine_schedule=refine_schedule).fit(
                       X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
+        row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}
         # `bin_U` (A14) is its own product name, distinct from the
         # joint path's `bins`, so it can be written every draw while
@@ -410,6 +415,7 @@ def run_ijfd(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
         X = case.draw(N, dseed)
         res = IJFD(point_curvature=point_curvature).fit(X, T, pool=pool)
         row = _ijfd_row(dataset, estimator, N, s, dseed, res)
+        row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _ijfd_step_ratio(res), 'psi': _ijfd_points(res)}
         products.write_draw(md, s, row, arrays)
         written += 1

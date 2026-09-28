@@ -164,6 +164,12 @@ class P2Mixture:
     def prepare(self, X: np.ndarray) -> tuple:
         return self._gmm.prepare(X)
 
+    def loglik(self, X: np.ndarray, w: np.ndarray, theta: np.ndarray,
+               prep: tuple = None) -> float:
+        """`GMM2D.loglik` on the raw mixture parameters (the derived
+        outputs have no likelihood term)."""
+        return self._gmm.loglik(X, w, np.asarray(theta, dtype=float)[:self._gmm.p], prep=prep)
+
     def __call__(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
                  start: np.ndarray = None, eta: float = None, **kwargs) -> np.ndarray:
         raw_start = None if start is None else np.asarray(start, dtype=float)[:self._gmm.p]

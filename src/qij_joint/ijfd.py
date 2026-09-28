@@ -130,6 +130,7 @@ class IJFDResult:
     N: int
     point_curvature: bool
     theta_hat: np.ndarray          # (q,) q = len(outputs)
+    theta_hat_full: np.ndarray     # (q_full,) every T output; the search audit's input
     V: np.ndarray                  # (q,) sum psi^2 / N^2, from THIS draw's psi
     a: np.ndarray                  # (q,) ABC acceleration (A10); NaN unless point_curvature
     b_hat: np.ndarray              # (q,) ABC second-order bias (A10); NaN unless point_curvature
@@ -196,7 +197,7 @@ def _failed_result(outputs: Tuple[str, ...], outputs_full: Tuple[str, ...], N: i
     rows_by = {'cold': rows, 'eta_full': 0, 'forward': 0, 'backward': 0, 'abc': 0, 'check': 0, 'total': rows}
     return IJFDResult(
         outputs=outputs, outputs_full=outputs_full, N=N, point_curvature=point_curvature,
-        theta_hat=np.full(q, np.nan), V=np.full(q, np.nan),
+        theta_hat=np.full(q, np.nan), theta_hat_full=np.full(q_full, np.nan), V=np.full(q, np.nan),
         a=np.full(q, np.nan), b_hat=np.full(q, np.nan), c_q=np.full(q, np.nan),
         eta_full=float('nan'), evals_by_stage=evals, rows_by_stage=rows_by,
         wall_time_total=wall, busy_time_total=wall, workers=workers,
@@ -482,7 +483,7 @@ class IJFD:
 
         return IJFDResult(
             outputs=outputs, outputs_full=outputs_full, N=N, point_curvature=self.point_curvature,
-            theta_hat=theta_hat[measured], V=V, a=a, b_hat=b_hat, c_q=c_q,
+            theta_hat=theta_hat[measured], theta_hat_full=theta_hat, V=V, a=a, b_hat=b_hat, c_q=c_q,
             eta_full=eta_full, evals_by_stage=evals_by_stage, rows_by_stage=rows_by_stage,
             wall_time_total=wall_time_total, busy_time_total=busy_time_total, workers=workers,
             step_ratio=step_ratio, nan_fraction=n_perturbed_failed / n_perturbed_total, psi=psi,

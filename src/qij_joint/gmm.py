@@ -1288,6 +1288,21 @@ class GMM2D:
         Q, XP = _build_features(Xc)
         return xmean, Xc, Q, XP
 
+    def loglik(self, X: np.ndarray, w: np.ndarray, theta: np.ndarray,
+               prep: tuple = None) -> float:
+        """The penalized log-likelihood per unit weight at `theta` (T's
+        own output layout, data coordinates), with no fit: the search
+        audit's comparison of two maxima on the same draw. NaN when a
+        covariance in `theta` is not positive definite."""
+        w = np.asarray(w, dtype=float)
+        xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
+        pis, mus, Ss = _unpack(self.K, _center_start(np.asarray(theta, dtype=float), self.K, xmean))
+        W, a_pen, Scov, _d = _weighted_cov(Xc, w)
+        try:
+            return float(_penalized_ll(Q, w, W, pis, mus, Ss, Scov, a_pen))
+        except np.linalg.LinAlgError:
+            return float('nan')
+
     def __call__(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
                  start: np.ndarray = None, eta: float = None, **kwargs) -> np.ndarray:
         cfg = self._resolve(kwargs)
