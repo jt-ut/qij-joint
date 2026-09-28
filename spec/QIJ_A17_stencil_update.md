@@ -230,3 +230,43 @@ These supersede the corresponding statements above.
    those); the session-scratch pickle is not required. If kept, the
    harness lives in `scripts/` and calls the code as it stands after
    this document's removals.
+
+## 9. Rulings on the build report (28 September, night; build at `a17-stencils` 8635952)
+
+1. **A failed prototype is a missing row for that output only.** Output
+   c's design is: every receptive field whose survey evaluation is finite
+   for c (its row indexed by receptive-field id, never by position in a
+   compacted array), plus output c's current leaves. A receptive field
+   whose evaluation failed for c contributes no row to c's model; its
+   points still belong to c's leaves and are still predicted. This is the
+   convention the stage-1 model already uses for a NaN prototype (a
+   missing response, per output, neither filled nor dropped). The output
+   is not collapsed. Empty receptive fields are dropped, as built. The
+   `NotImplementedError` at `core/stencils.py` is replaced by this rule.
+2. **The receptive-field columns are cached.** They are per-draw
+   invariants (E5, E6): formed once per kernel group at the first update
+   and reused; only the leaf columns are rebuilt each round, and a leaf's
+   column is formed when the leaf is created and dropped when it is
+   split. This is a code-standards ruling, not a performance claim;
+   `update_wall_time` is still reported per round.
+3. **The centring offset follows the model.** m_c is re-derived at every
+   update as the mean of the updated ψ̂₀_c over the N points, so the
+   centred field ψ̂₀_c − m_c has mean zero, on the same scale as the
+   stencils' own centring. (Σ_k p_k ū_k² is not shift-invariant; a frozen
+   offset would bias ρ² and every level gain after the first update.)
+4. **The λ_c objective, as built, is accepted.** The exact Gaussian
+   marginal likelihood with s²_c held at its stage-1 value and the trend
+   integrated out, ½ log det A + ½ log det G + ½ resid/s²_c, evaluated
+   through the same truncated eigendecomposition as the final solve; a
+   five-point log grid on [10⁻¹⁰, 10²] and one bounded refinement. The
+   noise conventions stated in the report are the intended ones: the
+   larger child's noise sd is (p_small/p_large) times the smaller
+   child's; a set row's noise-to-signal ratio is (sd · |θ̂_c|)² / s²_c.
+5. **Next run.** Cloudfil at N < 10 000 collapses in stage 1 (every survey
+   evaluation NaN), so the first real test is the rehearsal's draws 0 and
+   1 at N = 10 000, qij only, 14 workers, demo settings with
+   `gpwidth = local`, `refine_update = stencils`, `refine_schedule =
+   rounds`. Report per output V_btw/V_ij against the stored `ij` values,
+   evaluations, rounds, `update_wall_time`, the eigenvalue cut count per
+   update, and a_c and λ_c before and after. The A15 gate criteria then
+   apply. The author decides whether the simulator pre-screen runs first.

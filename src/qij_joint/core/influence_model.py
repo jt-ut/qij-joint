@@ -1122,31 +1122,48 @@ def _set_basis_row(Zw: np.ndarray, idx_S: np.ndarray, m_g: int) -> np.ndarray:
     return _basis(Zw[idx_S], m_g).mean(axis=0)
 
 
+def assemble_K_ss(Kx: np.ndarray, all_idx: Sequence[np.ndarray]) -> np.ndarray:
+    """
+    K_ss (n, n) = k(S, S') for the design's own rows `all_idx` (one
+    point-index array per row), read back from the already-formed `Kx`
+    (N, n): row a's own entry against every column is the mean of
+    `Kx`'s rows at row a's own members (spec section 8 item 2's K.A
+    construction, applied a second time to `Kx` itself rather than a
+    fresh pairwise pass), symmetrized once since the two ways of
+    deriving one off-diagonal entry agree only to rounding. No new
+    kernel evaluation: pure numpy indexing over `Kx`, so it is always
+    cheap to rebuild every round even when `Kx`'s own columns are
+    cached (spec section 9 item 2's caching ruling is about the K.A
+    kernel evaluations that built `Kx`, not this assembly).
+    """
+    K_ss = np.stack([Kx[idx].mean(axis=0) for idx in all_idx], axis=0)
+    return 0.5 * (K_ss + K_ss.T)
+
+
 def build_design(
     Zw: np.ndarray, all_idx: Sequence[np.ndarray], gpwidth: str, ell_or_c: float,
     h_full: Optional[np.ndarray], bmu: Optional[np.ndarray], d_z: int, m_g: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     The augmented design's shared (coordinate-independent) geometry over
-    `all_idx` (one point-index array per row -- every live prototype's
-    receptive field and every output's own current leaf alike, spec
-    section 8 items 1a-2), rebuilt from scratch every time this is
-    called (no set is assumed still present from a previous call).
+    `all_idx` (one point-index array per row), rebuilt from scratch
+    every time this is called -- no set's own column is assumed cached
+    from a previous call. `core.stencils`'s own production path caches
+    a receptive field's column per group (formed once, at the first
+    update) and a leaf's column per (group, leaf) (formed when the leaf
+    is created, dropped when it is split, spec section 9 item 2); this
+    function is the uncached reference the caching is checked against.
     Returns (Kx, H_all, K_ss): Kx (N, n) = k(x_i, S) for every draw
     point and every row (also the per-point kernel-to-design block at
-    re-prediction, no second computation); H_all (n, m_g) = h(S);
-    K_ss (n, n) = k(S, S'), each row read back from `Kx` at its own
-    members' rows (no second pairwise pass) and the whole matrix
-    symmetrized once, since the two ways of deriving one off-diagonal
-    entry agree only to rounding.
+    re-prediction, no second computation); H_all (n, m_g) = h(S); K_ss
+    from `assemble_K_ss`.
     """
     Kx = np.stack(
         [_set_kernel_column(Zw, idx, gpwidth, ell_or_c, h_full, bmu, d_z) for idx in all_idx],
         axis=1,
     )
     H_all = np.stack([_set_basis_row(Zw, idx, m_g) for idx in all_idx], axis=0)
-    K_ss = np.stack([Kx[idx].mean(axis=0) for idx in all_idx], axis=0)
-    K_ss = 0.5 * (K_ss + K_ss.T)
+    K_ss = assemble_K_ss(Kx, all_idx)
     return Kx, H_all, K_ss
 
 
