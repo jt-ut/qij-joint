@@ -171,11 +171,11 @@ query in this package is at the draw's own N points.
 
 **Width/c search.** Searched jointly for the group on
 [param_min, param_max]: under `gpwidth='global'` directly on ell,
-param_min the median whitened distance between CONN-connected
+param_min the smallest positive whitened distance between any two
 prototypes, param_max ten times the largest inter-prototype distance
 (both over the group's own finite design); under `gpwidth='local'` on
 c instead, with the same two bounds converted through the group's own
-h: c_min = param_min / median_j(h_j) (so c_min is about 1), c_max =
+h: c_min = param_min / median_j(h_j), c_max =
 param_max / min_j(h_j). Either way: five log-spaced candidates, then
 one bounded refinement between the best grid point's neighbours,
 SKIPPED when the best grid point is the upper endpoint. With the mean

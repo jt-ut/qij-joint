@@ -548,6 +548,7 @@ def run_joint(
         leaf = leaves[i]
         if leaf['n'] > 1:
             V_win_hat += (leaf['n'] / N) * (leaf['var'] + leaf['v'])
+    V_win_hat /= N  # (1/N) sum_k p_k (Var_k + v_k), on V_btw's scale (method_notes section 6)
     V_tot_hat = V_btw + V_win_hat
 
     gain_ratio = np.full(q, np.nan)

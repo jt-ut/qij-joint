@@ -271,14 +271,14 @@ def _basis(Zw: np.ndarray, m: int) -> np.ndarray:
     return np.hstack([np.ones((N, 1), dtype=float), Zw, quad])
 
 
-def _length_scale_bounds(conn, D_full: np.ndarray) -> Tuple[float, float]:
+def _length_scale_bounds(D_full: np.ndarray) -> Tuple[float, float]:
     """
-    ell_min = the median whitened distance between CONN-connected
-    prototypes; fallback = the smallest positive inter-prototype
-    distance if no CONN edges of positive length exist, or 1.0 if
-    every prototype coincides. ell_max = 10x the largest
+    ell_min = the smallest positive whitened distance between any two
+    prototypes, or 1.0 if every prototype coincides: the finest scale
+    the design can resolve, so the search is not held above structure
+    the likelihood prefers. ell_max = 10x the largest
     inter-prototype distance, forced to 10x ell_min if that is not
-    larger than ell_min. `conn`/`D_full` are taken over whichever
+    larger than ell_min. `D_full` is taken over whichever
     design is in play (a coordinate group's own finite subset); under
     gpwidth='local' these same two bounds are converted to the bounds
     on c (method_notes section 3) rather than searched directly.
@@ -288,15 +288,7 @@ def _length_scale_bounds(conn, D_full: np.ndarray) -> Tuple[float, float]:
     all_d = D_full[iu]
     pos_all = all_d[all_d > 0.0]
 
-    conn_coo = conn.tocoo()
-    mask = conn_coo.row < conn_coo.col
-    ii, jj = conn_coo.row[mask], conn_coo.col[mask]
-    conn_d = D_full[ii, jj]
-    conn_d = conn_d[conn_d > 0.0]
-
-    if conn_d.size > 0:
-        ell_min = float(np.median(conn_d))
-    elif pos_all.size > 0:
+    if pos_all.size > 0:
         ell_min = float(pos_all.min())
     else:
         ell_min = 1.0  # degenerate: every prototype coincides
@@ -565,12 +557,11 @@ def fit_influence_model(
         Hb_g = _basis(centers_g, m_g)
 
         D_full_g = cdist(centers_g, centers_g)
-        conn_g = xvq.conn[idx_g, :][:, idx_g]
-        ell_min, ell_max = _length_scale_bounds(conn_g, D_full_g)
+        ell_min, ell_max = _length_scale_bounds(D_full_g)
 
         # The outer search runs over ell under 'global', or over c under
-        # 'local' (bounds converted through the group's CONN spacing, so
-        # c_min is about 1; method_notes section 3).
+        # 'local' (bounds converted through the group's CONN spacing;
+        # method_notes section 3).
         if gpwidth == 'global':
             param_min, param_max = ell_min, ell_max
             h_design_g = None
