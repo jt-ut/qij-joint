@@ -42,9 +42,9 @@ pairs (section 7.2); `budget_quad` the number of quadratic contrasts
 
 ### 1.2 Layout
 
-* `src/qij_joint/qijt.py` (≤ 450 lines): `QIJT`, `QIJTResult`, the
+* `src/qij_joint/qijt.py` (≤ 500 lines): `QIJT`, `QIJTResult`, the
   draw's stage sequence (section 9.1), the interval methods.
-* `src/qij_joint/core/tree.py` (≤ 700 lines): the hierarchy (section
+* `src/qij_joint/core/tree.py` (≤ 900 lines): the hierarchy (section
   3), the weight constructions and task functions (sections 2, 4, 7),
   the round loop (section 5), the anchors (section 6), the within-term
   (section 7), the per-point reconstruction (section 8.1).
@@ -89,18 +89,53 @@ to the full-data fit; the row count is never used as a weight sum.
    T takes a start, else T's declared η with none. Every quantized
    evaluation below passes `eta=η_full` (the reproducibility a fit
    actually has, not the declared one).
-3. θ_Q = T(rows, ω0, start=θ̂, eta=η_full): the quantized base fit as a
+3. θ̂ is brought to a **fixed point** of its own continuation (2.2a):
+   θ̂ ← fixed_point(X, 1_N, θ̂). Stage `full_fit`.
+4. θ_Q = fixed_point(rows, ω0, θ̂): the quantized base fit as a
    continuation of θ̂ (no multistart on the rows; the search that defines
-   the estimator ran once, on the full data). NaN → failed draw.
-4. η_Q by `_measure_eta_Q(counter, rows, ω0, row_field=arange(R),
-   p=m, θ_Q, eta=η_full)`: 3 quantized evaluations when T takes a
-   start; else η_Q = T's declared η. η_Q is measured once, on the
+   the estimator ran once, on the full data), iterated to a fixed point.
+   NaN → failed draw.
+5. η_Q by `measure_eta_Q_tree` (2.2b): 3 quantized evaluations when T
+   takes a start; else η_Q = T's declared η. η_Q is measured once, on the
    initial rows, and is the noise scale of every quantized contrast.
 
 Every later quantized evaluation is `counter(rows, ω, start=θ_Q,
 eta=η_full)` with the θ_Q current for those rows (section 5.3). Every
 full-data evaluation is `counter(X, ω, start=θ̂, eta=η_full)`. In a pool
 task these go through `call_T` with the same arguments.
+
+### 2.2a The fixed-point rule
+
+A forward difference [T(ω(t), start=θ) − θ]/t measures an influence only
+if θ = T(ω0, start=θ) to within the fit's reproducibility; otherwise the
+residual, divided by t, enters every coefficient as a common offset that
+no noise estimate sees. So every base fit (θ̂; θ_Q on the initial rows;
+θ_Q after each round's openings, 5.3) is iterated to that fixed point:
+
+    repeat: θ' = T(rows, ω0, start=θ, eta=η_full);
+            r = max_o |θ'_o − θ_o| / max(|θ'_o|, |θ_o|)   (0/0 → 0, over every output of T);
+            θ ← θ'
+    until r ≤ η_full,  at most 5 iterations.
+
+r ≤ η_full is the fit's own reproducibility, so the iteration asks for
+nothing the fit cannot deliver; the finish is a trust-region step, so
+one or two iterations are expected. Hitting the cap is a fit failure,
+not a base to build on: failed draw with `status='base_unconverged'`
+(full data) or `'theta_Q_unconverged'` (rows). The iteration count and
+the final r are products (`n_fp_full`, `r_fp_full`, `n_fp_Q`, `r_fp_Q`;
+for the re-evaluations of 5.3 the sums over rounds). An estimator without
+a start has a deterministic T: no iteration, r = 0, no evaluation.
+
+### 2.2b η_Q for the tree
+
+`measure_eta_Q_tree(counter, rows, ω0, m, θ_Q, η_full)` in `core/tree.py`:
+the three evaluations of `core.xvq._measure_eta_Q` (two at ω0 continued
+from θ_Q, one at the largest-mass row perturbed by a relative 1e-6),
+with the same pairwise relative differences, plus the relative
+difference of each of the two base evaluations from θ_Q itself (the
+fixed-point residual, ≤ η_full by 2.2a); η_Q = the largest of these
+five, floored at η_full; `failed` as in `_measure_eta_Q`. The xvq
+function is not modified.
 
 ### 2.3 The weight construction for a member set
 
@@ -181,8 +216,11 @@ measurement, 4.1 applied one level up), so
     E_c = (1/N) · (p_A · p_B / p_c) · y_c².
 
 E_c is exactly the between-variance (1/N) Σ_leaves p U² gains when c is
-split, so the between-term of the measured tree is Σ_c E_c over measured
-nodes (section 8). The member rows of a node = the rows of its cells
+split, provided U_c and U_A are measured on the same rows; the
+derivation is only valid then. A cell's opening changes its rows, so an
+opened cell's U is re-measured on the new rows before anything below it
+is derived (5.3); every other node's U is the one its parent's
+measurement gave it. The member rows of a node = the rows of its cells
 (cell level: each cell's prototype row, or its native points if that cell
 has been opened) or its native points (within-cell).
 
@@ -235,11 +273,22 @@ A selected cell node's measurement is its within-cell root contrast.
 
 For each cell opened: its prototype row is removed, its native points
 appended (2.1), its within-cell tree built (3.3). After all of a round's
-openings: the pool re-shares the rows, and θ_Q is re-evaluated once,
-θ_Q ← T(rows, ω0, start=θ_Q_previous, eta=η_full), one quantized
-evaluation counted in stage `opening`. NaN → failed draw with
-`status='opening_failed'`. Coefficients already measured on earlier rows
-are kept as measured (the drift they carry is a product, 6.3).
+openings: the pool re-shares the rows, and θ_Q is re-evaluated to a
+fixed point on the new rows, θ_Q ← fixed_point(rows, ω0, θ_Q_previous)
+(2.2a), its evaluations counted in stage `opening`. NaN → failed draw
+with `status='opening_failed'`; the cap → `'theta_Q_unconverged'`. Then
+each opened cell X has its own U
+re-measured on the new rows, one evaluation per opened cell in one
+batch, member set = X's native points, t = step_parameter(δ_f, p_X),
+base = the new θ_Q, counted in stage `opening` (not charged to the
+budget). This U_X replaces, for everything below X, the value X carried
+from its parent's measurement: the within-cell root contrast derives its
+sibling from it. X's ancestors keep their y, E and U as measured. The
+shift U_X^new − U_X^old per output is recorded (`open_shift_o` in the
+nodes table): it is the within-cell nonlinearity the one prototype row
+could not represent. A failed re-measurement keeps U_X^old and counts in
+`n_failed`. Coefficients already measured on earlier rows are otherwise
+kept as measured (the base drift they carry is a product, 6.3).
 
 ## 6. Anchors: scale from the full data
 
@@ -282,15 +331,18 @@ It is a product only.
 
 ### 6.4 Bias ingredient
 
-For the root's two children (depth 1) the second difference along each
-child's own member set on the full data,
-
-    D2_K = [T(t_K) − 2 T(t_K/2) + θ̂] / (t_K/2)²,   t_K = step_parameter(δ_f, p_K),
-
-uses the anchor and half-step evaluations already made for the measured
-child, and two more full evaluations for the other child (stage `bias`).
-b̂_o = (1/(2N)) · (p_A D2_A,o + p_B D2_B,o), the plug-in bias of
-`ivq.bias_and_acceleration` on this two-set partition.
+For the root's two children (depth 1) the central second difference
+along each child's own member set on the full data, at the second-
+difference step, by `core.differences.difference(p_K, central_step(η_f),
+evaluate, θ̂)`: t_K = step_parameter((3η_f)^{1/3}, p_K), evaluate(±t) =
+T(X, ω(±t)) with 2.3's construction on ω0 = 1_N, start = θ̂, eta = η_full;
+D2_K = [T(+t) − 2θ̂ + T(−t)] / t². Four full evaluations, stage `bias`.
+The first-difference step δ_f = 2√η_f is not usable here: a second
+difference at that step divides rounding noise by t² and returns O(1)
+noise for a start-less estimator (η_f = machine ε). The anchors' half-step
+evaluations serve the step ratio only. b̂_o = (1/(2N)) · (p_A D2_A,o +
+p_B D2_B,o), the plug-in bias of `ivq.bias_and_acceleration` on this
+two-set partition.
 
 ## 7. The within-term
 
@@ -329,8 +381,10 @@ A pair is (ℓ, j) with 1 ≤ j ≤ min(r_ℓ, n_ℓ − 1). Score:
     score(ℓ, j) = max_o p_ℓ · λ_j · ĝ_ℓ,o² / (N · V_btw,o)     (unscaled V_btw),
 
 ties: lower leaf node id, then lower j. Buy the top `budget_win` pairs.
-Every bought leaf that is an unopened cell is opened first (5.3: rows
-appended, one θ_Q re-evaluation for all of them, stage `opening`).
+Every bought leaf that is an unopened cell is opened first (5.3 in
+full: rows appended, one θ_Q re-evaluation for all of them, then each
+opened cell's U re-measured on the new rows, stage `opening`); the
+re-measured U is the leaf's U from then on (8.1).
 
 Contrast for (ℓ, j): h_r = (z_r − μ_ℓ)·v_j / √λ_j for member rows r, 0
 elsewhere (mass-weighted mean 0 and mass-weighted mean of h² = 1 over
@@ -370,12 +424,21 @@ sum never double-counts.
     ψ̂_r,o = a_o · [ U_ℓ(r),o + Σ_{bought directions of ℓ(r)} (D_o / p_ℓ) · h_r ]
 
 per row, with the quadratic direction included where bought (Q in place
-of D). A native point's ψ̂ is its own row's; a point in an unopened cell
-takes its cell's row's value. ψ̂ is mass-centred because every U is.
+of D), and only directions that passed (7.2's rule) entering, the same
+gate as W and the quadratic term. A native point's ψ̂ is its own row's;
+a point in an unopened cell takes its cell's row's value. ψ̂ is
+mass-centred because every U is.
 
 ### 8.2 Variance and acceleration
 
-    V_btw,o = a_o² Σ_measured c E_c,o,     V_tot,o = V_btw,o + V_win,o,
+    V_btw,o = a_o² · (1/N) Σ_leaves p_ℓ U_ℓ,o²,     V_tot,o = V_btw,o + V_win,o,
+
+the between-leaf variance from the leaf means (7.1's leaves, every leaf
+in ascending id order). Within any subtree measured on one row set this
+equals the sum of its counted E_c; across an opening it does not, which
+is why the leaf sum, not Σ E_c, is the estimate. The `curve` product
+reports the same leaf sum for the leaves as they stand after each
+round. E_c serves the priority (5.2) and the tables only.
     a_o = (1/N) Σ_i ψ̂_i,o³ / ( 6 √N · ((1/N) Σ_i ψ̂_i,o²)^{3/2} ),
 
 `ivq.bias_and_acceleration`'s acceleration at point masses 1/N; NaN
@@ -385,7 +448,8 @@ where the denominator is 0.
 
 `core.abc.curvature(counter, sv, θ_Q, I_rows, m, N, pool, outputs=measured)`
 on the final rows, with `sv` a `SurveyRows(rows=final rows, row_field=
-arange(R), omega0=final ω0, eta_Q=η_Q (NaN when T lacks a start),
+arange(R), omega0=final ω0, eta_Q=η_Q (2.2 step 4: the declared η when
+T lacks a start, never NaN),
 step_ratio=full((5, q_full), NaN), quantized_start='full-data',
 eta_rows=η_full)` and I_rows (R, q_full) = 8.1's ψ̂ per row (full width;
 unmeasured outputs 0). 2q quantized evaluations, stage `curvature`,
@@ -410,9 +474,12 @@ derives them, including the 1-D promotion) → base_Q → eta_Q → tree
 (rounds, with `opening` evaluations counted separately) → anchors
 (6.1–6.2) → bias (6.4) → within (7.2, with its openings counted in
 `opening`) → quadratic (7.3) → drift (6.3) → curvature (8.3) →
-assembly. `evals_by_stage`, `rows_by_stage`, `wall_time_by_stage` keyed
-by these names; `busy_time_total` = the sum of task wall times. The
-parent calls `counter.add(1, len(shared array), failed)` per task.
+assembly. `evals_by_stage` and `rows_by_stage` keyed by these names;
+`wall_time_by_stage` the same except that `bias` runs inside the anchor
+batch and `quadratic` inside the within batch, so their wall is inside
+`anchors` and `within` respectively; `busy_time_total` = the sum of task
+wall times. The parent calls `counter.add(1, len(shared array), failed)`
+per task.
 `budget` ≥ 1; `budget_win`, `budget_quad` ≥ 0.
 
 `QIJTResult` carries every scalar of 11.1 as an attribute (per-output
@@ -441,7 +508,8 @@ checks it.
 
 Failed draw (products written with NaN variances and the status): θ̂ NaN
 (`'theta_hat_failed'`), θ_Q NaN (`'theta_Q_failed'`), a re-evaluated θ_Q
-NaN (`'opening_failed'`). Not failed: any single contrast, anchor,
+NaN (`'opening_failed'`), a fixed-point iteration reaching its cap
+(`'base_unconverged'`, `'theta_Q_unconverged'`, 2.2a). Not failed: any single contrast, anchor,
 within, quadratic or curvature evaluation failing (each handled where
 it is defined, counted in `n_failed`), an output with a_o = NaN, the
 η measurements' `failed` flags (recorded as `eta_full_failed`,
@@ -456,7 +524,8 @@ scalar row is the done marker.
 
 `s, seed, N, M_X, R_final, budget, budget_win, budget_quad, workers,
 status, theta_hat_status, theta_Q_status, eta_full, eta_Q,
-eta_full_failed, eta_Q_failed, n_rounds, n_measured, n_opened,
+eta_full_failed, eta_Q_failed, n_fp_full, r_fp_full, n_fp_Q, r_fp_Q,
+n_fp_opening, r_fp_opening_max, n_rounds, n_measured, n_opened,
 n_leaves, max_depth, n_failed, tree_status, n_pairs_bought,
 n_quad_bought, busy_time, wall_time`, per stage `evals_<stage>`,
 `rows_<stage>`, `wall_<stage>`, and per output o: `theta_hat_o, V_btw_o,
@@ -467,12 +536,19 @@ c_q_o, lo_o, hi_o, lo_btw_o, hi_btw_o, lo_abc_o, hi_abc_o` at level 0.95.
 
 One row per node of the measured tree and its leaves: `node, parent,
 depth, kind ('cells'|'points'), cell (−1 above the cell level), n_cells,
-n_points, p, measured (bool), round, measured_child, t, evals_rows,
-status` (`fit_status` of the measuring evaluation), and per output
-`U_o, y_o, s_o, E_o, pass_o` (y, s, E unscaled; NaN where not measured;
-U known for every node in the table). The table holds the measured
-nodes and their children only, not the unmeasured remainder of the
-hierarchy.
+n_points, p, node_measured (bool), round (−1 for an anchor node measured
+after the tree stopped), measured_child, t, evals_rows (R of the node's
+round), status` (`fit_status` of the measuring evaluation), and per
+output `U_o, y_o, s_o, E_o, pass_o, open_shift_o` (y, s, E unscaled; NaN
+where not measured; U known for every node in the table; `open_shift`
+NaN except for opened cells, 5.3). The table holds the measured nodes
+and their children only, not the unmeasured remainder of the hierarchy.
+
+### 11.2a `pairs` (every draw)
+
+One row per bought within-term contrast: `leaf, j` (the principal-axis
+index, 0 for the quadratic contrast), `t`, per output `D_o, s_o, pass_o`
+(D unscaled; Q in the D column for j = 0).
 
 ### 11.3 `leaves` (every draw)
 
@@ -517,8 +593,11 @@ V_ij,o; (b) V_tot,o / V_ij,o; (c) on every node the tree measured at
 depth ≤ 5, the same contrast on the full data (one evaluation each,
 outside the method, in the validation script): per output the slope
 and r² of y^full against a_o y^Q, and the same for the within-term
-pairs bought in the subject component's cells — this is where the
-position-angle output is judged; (d) root_drift, a_scatter, step_ratio;
+pairs bought in the subject component's cells (the `pairs` table's
+signed D_o against the same contrast on the full data) — this is where
+the position-angle output is judged; also the distribution of
+`open_shift_o` over opened cells relative to √V_ij,o; (d) root_drift,
+a_scatter, step_ratio;
 (e) busy/wall at workers 14 and at workers 1 for draw 0.
 
 V3 **Bit identity.** (pareto, tail) draw 0 and cloudfil draw 0 at
