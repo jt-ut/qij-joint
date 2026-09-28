@@ -143,8 +143,11 @@ class P2Mixture:
     takes_start = True
 
     def __init__(self, reference=None, measured=None, eta: float = None,
-                 cond_max: float = None, fd_step: float = _FD_STEP):
-        kw = {k: v for k, v in (('eta', eta), ('cond_max', cond_max)) if v is not None}
+                 cond_max: float = None, fd_step: float = _FD_STEP,
+                 smem_breadth: int = None, split_offset: float = None):
+        kw = {k: v for k, v in (('eta', eta), ('cond_max', cond_max),
+                                 ('smem_breadth', smem_breadth), ('split_offset', split_offset))
+              if v is not None}
         self._gmm = GMM2D(K=_K, reference=reference, **kw)
         self.fd_step = float(fd_step)
         self.eta = self._gmm.eta

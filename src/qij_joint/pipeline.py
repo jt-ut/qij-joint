@@ -40,8 +40,10 @@ def _oracle_task(T, case, X, task):
         failed = True
         status = fit_status(T, theta_hat, raised=True)
     wall = time.perf_counter() - t0
+    info = getattr(T, 'last_fit_info', None)
+    search = dict(getattr(info, 'search', None) or {})
     audit = search_audit(T, Xd, theta_hat, case.dataset, case.estimator)
-    return s, seed, theta_hat, failed, status, wall, audit
+    return s, seed, theta_hat, failed, status, wall, {**search, **audit}
 
 
 def _ij_task(T, case, X, task):

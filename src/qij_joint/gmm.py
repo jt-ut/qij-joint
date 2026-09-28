@@ -121,7 +121,7 @@ _D = {
 }
 _STYPES = ('S11', 'S12', 'S22')
 
-_Cfg = namedtuple('_Cfg', ['K', 'n_starts', 'seed', 'p'])
+_Cfg = namedtuple('_Cfg', ['K', 'n_starts', 'seed', 'p', 'smem_breadth', 'split_offset'])
 
 
 def _make_outputs(K: int) -> tuple:
@@ -1134,6 +1134,32 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     if start is None:
         best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
                                    eta, Scov, a_pen)
+        if best is not None:
+            # The split-and-merge finish (spec/QIJ_estimator_search_spec.md
+            # 2.3) starts from the racing screen's winner CONVERGED by the
+            # local optimizer, trust-region finish included (a continuation
+            # of the winner); from EM's endpoint alone its proposal ranking
+            # differs and misses repairs the finished fit finds. An
+            # accepted configuration is rerun through EM so the finish below
+            # starts from EM's own endpoint, as for every other fit.
+            won, won_status = _fit(X, w, cfg, Q, XP, eta, None,
+                                   _pack(cfg.K, best['pis'], best['mus'], best['Ss']))
+            start_sm = won if won_status == 'converged' else best
+            sm = split_merge(X, Q, XP, w, start_sm['pis'], start_sm['mus'], start_sm['Ss'],
+                             eta, Scov, a_pen, breadth=cfg.smem_breadth,
+                             split_offset=cfg.split_offset)
+            search = dict(n_starts_screened=best['n_starts_screened'],
+                          screen_rounds=best['screen_rounds'],
+                          n_survivors=best['n_survivors'],
+                          screen_status=best['screen_status'],
+                          n_smem_tried=sm['n_smem_tried'],
+                          n_smem_accepted=sm['n_accepted'],
+                          smem_status=sm['status'], smem_wall_time=sm['wall_time'])
+            if sm['n_accepted'] > 0:
+                rerun = _run_em(X, Q, XP, w, sm['pis'], sm['mus'], sm['Ss'], eta, Scov, a_pen)
+                if rerun is not None:
+                    best = rerun
+            best['search'] = search
     else:
         pis0, mus0, Ss0 = _unpack(cfg.K, start)
         best = _run_em(X, Q, XP, w, pis0, mus0, Ss0, eta, Scov, a_pen)
@@ -1172,7 +1198,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
         theta = _pack(cfg.K, pis, mus, Ss)
         return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, A=A, ll=ll, resid=resid,
                     status=status, n_iter_em=n_iter_em, n_iter_newton=n_iter_newton,
-                    label_order=label_order), status
+                    label_order=label_order, search=best.get('search')), status
 
     if best['status'] != 'converged':
         # EM never reached its own stopping rule (2.1): the finish's
@@ -1300,7 +1326,7 @@ def _center_start(start, K: int, xmean: np.ndarray):
 
 
 FitInfo = namedtuple('FitInfo', ['status', 'score', 'n_iter_em', 'n_iter_newton',
-                                  'label_order'])
+                                  'label_order', 'search'])
 
 
 def _fit_info(fit, status) -> FitInfo:
@@ -1311,9 +1337,10 @@ def _fit_info(fit, status) -> FitInfo:
     two statuses have no dict (`_fit`'s docstring)."""
     if fit is None:
         return FitInfo(status=status, score=float('nan'), n_iter_em=0,
-                        n_iter_newton=0, label_order=None)
+                        n_iter_newton=0, label_order=None, search=None)
     return FitInfo(status=status, score=fit['resid'], n_iter_em=fit['n_iter_em'],
-                   n_iter_newton=fit['n_iter_newton'], label_order=fit['label_order'])
+                   n_iter_newton=fit['n_iter_newton'], label_order=fit['label_order'],
+                   search=fit.get('search'))
 
 
 def _merge_scores(R: np.ndarray) -> np.ndarray:
@@ -1344,7 +1371,11 @@ def _split_scores(R: np.ndarray, X: np.ndarray, mus: np.ndarray,
     (not pi_k * phi_k), renormalized over the same finite sample rather
     than its continuous integral -- both f_k and p_k are probability
     distributions over the N rows, so their KL divergence is an ordinary
-    finite sum. Largest first is the worst-fitting component."""
+    finite sum. Largest first is the worst-fitting component. Computed
+    in log space (log p_k normalized by logsumexp): the density itself
+    underflows to 0 far from the component, which would make log p_k
+    -inf and J_split +inf for every component with any responsibility
+    there."""
     N, K = R.shape
     n_k = R.sum(axis=0)
     scores = np.empty(K)
@@ -1353,13 +1384,11 @@ def _split_scores(R: np.ndarray, X: np.ndarray, mus: np.ndarray,
         dy = X[:, 1] - mus[k, 1]
         q = (c[k] * dx * dx - 2.0 * b[k] * dx * dy + a[k] * dy * dy) / det[k]
         log_phi = -_LOG2PI - 0.5 * np.log(det[k]) - 0.5 * q
-        phi = np.exp(log_phi)
-        p_k = phi / phi.sum()
+        top = log_phi.max()
+        log_p = log_phi - (top + np.log(np.sum(np.exp(log_phi - top))))
         f_k = R[:, k] / n_k[k]
-        with np.errstate(divide='ignore', invalid='ignore'):
-            log_ratio = np.log(f_k) - np.log(p_k)
-            contrib = np.where(f_k > 0.0, f_k * log_ratio, 0.0)
-        scores[k] = float(np.sum(contrib))
+        pos = f_k > 0.0
+        scores[k] = float(np.sum(f_k[pos] * (np.log(f_k[pos]) - log_p[pos])))
     return scores
 
 
@@ -1472,7 +1501,7 @@ def _try_smem_proposal(X, Q, XP, w, pis, mus, Ss, R, i, j, k, eta, Scov, a_pen,
     mus_p = np.concatenate([mus[keep], fit_partial['mus']], axis=0)
     Ss_p = np.concatenate([Ss[keep], fit_partial['Ss']], axis=0)
 
-    cfg = _Cfg(K=K, n_starts=0, seed=0, p=(K - 1) + 5 * K)
+    cfg = _Cfg(K=K, n_starts=0, seed=0, p=(K - 1) + 5 * K, smem_breadth=0, split_offset=0.0)
     theta_p = _pack(K, pis_p, mus_p, Ss_p)
     fit_full, status_full = _fit(X, w, cfg, Q, XP, eta, None, theta_p)
     if status_full != 'converged':
@@ -1527,13 +1556,19 @@ def split_merge(X, Q, XP, w, pis, mus, Ss, eta, Scov, a_pen, breadth=5,
         R, _ = _e_step_fast(Q, pis, mus, a, b, c, det)
         Jm = _merge_scores(R)
         Js = _split_scores(R, X, mus, a, b, c, det)
+        # Exact ties are broken by component position (the lexicographic
+        # order of the means), never by index, so the proposals do not
+        # depend on how the components happen to be labelled.
+        pos_rank = np.empty(K, dtype=int)
+        pos_rank[np.lexsort((mus[:, 1], mus[:, 0]))] = np.arange(K)
         merge_pairs = sorted(
-            ((Jm[i, j], i, j) for i in range(K) for j in range(i + 1, K)),
-            key=lambda t: t[0], reverse=True)
-        split_order = sorted(range(K), key=lambda kk: Js[kk], reverse=True)
+            ((Jm[i, j], -min(pos_rank[i], pos_rank[j]), -max(pos_rank[i], pos_rank[j]), i, j)
+             for i in range(K) for j in range(i + 1, K)),
+            key=lambda t: t[:3], reverse=True)
+        split_order = sorted(range(K), key=lambda kk: (-Js[kk], pos_rank[kk]))
 
         proposals = []
-        for _, i, j in merge_pairs:
+        for _, _, _, i, j in merge_pairs:
             kk = next((c2 for c2 in split_order if c2 not in (i, j)), None)
             if kk is not None:
                 proposals.append((i, j, kk))
@@ -1595,7 +1630,8 @@ class GMM2D:
     takes_start = True
 
     def __init__(self, K: int, n_starts: int = 20, seed: int = 0, reference=None,
-                 eta: float = _ETA_DEFAULT, cond_max: float = _COND_MAX_DEFAULT):
+                 eta: float = _ETA_DEFAULT, cond_max: float = _COND_MAX_DEFAULT,
+                 smem_breadth: int = 5, split_offset: float = 0.5):
         self.K = int(K)
         self.n_starts = int(n_starts)
         self.seed = int(seed)
@@ -1605,6 +1641,11 @@ class GMM2D:
         self.outputs = _make_outputs(self.K)
         self.eta = float(eta)
         self.cond_max = float(cond_max)
+        # The cold search's split-and-merge breadth C (Ueda et al.'s
+        # published 5) and the split's mean displacement in standard
+        # deviations along the principal axis.
+        self.smem_breadth = int(smem_breadth)
+        self.split_offset = float(split_offset)
         self.last_fit_info = None
 
     def _resolve(self, kwargs: dict) -> _Cfg:
@@ -1614,6 +1655,8 @@ class GMM2D:
             n_starts=int(kwargs.get('n_starts', self.n_starts)),
             seed=int(kwargs.get('seed', self.seed)),
             p=(K - 1) + 5 * K,
+            smem_breadth=self.smem_breadth,
+            split_offset=self.split_offset,
         )
 
     def prepare(self, X: np.ndarray) -> tuple:

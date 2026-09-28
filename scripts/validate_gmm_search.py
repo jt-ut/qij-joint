@@ -64,8 +64,9 @@ def _info_dict(info) -> dict:
     change) code for the first three, absent (and so NaN here) for the
     seven search-rewrite fields until that code lands."""
     out = {}
+    search = (getattr(info, 'search', None) or {}) if info is not None else {}
     for name in _FIT_INFO_FIELDS:
-        v = getattr(info, name, float('nan')) if info is not None else float('nan')
+        v = getattr(info, name, search.get(name, float('nan'))) if info is not None else float('nan')
         out[name] = float('nan') if v is None else v
     return out
 
