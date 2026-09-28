@@ -3,12 +3,18 @@ covariances) with an analytic influence function via Louis's (1982)
 identity.
 
 `GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`
-fits by multi-start weighted EM (SQUAREM-accelerated), polishes the
-winning start with a damped Newton step gated on the observed
-information's positive-definiteness, and reports the score and observed
-information at the fit for `influence`. Follows `estimators.py`'s
-conventions: `T(X, w) -> ndarray(p,)` never raises (a failed fit is
-NaN); no state between calls. Without `start` (see below), `reference`
+fits by multi-start weighted EM (SQUAREM-accelerated), then finishes the
+winning start with a trust-region Newton step
+(`scipy.optimize.minimize(method='trust-exact')`, no gate, no halving
+loop) in the unconstrained parametrization of `gmm_param.py`, and
+reports the score and observed information at the fit for `influence`.
+Follows `estimators.py`'s conventions: `T(X, w) -> ndarray(p,)` never
+raises (a failed fit is NaN); the one exception to "no state between
+calls" is `last_fit_info` (spec/QIJ_estimator_fit_spec.md 2.4), a
+read-only diagnostic `__call__`/`influence`/`fit_and_influence` each
+overwrite with their own fit's status, final scaled score, EM and
+Newton iteration counts and labelling assignment, never consulted by
+`T`'s own returned value. Without `start` (see below), `reference`
 labels every evaluation's components by the assignment to it minimizing
 total Bhattacharyya distance (method_notes section 5); without either,
 components are ordered by ascending first-mean coordinate.
@@ -41,9 +47,10 @@ The estimand is the maximizer of the penalized log-likelihood ell_p =
 ell - a * sum_k[tr(S Sigma_k^-1) + log det Sigma_k] (Chen and Tan 2009,
 arXiv:0805.3906, eq. 2), a = 1/sum(w), S the w-weighted covariance of
 the rows passed to T -- always on, for every call, since the free-
-covariance mixture likelihood is otherwise unbounded. EM's M-step,
-Newton's score and observed information, and the analytic influence are
-all those of ell_p; method_notes section 5 gives every closed form.
+covariance mixture likelihood is otherwise unbounded. EM's M-step, the
+trust-region finish's score and observed information, and the analytic
+influence are all those of ell_p; method_notes section 5 gives every
+closed form.
 
 Parameter layout, the two-phase multi-start/EM design, the penalized
 M-step, SQUAREM acceleration, the Newton gate and polish, and the
@@ -65,21 +72,23 @@ same two-phase screen.
 """
 
 from collections import namedtuple
+import math
 import warnings
 
 import numpy as np
 from scipy.cluster.vq import kmeans2
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment, minimize
 
+from .gmm_param import (chain, coordinate_scales, from_unconstrained,
+                         scaled_gradient_norm, to_unconstrained)
 from .seeding import greedy_em_start, scaled_variants
 
 _LOG2PI = float(np.log(2.0 * np.pi))
-_ACCEPT_TOL = 1e-9
 _COND_MAX = 1e12
-_MAX_NEWTON = 40
-_MAX_HALVINGS = 30
-# Declared from the score norm the polish reliably reaches on the demo
-# mixture's multi-start (module report), rounded up to a power of ten.
+# GMM2D's own declared reproducibility floor (the constructor's default
+# `eta`, overridable per call) -- unrelated to any fixed iteration or
+# tolerance constant of the fit itself, all of which are now measured
+# against `eta` or `p` (spec/QIJ_estimator_fit_spec.md 5).
 _ETA = 1e-12
 
 # Phase 1's fixed screening budget and phase 2's promotion count, set by
@@ -676,7 +685,7 @@ def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, tol, max_iter, Scov, a_pe
 
 def _canonical_sort(pis, mus, Ss):
     order = np.lexsort((mus[:, 1], mus[:, 0]))
-    return pis[order].copy(), mus[order].copy(), Ss[order].copy()
+    return pis[order].copy(), mus[order].copy(), Ss[order].copy(), order
 
 
 def _covs_from_Ss(Ss: np.ndarray) -> np.ndarray:
@@ -711,7 +720,7 @@ def _reference_sort(pis, mus, Ss, reference):
     ref_means, ref_covs = reference
     _, col = linear_sum_assignment(_bhattacharyya(mus, Ss, ref_means, ref_covs))
     order = np.argsort(col)
-    return pis[order].copy(), mus[order].copy(), Ss[order].copy()
+    return pis[order].copy(), mus[order].copy(), Ss[order].copy(), order
 
 
 def reference_from_theta(theta: np.ndarray, K: int) -> tuple:
@@ -868,8 +877,12 @@ def _score_info_penalized(X, Q, w, K, pis, mus, Ss, Scov, a_pen, W):
 
 
 def _cholesky_ok(A: np.ndarray) -> bool:
-    """True iff -H (A) is positive definite (a Cholesky succeeds) --
-    the Newton gate of method_notes section 5."""
+    """True iff -H (A) is positive definite (a Cholesky succeeds). No
+    longer a pre-Newton gate (method_notes section 5): the trust-region
+    subproblem handles an indefinite `A` itself. It survives only as the
+    check a converged fit's `A` must still pass for `influence` to make
+    sense of it as an observed information -- a tiny score at a saddle
+    is not a maximum, whatever the trust region declares."""
     try:
         np.linalg.cholesky(A)
         return True
@@ -877,32 +890,66 @@ def _cholesky_ok(A: np.ndarray) -> bool:
         return False
 
 
+def _score_at(X, Q, w, cfg, pis, mus, Ss, Scov, a_pen, W, s):
+    """(psi_raw, A, ll, u, g_u, H_u, score) at (pis, mus, Ss): the
+    penalized score/information, its unconstrained-parametrization
+    mapping (`gmm_param.chain`, `g_theta = psi_bar`, `H_theta = -A`,
+    module docstring's convention), and the scaled gradient norm of 2.3
+    -- one place both the EM-endpoint shortcut and the trust-region
+    finish's own evaluations get all of it from `(pis, mus, Ss)` alone.
+    Raises np.linalg.LinAlgError if any Sigma_k is not PD (never true of
+    a `from_unconstrained` point, only of EM's own raw output)."""
+    psi_raw, A, ll, psi_bar = _score_info_penalized(X, Q, w, cfg.K, pis, mus, Ss,
+                                                      Scov, a_pen, W)
+    theta = _pack(cfg.K, pis, mus, Ss)
+    u = to_unconstrained(cfg.K, theta)
+    g_u, H_u = chain(cfg.K, u, psi_bar, -A)
+    score = scaled_gradient_norm(g_u, s, ll)
+    return psi_raw, A, ll, u, g_u, H_u, score
+
+
 def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
          eta: float, reference=None, start: np.ndarray = None):
-    """None on failure; else dict(theta, pis, mus, Ss, psi, A, ll,
-    score_history, polished, resid) -- the penalized-likelihood
-    estimand (method_notes section 5). `ll` is ell_p/W; `A` is the
-    penalized observed information; `psi` is the raw mixture score plus
-    the per-point sensitivity of the penalty to that point's own
-    weight. Operates in the caller's own (already-centered) coordinates
-    with the caller's own (X-only) `Q`, `XP`. Components are labelled
-    against `start`'s own components (min-Bhattacharyya assignment)
-    when `start` is given; otherwise by `reference` when given, else
-    ordered by ascending first-mean coordinate.
+    """(dict_or_None, status), status in {'converged', 'em_cap',
+    'newton_cap', 'newton_stalled', 'infeasible', 'linalg'}
+    (spec/QIJ_estimator_fit_spec.md 2.4). The dict is None only for
+    'infeasible' (no start survived EM) and 'linalg' (the score/
+    information could not be formed, or formed but is not PD at a point
+    the finish calls converged -- a saddle wearing a small gradient);
+    every other status returns a dict(theta, pis, mus, Ss, A, ll, resid,
+    status, n_iter_em, n_iter_newton, label_order), and only 'converged'
+    additionally carries `psi` (the raw mixture score plus the
+    per-point sensitivity of the penalty to that point's own weight --
+    the influence's own numerator, not worth forming for a fit `GMM2D`
+    is about to NaN anyway). `ll` is ell_p/W; `A` is the penalized
+    observed information; `resid` is the final scaled gradient norm of
+    2.3 regardless of status. Operates in the caller's own
+    (already-centered) coordinates with the caller's own (X-only) `Q`,
+    `XP`. Components are labelled against `start`'s own components
+    (min-Bhattacharyya assignment) when `start` is given; otherwise by
+    `reference` when given, else ordered by ascending first-mean
+    coordinate.
 
     With `start` (theta (p,) in this function's own centered, packed
     layout) given, a single accelerated-EM run (`_run_em`) from `start`
     at the given `w` replaces the multi-start search below; everything
-    after (labelling against `start`, Newton gate, polish, acceptance)
-    is unchanged, so the perturbed fit is the continuation of `start`,
+    after (labelling against `start`, the trust-region finish) is
+    unchanged, so the perturbed fit is the continuation of `start`,
     never a fresh multi-start winner, and never relabelled away from
     it. Without `start`, unchanged (bit-identical).
 
-    Newton gate: the polish only runs once -H (`A`) is PD (a Cholesky
-    succeeds); otherwise one more block of accelerated EM (the same
-    `max_iter` cap) and a single re-test, no further retry. NaN when
-    -H is still not PD after that, or the polish does not bring the
-    score norm under `eta`."""
+    The trust-region finish (2.2, 5) runs only when EM's OWN status is
+    'converged' (`_run_em`'s stopping rule, not this function's, fired):
+    an EM iterate that only hit its iteration cap is not the branch the
+    finish's initial trust radius (5.3) assumes it starts on, so `_fit`
+    reports `em_cap` and stops there. Otherwise the finish runs
+    unconditionally -- no PD gate, no halving loop, indefiniteness
+    handled inside `scipy.optimize.minimize`'s own trust-region
+    subproblem -- to `2 * cfg.p` iterations (5.4, `newton_cap`) or a
+    stall it detects itself once the accepted step is smaller than the
+    fit's own reproducibility (5.5, `newton_stalled`); either ending
+    returns EM's endpoint, never the finish's own last (possibly worse)
+    iterate."""
     W, a_pen, Scov, d = _weighted_cov(X, w)
 
     if start is None:
@@ -910,10 +957,9 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
                                    cfg.tol, cfg.max_iter, Scov, a_pen)
     else:
         pis0, mus0, Ss0 = _unpack(cfg.K, start)
-        best = _run_em(Q, XP, w, pis0, mus0, Ss0, cfg.tol, cfg.max_iter,
-                        Scov, a_pen)
+        best = _run_em(X, Q, XP, w, pis0, mus0, Ss0, eta, Scov, a_pen)
     if best is None:
-        return None
+        return None, 'infeasible'
     pis, mus, Ss = best['pis'], best['mus'], best['Ss']
 
     # A continuation is labelled against START's own components (min
@@ -933,82 +979,121 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
             return _canonical_sort(pis, mus, Ss)
         return _reference_sort(pis, mus, Ss, reference)
 
-    pis, mus, Ss = _label(pis, mus, Ss)
+    pis, mus, Ss, label_order = _label(pis, mus, Ss)
+    s = coordinate_scales(cfg.K, Scov)
     try:
-        psi, A, ll, psi_bar = _score_info_penalized(X, Q, w, cfg.K, pis, mus, Ss,
-                                                      Scov, a_pen, W)
+        psi, A, ll, u, g_u, _, score = _score_at(X, Q, w, cfg, pis, mus, Ss,
+                                                   Scov, a_pen, W, s)
     except np.linalg.LinAlgError:
-        return None
+        return None, 'linalg'
 
-    if not _cholesky_ok(A):
-        # Not near a maximum yet: one more accelerated-EM block, then
-        # re-label and re-test once, no further retry.
-        try:
-            pis, mus, Ss, ll, _, _ = _em_accelerated(
-                Q, XP, w, W, pis, mus, Ss, ll, cfg.tol, cfg.max_iter,
-                Scov, a_pen, cfg.K)
-        except np.linalg.LinAlgError:
-            return None
-        pis, mus, Ss = _label(pis, mus, Ss)
-        try:
-            psi, A, ll, psi_bar = _score_info_penalized(
-                X, Q, w, cfg.K, pis, mus, Ss, Scov, a_pen, W)
-        except np.linalg.LinAlgError:
-            return None
+    n_iter_em = best['n_iter']
+
+    def _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton):
+        theta = _pack(cfg.K, pis, mus, Ss)
+        return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, A=A, ll=ll, resid=resid,
+                    status=status, n_iter_em=n_iter_em, n_iter_newton=n_iter_newton,
+                    label_order=label_order), status
+
+    if best['status'] != 'converged':
+        # EM never reached its own stopping rule (2.1): the finish's
+        # initial trust radius (5.3) and its "stay on EM's branch"
+        # rationale both assume an iterate EM itself calls converged.
+        return _stopped('em_cap', pis, mus, Ss, A, ll, score, 0)
+
+    if score <= eta:
+        # EM's own endpoint already meets 2.3; nothing for the
+        # trust-region finish to do.
         if not _cholesky_ok(A):
-            return None
+            return None, 'linalg'
+        extra = _penalty_influence_extra(Ss, Scov, a_pen, W, d)
+        fit, _ = _stopped('converged', pis, mus, Ss, A, ll, score, 0)
+        fit['psi'] = psi + extra
+        return fit, 'converged'
 
-    theta = _pack(cfg.K, pis, mus, Ss)
-    score_history = [float(np.linalg.norm(psi_bar))]
+    # Trust-region finish (2.2, 5.3-5.6), in v = u / s so the algorithm's
+    # own trust radius, and every step it takes, is already in the
+    # scaled coordinates 2.3's and 5's criteria are stated in; `s` is
+    # constant through the finish (fixed by Scov at EM's endpoint), so
+    # this is a linear change of variables, not a reparametrization.
+    p = cfg.p
+    cache: dict = {}
 
-    # Damped Newton polish: A is -H of ell_p and PD here (the gate
-    # above), so the full step is the local quadratic model; halving
-    # only guards a step that leaves the feasible set or drops ell_p.
-    polished = False
-    for _ in range(_MAX_NEWTON):
-        norm = float(np.linalg.norm(psi_bar))
-        if norm <= eta:
-            break
-        try:
-            delta = np.linalg.solve(A, psi_bar)
-        except np.linalg.LinAlgError:
-            break
+    def _eval(v: np.ndarray) -> dict:
+        key = v.tobytes()
+        if cache.get('key') != key:
+            u_v = v * s
+            theta_v = from_unconstrained(cfg.K, u_v)
+            pis_v, mus_v, Ss_v = _unpack(cfg.K, theta_v)
+            psi_v, A_v, ll_v, psi_bar_v = _score_info_penalized(
+                X, Q, w, cfg.K, pis_v, mus_v, Ss_v, Scov, a_pen, W)
+            g_uv, H_uv = chain(cfg.K, u_v, psi_bar_v, -A_v)
+            cache['key'] = key
+            cache['val'] = dict(theta=theta_v, pis=pis_v, mus=mus_v, Ss=Ss_v,
+                                 psi=psi_v, A=A_v, ll=ll_v, g_u=g_uv, H_u=H_uv)
+        return cache['val']
 
-        accepted = False
-        for n_halvings in range(_MAX_HALVINGS + 1):
-            theta_new = theta + delta * (0.5 ** n_halvings)
-            pis_new, mus_new, Ss_new = _unpack(cfg.K, theta_new)
-            if np.any(pis_new <= 0.0):
-                continue
-            try:
-                psi_new, A_new, ll_new, psi_bar_new = _score_info_penalized(
-                    X, Q, w, cfg.K, pis_new, mus_new, Ss_new, Scov, a_pen, W)
-            except np.linalg.LinAlgError:
-                continue
-            if not np.isfinite(ll_new) or ll_new < ll - _ACCEPT_TOL:
-                continue
-            accepted = True
-            break
-        if not accepted:
-            break
+    def fun(v):
+        return -_eval(v)['ll']
 
-        theta, pis, mus, Ss = theta_new, pis_new, mus_new, Ss_new
-        psi, A, ll, psi_bar = psi_new, A_new, ll_new, psi_bar_new
-        polished = True
-        score_history.append(float(np.linalg.norm(psi_bar)))
+    def jac(v):
+        return -_eval(v)['g_u'] * s
 
-    resid = float(np.linalg.norm(psi_bar))
-    if resid > eta:
-        return None
+    def hess(v):
+        H_uv = _eval(v)['H_u']
+        return -(H_uv * s[:, None]) * s[None, :]
 
-    # The influence's per-point term: the raw score plus the per-point
-    # sensitivity of the penalty (through S(w) and a_pen(w)) to that
-    # point's own weight (method_notes section 5).
-    extra = _penalty_influence_extra(Ss, Scov, a_pen, W, d)
-    psi_full = psi + extra
+    def _score_v(v):
+        e = _eval(v)
+        return scaled_gradient_norm(e['g_u'], s, e['ll'])
 
-    return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, psi=psi_full, A=A, ll=ll,
-                score_history=score_history, polished=polished, resid=resid)
+    v0 = u / s
+    last_step_u = np.asarray(best.get('last_step_u', np.zeros(p)), dtype=float)
+    radius0 = max(float(np.linalg.norm(last_step_u / s)), math.sqrt(eta))
+    n_cap = 2 * p
+
+    stall = {'v': v0.copy(), 'n': 0, 'converged': False, 'stalled': False}
+
+    def _callback(intermediate_result):
+        # scipy halts a trust-region minimize only on a raised
+        # StopIteration from the callback it was given (its return value
+        # is not consulted), so the two exact stopping tests of 2.3/5.5
+        # both raise rather than return.
+        v = np.asarray(intermediate_result.x, dtype=float)
+        if _score_v(v) <= eta:
+            stall['converged'] = True
+            raise StopIteration
+        step = float(np.linalg.norm(v - stall['v']))
+        stall['v'] = v
+        stall['n'] = stall['n'] + 1 if step < eta else 0
+        # A step below the fit's own reproducibility, twice in a row (so
+        # one small-but-real step near convergence is never mistaken for
+        # a stall), cannot improve it further (5.5): give up here rather
+        # than let the cap (5.4) spend the rest of its budget on nothing.
+        if stall['n'] >= 2:
+            stall['stalled'] = True
+            raise StopIteration
+
+    result = minimize(fun, v0, jac=jac, hess=hess, method='trust-exact',
+                       callback=_callback,
+                       options=dict(initial_trust_radius=radius0,
+                                    max_trust_radius=max(1e3, 10.0 * radius0),
+                                    gtol=0.0, maxiter=n_cap))
+    n_iter_newton = int(result.nit)
+    final = _eval(np.asarray(result.x, dtype=float))
+    resid = scaled_gradient_norm(final['g_u'], s, final['ll'])
+
+    if stall['converged'] or resid <= eta:
+        if not _cholesky_ok(final['A']):
+            return None, 'linalg'
+        extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
+        fit, _ = _stopped('converged', final['pis'], final['mus'], final['Ss'],
+                           final['A'], final['ll'], resid, n_iter_newton)
+        fit['psi'] = final['psi'] + extra
+        return fit, 'converged'
+
+    status = 'newton_cap' if (result.status == 1 and not stall['stalled']) else 'newton_stalled'
+    return _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton)
 
 
 def _center_start(start, K: int, xmean: np.ndarray):
@@ -1027,6 +1112,23 @@ def _center_start(start, K: int, xmean: np.ndarray):
     return start_c
 
 
+FitInfo = namedtuple('FitInfo', ['status', 'score', 'n_iter_em', 'n_iter_newton',
+                                  'label_order'])
+
+
+def _fit_info(fit, status) -> FitInfo:
+    """`GMM2D.last_fit_info` from `_fit`'s own return
+    (spec/QIJ_estimator_fit_spec.md 2.4): `score` is the final scaled
+    gradient norm of 2.3 whatever `status` is; `n_iter_em`/`n_iter_newton`
+    /`label_order` are 0/0/None on 'infeasible' or 'linalg', since those
+    two statuses have no dict (`_fit`'s docstring)."""
+    if fit is None:
+        return FitInfo(status=status, score=float('nan'), n_iter_em=0,
+                        n_iter_newton=0, label_order=None)
+    return FitInfo(status=status, score=fit['resid'], n_iter_em=fit['n_iter_em'],
+                   n_iter_newton=fit['n_iter_newton'], label_order=fit['label_order'])
+
+
 class GMM2D:
     """See module docstring. `T(X, w) -> ndarray(p,)`, `T.influence(X,
     w) -> ndarray(N, p)`, `T.fit_and_influence(X, w) -> (ndarray(p,),
@@ -1035,14 +1137,25 @@ class GMM2D:
     `T.prepare(X)`, an optional `start` (theta (p,) in `T`'s own
     output layout: a continuation of a previous fit, see module
     docstring), and an optional `eta`: when given, it replaces
-    `self.eta` in the polish's acceptance rule for that call alone
-    (spec/QIJ_mods_waves.md A15's measured eta_full), leaving `self.eta`
-    itself untouched for every other call. With `start` given, all three
-    label components against `start`'s own components (never
-    `self.reference`, and never the canonical sort); without it, against
-    `self.reference` (method_notes section 5) when it is not None, else
-    the canonical sort. `self.name`, `self.outputs`, `self.eta`,
-    `self.p` are fixed at construction from the constructor's own `K`."""
+    `self.eta` in the trust-region finish's convergence test for that
+    call alone (spec/QIJ_mods_waves.md A15's measured eta_full), leaving
+    `self.eta` itself untouched for every other call. With `start`
+    given, all three label components against `start`'s own components
+    (never `self.reference`, and never the canonical sort); without it,
+    against `self.reference` (method_notes section 5) when it is not
+    None, else the canonical sort. `self.name`, `self.outputs`,
+    `self.eta`, `self.p` are fixed at construction from the
+    constructor's own `K`.
+
+    `self.last_fit_info` (a `FitInfo`) is the one exception to "no state
+    between calls": `__call__`, `influence` and `fit_and_influence` each
+    overwrite it with their own fit's outcome (`_fit`'s status, final
+    scaled score, EM and Newton iteration counts, and the labelling
+    assignment against `start`/`reference`/the canonical order) before
+    returning, whatever that outcome is -- `T`'s own returned value NaNs
+    on anything but 'converged' exactly as before; `last_fit_info` is
+    where the status behind that NaN (or a converged fit's own numbers)
+    is read from. None before any call."""
 
     name = 'gmm2d'
     takes_start = True
@@ -1059,6 +1172,7 @@ class GMM2D:
         self.p = (self.K - 1) + 5 * self.K
         self.outputs = _make_outputs(self.K)
         self.eta = _ETA
+        self.last_fit_info = None
 
     def _resolve(self, kwargs: dict) -> _Cfg:
         K = int(kwargs.get('K', self.K))
@@ -1089,8 +1203,9 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
-            if fit is None:
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            self.last_fit_info = _fit_info(fit, status)
+            if status != 'converged':
                 return np.full(cfg.p, np.nan)
             theta = fit['theta']
             for k in range(cfg.K):
@@ -1099,6 +1214,11 @@ class GMM2D:
                 theta[my] += xmean[1]
             return theta
         except Exception:
+            # A failure this module's own statuses do not name (an
+            # unexpected exception, not one of `_fit`'s own LinAlgError
+            # sites): 'linalg' is the closest of the six, not a claim
+            # about the exception's actual type.
+            self.last_fit_info = _fit_info(None, 'linalg')
             return np.full(cfg.p, np.nan)
 
     def influence(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
@@ -1110,8 +1230,9 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
-            if fit is None:
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            self.last_fit_info = _fit_info(fit, status)
+            if status != 'converged':
                 return np.full((N, cfg.p), np.nan)
             A = fit['A']
             if np.linalg.cond(A) > _COND_MAX:
@@ -1121,6 +1242,7 @@ class GMM2D:
                 return np.full((N, cfg.p), np.nan)
             return IF
         except Exception:
+            self.last_fit_info = _fit_info(None, 'linalg')
             return np.full((N, cfg.p), np.nan)
 
     def fit_and_influence(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
@@ -1137,8 +1259,9 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
-            if fit is None:
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            self.last_fit_info = _fit_info(fit, status)
+            if status != 'converged':
                 return nan_theta, nan_psi
             theta = fit['theta'].copy()
             for k in range(cfg.K):
@@ -1153,4 +1276,5 @@ class GMM2D:
                 return theta, nan_psi
             return theta, IF
         except Exception:
+            self.last_fit_info = _fit_info(None, 'linalg')
             return nan_theta, nan_psi

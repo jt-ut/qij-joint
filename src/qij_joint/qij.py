@@ -274,7 +274,7 @@ class QIJ:
         if theta_hat_pre is not None:
             t0 = time.perf_counter()
             ev_e0, rows_e0 = counter.snapshot()
-            eta_full_pre, _n_eta_full = measure_eta_full(counter, X, theta_hat_pre)
+            eta_full_pre, _n_eta_full, _ = measure_eta_full(counter, X, theta_hat_pre)
             wall_time_eta_full = time.perf_counter() - t0
             ev_e1, rows_e1 = counter.snapshot()
             evals_eta_full = ev_e1 - ev_e0
@@ -360,7 +360,7 @@ class QIJ:
         else:
             t0 = time.perf_counter()
             ev_e0, rows_e0 = counter.snapshot()
-            eta_full, _n_eta_full = measure_eta_full(counter, X, theta_hat)
+            eta_full, _n_eta_full, _ = measure_eta_full(counter, X, theta_hat)
             wall_time_eta_full = time.perf_counter() - t0
             ev_e1, rows_e1 = counter.snapshot()
             evals_eta_full = ev_e1 - ev_e0

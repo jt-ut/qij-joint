@@ -274,13 +274,24 @@ def _step_prototype(omega0: np.ndarray, p: np.ndarray, delta_f: float, j: int) -
 def _measure_eta_Q(
     counter, rows: np.ndarray, omega0: np.ndarray, row_field: np.ndarray,
     p: np.ndarray, theta_Q: np.ndarray, eta: Optional[float] = None,
-) -> float:
+) -> Tuple[float, bool]:
     """A9 item 3: the rows' reproducibility of a continuation from
     theta_Q -- two fits at the base weights and one at the largest-mass
-    prototype's weights perturbed by a relative 1e-6 and back; eta_Q is
-    the largest relative difference among the three fits (each pair
-    scaled by its own larger magnitude, floored against 0/0), floored
-    at the polish tolerance (`eta` when given, else T's declared eta)."""
+    prototype's weights perturbed by a relative 1e-6 and back. Returns
+    (eta_Q, failed): `failed` is True the moment any of the three
+    continuations returns a single non-finite entry, checked directly
+    rather than left for `nanmax` to discover by skipping it -- a
+    continuation that fails on only SOME outputs used to slip through
+    `nanmax` as a deceptively finite number built from the outputs that
+    did not fail (spec/QIJ_estimator_fit_spec.md 1, 2.3). On failure
+    `eta_Q` is the same floor the valid case would have used (`eta`
+    when given, else `counter.eta`), never NaN: a caller that does not
+    check `failed` still gets a finite, safe tolerance rather than a
+    value whose every comparison downstream (`resid > eta`, `score <=
+    eta`, ...) silently evaluates False. On success `eta_Q` is the
+    largest relative difference among the three fits (each pair scaled
+    by its own larger magnitude, floored against 0/0), floored at that
+    same floor."""
     f_a = counter(rows, omega0, start=theta_Q, eta=eta)
     f_b = counter(rows, omega0, start=theta_Q, eta=eta)
     j_max = int(np.argmax(p))
@@ -288,13 +299,17 @@ def _measure_eta_Q(
     omega_pert = _field_step_weights(omega0, row_field, j_max, p_max,
                                       step_parameter(1e-6, p_max))
     f_c = counter(rows, omega_pert, start=theta_Q, eta=eta)
+    floor = counter.eta if eta is None else eta
+    if not (np.all(np.isfinite(f_a)) and np.all(np.isfinite(f_b))
+            and np.all(np.isfinite(f_c))):
+        return float(floor), True
     scale_ab = np.maximum(np.abs(f_a), np.abs(f_b))
     scale_ac = np.maximum(np.abs(f_a), np.abs(f_c))
     diffs = np.concatenate([
         np.abs(f_a - f_b) / np.where(scale_ab > 0, scale_ab, 1.0),
         np.abs(f_a - f_c) / np.where(scale_ac > 0, scale_ac, 1.0),
     ])
-    return float(max(np.nanmax(diffs), counter.eta if eta is None else eta))
+    return float(max(np.max(diffs), floor)), False
 
 
 def _step_doubling(
@@ -358,7 +373,13 @@ def prototype_influences(
     q = theta_Q.shape[0]
 
     if counter.takes_start:
-        eta_Q = _measure_eta_Q(counter, rows, omega0, row_field, p, theta_Q, eta_rows)
+        # `_measure_eta_Q` never returns NaN (it substitutes the same
+        # floor a valid measurement would use), so `delta_f` below is
+        # never built on a value whose failure would otherwise be
+        # silent; whether THIS measurement itself failed is discarded
+        # here, since the failing continuations already count against
+        # `counter`'s own failure tally.
+        eta_Q, _ = _measure_eta_Q(counter, rows, omega0, row_field, p, theta_Q, eta_rows)
         delta_f = forward_step(eta_Q)
         step_ratio = _step_doubling(counter, rows, omega0, row_field, p, theta_Q, delta_f, q, eta_rows)
     else:

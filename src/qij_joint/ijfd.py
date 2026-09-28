@@ -399,7 +399,7 @@ class IJFD:
         # Step 2 (core/eta.py::measure_eta_full, A13 step 2 / A15):
         # every point its own "field" (row_field = its own index) when
         # T takes a start; an estimator without one spends nothing here.
-        eta_full, _ = measure_eta_full(counter, X, theta_hat)
+        eta_full, _, _ = measure_eta_full(counter, X, theta_hat)
         ev_eta, rows_eta = counter.snapshot()
 
         # Step 3: the step size depends on how this pass will be used.

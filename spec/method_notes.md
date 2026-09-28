@@ -343,9 +343,10 @@ mean of centered psi0 over the bin. V_tot_hat = V_btw + V_win_hat.
 
 `gmm.py`'s 2-D Gaussian-mixture estimator: K components, free full
 covariances, fit by multi-start weighted EM (SQUAREM-accelerated),
-polished with a damped Newton step gated on the observed information's
-positive-definiteness, with an analytic influence via Louis's (1982)
-identity.
+finished with a trust-region Newton step
+(`scipy.optimize.minimize(method='trust-exact')`) in the unconstrained
+parametrization of `gmm_param.py`, with an analytic influence via
+Louis's (1982) identity.
 `GMM2D(K, n_starts=20, seed=0, tol=1e-8, max_iter=500, reference=None)`;
 `T(X, w) -> ndarray(p,)` never raises (a failed fit is NaN); no state
 between calls; `T.influence(X, w) -> ndarray(N, p)`;
@@ -434,9 +435,10 @@ a budget-exhausted start as a failure would make pool membership a
 step function of `w`, incompatible with `T` needing to be
 differentiable in `w`. The pool is ranked by penalized weighted log-
 likelihood; the best is canonically relabeled (`_canonical_sort`,
-ascending `mu_x`, ties on `mu_y`) BEFORE Newton polish, so `psi`/`A`
-need no further permutation -- without this, two starts landing on the
-same optimum with swapped labels would make `T` discontinuous in `w`.
+ascending `mu_x`, ties on `mu_y`) BEFORE the trust-region finish, so
+`psi`/`A` need no further permutation -- without this, two starts
+landing on the same optimum with swapped labels would make `T`
+discontinuous in `w`.
 `_SHORT_ITERS = 25`, `_PROMOTE_N = 3` are chosen by measurement (not
 taste): validated to not move the winning start or `theta_hat` relative
 to running every start to full budget.
@@ -484,60 +486,87 @@ candidate that does not improve on `theta2`. Phase 1's batched screen is not
 accelerated (it has no per-start convergence test to accelerate against
 -- a fixed lockstep budget, used for ranking, not for finding a root).
 
-**Newton gate** (`_cholesky_ok`, `_fit`). After phase 2's winning start
-is labelled and its penalized score/information `(psi_bar, A)` formed,
-the polish below runs only if `A` (`-H` of `ell_p`) is positive
-definite (`np.linalg.cholesky` succeeds): a start that is not there yet
-is not one the local quadratic model of Newton's step should be trusted
-on. If `A` is not PD, one more block of SQUAREM-accelerated EM (the
-same `max_iter` cap, continuing from the current point) runs, the start
-is re-labelled and its `(psi_bar, A)` re-formed, and the PD test is
-repeated once. Still not PD: the fit is NaN (below), no third block, no
-other retry. Enforcing this before the FIRST Newton step matters: a
-start whose EM has not actually reached a stationary point can have a
-PD `A` and yet leave PD-ness after just one full Newton step (the local
-quadratic model is only locally valid), producing exactly the
-plateaued-score, many-halvings symptom the gate is meant to keep out of
-a WINNING start's polish; a per-step re-test of `A`'s own PD-ness is not
-part of the polish itself (only a mixing weight <= 0, a component
-covariance not PD, or `ell_p` falling triggers a halving, all below).
+**EM's own convergence test** (`_run_em`, `_em_accelerated`). EM stops
+when the scaled gradient norm (below) is <= `sqrt(eta)` AND the
+Aitken-projected remaining gain in `ell_p/W` is <= `eta *
+max(|ell_p/W|, 1)` (McLachlan and Krishnan, *The EM Algorithm and
+Extensions*, 2nd ed., section 4.9): the first delivers an iterate the
+trust-region finish converges quadratically from in one or two steps;
+the second guards against declaring convergence on a plateau next to a
+saddle (spec/QIJ_estimator_fit_spec.md 1, the diagnostic that motivated
+this whole section). Iteration cap `20 * p`; hitting it is a status
+(`em_cap`, below), not a NaN -- no converged result depends on it. The
+EM stage's status and its own final scaled gradient (`score_scaled`)
+and last accepted step (`last_step_u`, unconstrained, unscaled) are
+what the finish below needs.
 
-**Newton polish** (`_fit`) takes up to `_MAX_NEWTON = 20` damped Newton
-steps `theta <- theta + t * A^-1 (penalized weighted mean score)`, using
-the same analytic score/information the influence needs, both the
-penalized ones (below). At each iteration the
-full step (`t = 1`) is tried first; it is accepted if the new point is
-valid (every mixing weight positive, every component's covariance
-positive-definite, penalized log-likelihood finite) and the penalized
-weighted log-likelihood does not decrease, otherwise `t` is halved and the trial
-repeated, up to `_MAX_HALVINGS = 30` halvings (`t` as small as
-`2^-30 ~ 1e-9`). A full step from an unconverged EM point is a step from
-outside the region the Newton model is locally accurate in, and
-routinely overshoots a small mixing weight past zero or a covariance
-past positive-definiteness; damping recovers a usable step there while
-leaving a polish that already accepts the full step at every iteration
-identical to before. If no step at any damping level is admissible, the
-polish stops and the current point is kept. The loop otherwise stops
-when the penalized weighted mean score's norm falls to `self.eta` or
-below.
+**The unconstrained parametrization** (`gmm_param.py`). `theta`'s
+weight block becomes `K - 1` softmax logits (component `K` pinned as
+the reference); its mean block is unchanged (the identity map); its
+covariance block becomes, per component, a Cholesky factor
+`L = [[exp(u1), 0], [u2, exp(u3)]]`, `Sigma = L L^T` -- every `u` is
+therefore feasible by construction (`pi > 0`, `sum(pi) = 1`, `Sigma`
+PD), which is what removes the feasibility checks (a mixing weight
+<= 0, a covariance not PD) the old polish needed a halving loop for.
+`chain(K, u, g_theta, H_theta)` maps an objective's gradient and
+Hessian with respect to `theta` (the caller passes `g_theta = psi_bar`,
+`H_theta = -A`) to the same objective's gradient and Hessian with
+respect to `u`, by the ordinary chain rule plus a closed-form
+correction for the map's own curvature (zero in the mean block, where
+the map is affine). `coordinate_scales(K, Scov)` gives each `u`
+coordinate its own scale `s_i`: 1 for the weight logits and the
+covariance log-diagonals (`u1`, `u3`, already dimensionless); the data's
+own column standard deviation (`Scov`'s diagonal) for the means and for
+`u2` (an x-scale times a dimensionless slope, so the x column's own
+scale). `scaled_gradient_norm(g_u, s, ell) = max_i |g_u[i]| * s[i] /
+max(|ell|, 1)` is Dennis and Schnabel's relative gradient (*Numerical
+Methods for Unconstrained Optimization and Nonlinear Equations*, 1983);
+"the scaled gradient norm" below always means this.
 
-**Residual and `eta`.** `resid = norm(s_bar)` at the point the polish
-loop exits, `s_bar` the penalized weighted mean score -- the same
-quantity, at the same scale, the loop's own stopping test and the Newton
-gate above both watch. `resid > self.eta` (or `A` singular at any point
-along the way, so the gate or a Newton step cannot even be evaluated)
-makes the whole evaluation fail (`T` and `influence` both NaN): a
-`theta_hat` whose score is not this small is not one QIJ should treat as
-an exact root of `ell_p`. `eta` is declared, not derived: `self.eta =
-1e-12`, from the score norm the polish reliably reaches on the demo
-mixture (`datasets.mix11`, K=9) once a start clears the gate and
-actually converges (module report: two of its three phase-2 starts
-converge to a `resid` of a few times `1e-13`; the third clears the gate
-but does not converge within `_MAX_NEWTON` steps and would itself be
-NaN, which is not "reliably reached" and is excluded from the
-declaration), rounded up to `1e-12`. A fit whose Newton polish does not
-converge at all fails `resid > eta` by orders of magnitude (`1e-3` or
-larger), not by a margin that would call `eta`'s value into question.
+**The trust-region finish** (`_fit`, no gate, no halving loop). From
+EM's endpoint, once EM's OWN status is `converged` (below) -- never on
+an EM iterate that only hit its cap, since the finish's initial trust
+radius assumes an iterate EM itself already calls converged --
+`scipy.optimize.minimize(fun, u0, jac=jac, hess=hess,
+method='trust-exact', callback=callback)` maximizes `ell_p/W` by
+minimizing its negative, in `v = u / s` (so the algorithm's own trust
+radius and every step it takes are already in the scaled coordinates
+this section's criteria are stated in): `fun`, `jac`, `hess` rebuild
+`(psi_bar, A)` at the trial point and push them through `chain`, then
+rescale by `s`; indefiniteness in `A` is handled inside the
+trust-region subproblem itself (`scipy`'s nearly-exact iterative
+solver), which is what removes the PD gate. Three constants, all
+relative (never set from one draw of one dataset):
+
+- *Initial trust radius* (in `v`): the scaled length of EM's own last
+  accepted step, `norm(last_step_u / s)`, floored at `sqrt(eta)` -- EM's
+  steps are small near its own convergence, so the finish starts on
+  EM's branch by construction; `scipy`'s own trust-region update
+  enlarges the radius on successful steps from there.
+- *Iteration cap*: `2 * p`; status `newton_cap` when it binds.
+- *Give-up*: a callback (scipy halts a trust-region `minimize` only on
+  a raised `StopIteration` from it, never on a returned value) checks
+  the scaled gradient norm at every accepted iterate first (below);
+  short of that, two consecutive accepted steps each smaller than `eta`
+  (in `v`, i.e. already scaled) signal that the trust region has
+  shrunk under the fit's own reproducibility and cannot improve it
+  further -- status `newton_stalled`.
+
+Both `newton_cap` and `newton_stalled` return EM's OWN endpoint, never
+the finish's own (possibly worse) last iterate -- the finish either
+reaches 2.3's criterion or it contributes nothing.
+
+**Convergence** (2.3). The finish (or EM's own endpoint directly, when
+it already satisfies this without any trust-region step) is `converged`
+when the scaled gradient norm is `<= eta`, `eta` the value the caller
+passes (`T`'s own declared default, or a measured `eta_full`/`eta_Q`,
+interface sheet) -- not a solver setting, a measured reproducibility.
+Whatever status the finish stops at, `_fit` also re-tests `_cholesky_ok`
+on the final `A` before calling anything `converged`: a converged scaled
+gradient at a point whose `A` is not PD is a saddle wearing a small
+gradient, not a maximum, and is reported `linalg` instead -- the one
+place `_cholesky_ok` survives, since `influence`'s sandwich needs a
+genuine (PD) observed information, not merely a small score.
 
 **The score and Louis's identity** (`_score_info`). Per observation,
 with responsibility `r_k`, residual `res = x - mu_k`,
@@ -646,21 +675,32 @@ from `Xc` -- all independent of `w`, and otherwise rebuilt from scratch
 on every one of a draw's many bootstrap replicates / QIJ perturbations
 of the same X.
 
-**Failure convention.** The evaluation fails (NaN) when: every one of
+**Status, not NaN, at the estimator; NaN at the method's boundary**
+(spec/QIJ_estimator_fit_spec.md 2.4). `_fit` returns `(dict_or_None,
+status)`, status one of `converged`, `em_cap`, `newton_cap`,
+`newton_stalled`, `infeasible`, `linalg`: `infeasible` when every one of
 the `n_starts` starts degenerates, so nothing survives phase 1 to rank;
-or the winning start's `A` is not PD even after the Newton gate's one
-retry block; or, after polish, `resid > self.eta` (nothing retried
-beyond the polish's own `_MAX_NEWTON` iterations) or `A` becomes
-singular along the way; or (`influence`/`fit_and_influence` only) `A`'s
-condition number exceeds `_COND_MAX = 1e12`. A bad OTHER start's mid-EM
+`linalg` when the winning start's `(psi_bar, A)` cannot even be formed,
+or forms but is not PD at a point the finish calls converged (above);
+`em_cap`/`newton_cap`/`newton_stalled` the EM and trust-region stages'
+own non-convergent endings (above). `GMM2D` exposes this as
+`self.last_fit_info` (a `FitInfo`: status, final scaled score, EM and
+Newton iteration counts, the labelling assignment), overwritten by
+`__call__`, `influence` and `fit_and_influence` on every call -- the one
+exception to "no state between calls," never consulted by `T`'s own
+returned value. `T` and `influence` both NaN on any status but
+`converged`, exactly as before (a failed evaluation is excluded and
+counted, never retried, the method's own rule); `influence`/
+`fit_and_influence` additionally NaN when a converged `A`'s condition
+number exceeds `_COND_MAX = 1e12`. A bad OTHER start's mid-EM
 degeneracy just drops that one start -- multi-start's whole purpose. A
-start whose own EM never reaches `_run_em`'s relative-tolerance
-convergence within `max_iter` EM steps is not itself a failure (it is
-finalized `converged=False` and still ranked, above); but if the
-winning start then fails the Newton gate or its polish cannot bring
-`resid` under `eta`, the whole evaluation is NaN -- a real outcome for a
-hard mixture (K too large for N, near-empty or near-collinear clusters),
-not an artifact of the penalty.
+start whose own EM never reaches its stopping rule within its iteration
+cap is not itself a failure at the POOL level (it is finalized
+`converged=False` and still ranked, above); only if the WINNING start
+carries that status, or the finish that follows a winning start's own
+convergence cannot reach `eta`, is the whole evaluation NaN -- a real
+outcome for a hard mixture (K too large for N, near-empty or
+near-collinear clusters), not an artifact of the penalty.
 
 **Component labelling.** Without a reference, the winning start's
 components are labelled in ascending mu_x order. With
