@@ -270,3 +270,85 @@ These supersede the corresponding statements above.
    evaluations, rounds, `update_wall_time`, the eigenvalue cut count per
    update, and a_c and λ_c before and after. The A15 gate criteria then
    apply. The author decides whether the simulator pre-screen runs first.
+
+## 10. Closing the open ends (28 September, night). Final; supersedes sections 3, 8 and 9 where they differ.
+
+**10.1 One model, from stage 1 on.** Under `refine_update = stencils` the
+influence model is the set-observation model from its first fit: the
+prototype influence I_jc enters as an observation of the mean of ψ_c
+over receptive field j (noise λ_c), never as a value at the prototype's
+position. The hyperparameter search (width or c, λ_c, s²_c) runs on that
+covariance, formed as K·A over the receptive-field partition (one N × N
+kernel pass per candidate per group, in chunks). The initial bins are
+then built from a model that never claimed point-level knowledge inside
+a receptive field. Under `none` the stage-1 model is unchanged and
+audited. Section 8 item 2 and section 9 item 4's separate λ_c step are
+subsumed: after the initial bins are measured, a_c is applied to the
+survey responses and the hyperparameters are refit once, in full, on
+the rescaled responses plus the initial-bin rows.
+
+**10.2 No rank cut. The known redundancies are removed structurally.**
+Two exact linear dependences exist and are removed before the solve:
+(a) a split's parent row is replaced by its children's rows (section 8
+item 1a); (b) every partition of the N points, the receptive-field
+partition and each output's leaf partition, implies the same
+global-mean functional, so from EACH partition the row of its largest
+set is dropped from the design (its value is implied by the others and
+the centring). Every remaining row has strictly positive declared
+noise: λ_c for receptive-field rows; the finite-difference noise of
+section 8 item 1b for leaf rows, floored at 10⁻¹² of s²_c. The
+augmented system is then solved by Cholesky with the ridge ladder
+`fit_influence_model` already uses (0, then 10⁻¹⁰, 10⁻⁹, 10⁻⁸ of the mean
+diagonal); the ridge step used is a product per update. The
+eigendecomposition cut of section 8 item 1c is removed: the 343 dropped
+eigenvalues the smoke run reported are not to be understood, they are
+to be made impossible.
+
+**10.3 Cost is bounded by construction and reported.** The receptive-
+field columns of K·A are formed once per kernel group (section 9 item
+2). A leaf's column is formed at the leaf's creation (n_leaf × N kernel
+evaluations) and dropped at its split. Per round the linear algebra is
+one Cholesky of order (M_𝒳 + Σ_c L_c) per output. At N = 10 000 and
+M_𝒳 = 1 094 the first formation is 10⁸ kernel evaluations per group;
+`update_wall_time` per round and the formation time are products. No
+further rule; the number decides nothing until it is measured.
+
+**10.4 The position angle is judged against its identifiability, not
+patched.** On draw 0 P2's fitted covariance is nearly round, so the
+position angle is nearly unidentified: its analytic influence variance
+is 48 times the oracle's sampling variance, and any variance method
+that reproduces V_ij on that draw reports an interval 48 times too wide.
+That is the estimand on that draw, not the code. The gate stays at 0.97
+on every output. If the angle alone fails on draw 0 while V_ij/oracle
+for it exceeds 10, the report states that ratio beside the failure and
+the author rules on the estimand; no code changes for it.
+
+**10.5 If draw 1 stalls below the gate with the within-receptive-field
+floor as the cause: A18, the first-stage allocation, specified here so
+no further round is needed.** The cause is established when the final
+between-bin share is within 0.02 of the receptive-field-level share
+(Σ_j p_j U_j² over the receptive fields' own stencil-scale means), i.e.
+the refinement has exhausted what the receptive fields can give. Then,
+in stage 1, after the survey: for every receptive field j and output c,
+the predicted within-receptive-field variance ŵ_jc = p_j g_jcᵀ C_j g_jc,
+with g_jc the mass-weighted least-squares gradient of I_·c over j and
+its CONN neighbours (their whitened centroids as regressors) and C_j the
+field's positional covariance in whitened coordinates. While
+max_c Σ_j ŵ_jc / V̂_c > ε/2, split the receptive field with the largest
+max_c ŵ_jc / V̂_c by `two_means_split` on its points' whitened positions,
+build the two children's survey rows (section 2's representation, d_x + 1
+rows each), survey each child (one quantized evaluation, continuation
+from θ_Q), recompute the neighbours' gradients over the new CONN (the
+children inherit the parent's adjacencies plus each other). Guard: at
+most M_𝒳 additional evaluations. Products: the number added, the
+predicted within share before and after. Nothing downstream changes: the
+receptive fields are simply finer where the surveyed influence is steep.
+Not built until the A17 rehearsal names this cause.
+
+**10.6 What the coder does, in order, with no further exchange.** Build
+10.1 and 10.2 (10.3 is bookkeeping already ruled). Verify bit identity
+under `none`. Run the rehearsal of section 9 item 5. Report the table and
+the products named there, plus 10.4's ratio for the angle. Stop. Any
+question that cannot be answered from this document is answered by the
+ported rule (`method_notes.md` §4) and noted in the report; it is not
+asked.

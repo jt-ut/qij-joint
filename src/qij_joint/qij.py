@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from typing import Dict
 
 import numpy as np
 from numpy.linalg import LinAlgError
@@ -87,7 +88,7 @@ from . import registry
 from .core import abc as core_abc
 from .core.counter import Counter
 from .core.eta import measure_eta_full
-from .core.influence_model import fit_influence_model
+from .core.influence_model import _set_kernel_column, fit_influence_model, fit_rows_model, rows_point_terms
 from .core.influence_model import psi0 as _psi0
 from .core.influence_model import uncertainty as _uncertainty
 from .core.joint import run_joint
@@ -120,7 +121,7 @@ def _marginal_defaults(N: int, q: int) -> dict:
         n_adjacency_splits=np.zeros(q, dtype=int), rho=np.full(q, np.nan),
         n_refine_evals=np.zeros(q, dtype=int),
         psi_hat=np.full((N, q), np.nan), bin_label=np.full((N, q), -1, dtype=int),
-        bin_U=(), a_c=np.full(q, np.nan),
+        bin_U=(), a_c=np.full(q, np.nan), lambda_c_update=np.full(q, np.nan),
     )
 
 
@@ -206,6 +207,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
         refine_update=refine_update, n_update_rounds=0, update_wall_time=0.0,
+        lambda_c_stage1=nan_q, ridge_step_max=0, first_formation_wall_time=0.0,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_NO_COLD_DIAG,
     )
 
@@ -313,18 +315,58 @@ class QIJ:
         # result's diagnostics -- the same `inverse(xvq.centers)`
         # `run_xvq` already applied, recovered rather than re-derived.
         W_X = np.asarray(inverse(xvq.centers), dtype=float)
+        # spec/QIJ_A17_stencil_update.md section 10.1: under
+        # `refine_update='stencils'` (marginal path only -- inert under
+        # `ivqbins='joint'`), stage 1 ITSELF is the set-observation
+        # model, `fit_rows_model` in place of `fit_influence_model`; no
+        # point-prototype `InfluenceModel` is ever built for this draw.
+        rows_stage1 = self.refine_update == 'stencils' and self.ivqbins == 'marginal'
         try:
-            # Fit only the MEASURED outputs' GPs (spec/QIJ_mods_waves.md
-            # A11): `model` (and, below, `psi0_all`/`sigma_all`) are then
-            # indexed by LOCAL position (0..q-1, `measured`'s own order),
-            # never by the absolute index into `theta_hat`/`I_proto`,
-            # which stay full width for T's own continuation and for the
-            # bin measurements that reuse one shared evaluation across
-            # every output. Identity `measured` reproduces today's
-            # full-width model bit for bit.
-            model, model_busy = fit_influence_model(
-                Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
-                gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool)
+            if rows_stage1:
+                stage1_per_coord, stage1_shared, stage1_constant, stage1_aux = fit_rows_model(
+                    Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
+                    gptrend=self.gptrend, gpwidth=self.gpwidth)
+                model_busy = 0.0
+                mean_w, transform_w = stage1_aux['whitening']
+                Za = np.asarray(Z, dtype=float)
+                if Za.ndim == 1:
+                    Za = Za.reshape(-1, 1)
+                Zw = (Za - mean_w) @ transform_w.T
+                psi0_all = np.empty((N, q), dtype=float)
+                sigma_all = np.empty((N, q), dtype=float)
+                width_by_c: Dict[int, float] = {}
+                for gi, sh in stage1_shared.items():
+                    cols_g = sh['cols']
+                    Kx_g = np.stack(
+                        [_set_kernel_column(Zw, idx, self.gpwidth, sh['param'], stage1_aux['h_full'],
+                                             stage1_aux['bmu_full'], stage1_aux['d_z'])
+                         for idx in sh['all_idx']], axis=1)
+                    psi0_g, sigma_g, _Rg = rows_point_terms(stage1_per_coord, cols_g, Kx_g, Zw, sh['m'])
+                    for c in cols_g:
+                        psi0_all[:, c] = psi0_g[c]
+                        sigma_all[:, c] = sigma_g[c]
+                        width_by_c[c] = sh['param']
+                constant_path_rows = np.zeros(q, dtype=bool)
+                for c, (is_const, const_val) in stage1_constant.items():
+                    constant_path_rows[c] = is_const
+                    if is_const:
+                        psi0_all[:, c] = const_val
+                        sigma_all[:, c] = 0.0
+                offset_rows = psi0_all.mean(axis=0)
+            else:
+                # Fit only the MEASURED outputs' GPs (spec/QIJ_mods_waves.md
+                # A11): `model` (and, below, `psi0_all`/`sigma_all`) are then
+                # indexed by LOCAL position (0..q-1, `measured`'s own order),
+                # never by the absolute index into `theta_hat`/`I_proto`,
+                # which stay full width for T's own continuation and for the
+                # bin measurements that reuse one shared evaluation across
+                # every output. Identity `measured` reproduces today's
+                # full-width model bit for bit.
+                model, model_busy = fit_influence_model(
+                    Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
+                    gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool)
+                psi0_all = _psi0(model, Z)
+                sigma_all = _uncertainty(model, Z)
         except (RuntimeError, LinAlgError):
             # A failed stage 1 is recorded as failed, never retried; a
             # submitted `theta_future` is left uncollected and uncounted,
@@ -333,8 +375,6 @@ class QIJ:
                                  self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                  self.survey, sv, self.quantized_start, self.refine_schedule,
                                  self.refine_update)
-        psi0_all = _psi0(model, Z)
-        sigma_all = _uncertainty(model, Z)
         wall_time_prototype = time.perf_counter() - t0
         ev1, rows1 = counter.snapshot()
 
@@ -398,6 +438,18 @@ class QIJ:
         n_rounds = 0
         n_update_rounds = 0
         update_wall_time = 0.0
+        ridge_step_max = 0
+        first_formation_wall_time = 0.0
+        lambda_c_update_arr = np.full(q, np.nan)
+        # lambda_c_stage1 (spec/QIJ_A17_stencil_update.md section 10,
+        # planner-report products): the stage-1 REML value, whichever
+        # stage 1 fit this draw -- `fit_rows_model`'s own per-coordinate
+        # `lam` under 'stencils', `model.lam` otherwise; populated under
+        # every `refine_update`, since stage 1 itself always has one.
+        lambda_c_stage1_arr = (
+            np.array([float(stage1_per_coord[c]['lam']) for c in range(q)]) if rows_stage1
+            else np.array(model.lam)
+        )
         if self.ivqbins == 'joint':
             # `psi0_all`/`sigma_all`/`model` are already the measured
             # subset (this call's own `fit_influence_model` above), so
@@ -456,14 +508,20 @@ class QIJ:
             # requires `'rounds'` (`__init__` already enforced this) and
             # runs through `core.stencils` instead.
             if self.refine_update == 'stencils':
-                coordinates, n_rounds, n_update_rounds, update_wall_time = run_refinement_stencils(
+                coordinates, n_rounds, n_update_rounds, update_wall_time, stencil_products = run_refinement_stencils(
                     X, counter, theta_hat, list(measured), list(outputs),
-                    [psi0_all[:, j] for j in range(q)], [float(model.offset[j]) for j in range(q)],
+                    [psi0_all[:, j] for j in range(q)], [float(offset_rows[j]) for j in range(q)],
                     [sigma_all[:, j] for j in range(q)], [I_proto[:, c] for c in measured],
                     xvq.bmu, xvq.bmu2, eta_full, self.eps, xvq.M_used,
-                    [bool(model.constant_path[j]) for j in range(q)], Z, model, list(range(q)),
+                    [bool(constant_path_rows[j]) for j in range(q)], Z, list(range(q)),
+                    xvq, theta_Q[measured], self.gptrend, self.gpwidth,
+                    stage1_per_coord, stage1_aux,
                     pool, start=start_second_stage,
                 )
+                ridge_step_max = int(stencil_products['ridge_step_max'])
+                first_formation_wall_time = float(stencil_products['first_formation_wall_time'])
+                for j in range(q):
+                    lambda_c_update_arr[j] = stencil_products['lambda_c_update'][j]
             elif self.refine_schedule == 'rounds':
                 coordinates, n_rounds = run_refinement_rounds(
                     X, counter, theta_hat, list(measured), list(outputs),
@@ -528,6 +586,7 @@ class QIJ:
                 # stencil_update.md section 3); NaN under `refine_update=
                 # 'none'`.
                 a_c=np.array([cr.a_c for cr in coordinates]),
+                lambda_c_update=lambda_c_update_arr,
             )
             joint_fields = _joint_defaults(N, q)
         wall_time_refinement = time.perf_counter() - t0
@@ -566,23 +625,43 @@ class QIJ:
         # subset (spec/QIJ_mods_waves.md A11), so every model-derived
         # field below is used as-is, at `model`'s own (measured) width --
         # only the T-output arrays (`theta_hat`, `I_proto`, `c_q`,
-        # `survey_step_ratio`) still need `[measured]`.
+        # `survey_step_ratio`) still need `[measured]`. Under `rows_
+        # stage1` there is no `InfluenceModel`/`at_bound` search trace
+        # (spec/QIJ_A17_stencil_update.md section 10.1's own search is
+        # not instrumented for it -- 10.6, not answered by the document,
+        # noted rather than built); `ell`/`c`/`lam` come from stage 1's
+        # own per-coordinate fit instead (`lambda_c_stage1` in the
+        # products below is the SAME `lam` value, under its own name).
         local = self.gpwidth == 'local'
-        ell_bound = np.zeros(q, dtype=bool) if local else model.at_bound[:, 0].copy()
-        c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
+        if rows_stage1:
+            ell_arr = np.array([width_by_c[c] if not local else np.nan for c in range(q)])
+            c_arr = np.array([width_by_c[c] if local else np.nan for c in range(q)])
+            lam_arr = np.array([float(stage1_per_coord[c]['lam']) for c in range(q)])
+            ell_bound = np.zeros(q, dtype=bool)
+            c_bound = np.zeros(q, dtype=bool)
+            lam_bound = np.zeros(q, dtype=bool)
+            h_arr = np.array(stage1_aux['h_full'])
+        else:
+            ell_arr = np.array(model.width)
+            c_arr = np.array(model.c)
+            lam_arr = np.array(model.lam)
+            ell_bound = np.zeros(q, dtype=bool) if local else model.at_bound[:, 0].copy()
+            c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
+            lam_bound = model.at_bound[:, 1].copy()
+            h_arr = np.array(model.h)
 
         return QIJResult(
             outputs=outputs, N=N, theta_hat=theta_hat[measured],
-            ell=np.array(model.width), lam=np.array(model.lam),
-            ell_bound=ell_bound, lam_bound=model.at_bound[:, 1].copy(),
+            ell=ell_arr, lam=lam_arr,
+            ell_bound=ell_bound, lam_bound=lam_bound,
             gptrend=self.gptrend, gpwidth=self.gpwidth,
-            c=np.array(model.c), c_bound=c_bound,
+            c=c_arr, c_bound=c_bound,
             M_X=xvq.M_used, M_X_source=M_X_source, n_failed=counter.failed,
             evals_by_stage=evals_by_stage, rows_by_stage=rows_by_stage,
             wall_time_by_stage=wall_time_by_stage,
             busy_time_total=busy_time_total, workers=workers,
             psi0=psi0_all, sigma=sigma_all,
-            bmu=xvq.bmu, prototype_p=xvq.p, prototype_w=W_X, prototype_h=np.array(model.h),
+            bmu=xvq.bmu, prototype_p=xvq.p, prototype_w=W_X, prototype_h=h_arr,
             prototype_I=np.asarray(I_proto, dtype=float)[:, measured],
             ivqbins=self.ivqbins, survey=self.survey,
             c_q=c_q, c_q_one_sided=c_q_one_sided, eta_Q=sv.eta_Q, eta_full=float(eta_full),
@@ -590,6 +669,7 @@ class QIJ:
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
             refine_update=self.refine_update, n_update_rounds=n_update_rounds,
-            update_wall_time=update_wall_time,
+            update_wall_time=update_wall_time, lambda_c_stage1=lambda_c_stage1_arr,
+            ridge_step_max=ridge_step_max, first_formation_wall_time=first_formation_wall_time,
             **second_stage_fields, **joint_fields, **cold_diag,
         )

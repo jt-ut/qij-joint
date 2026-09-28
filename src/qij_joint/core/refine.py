@@ -113,6 +113,13 @@ class CoordinateResult:
                         model, used by `core.stencils` to rescale the
                         survey before the first update; NaN under
                         `refine_update='none'`.
+    lambda_c_update     (spec/QIJ_A17_stencil_update.md section 8 item 3)
+                        the receptive-field rows' own re-estimated
+                        noise-to-signal ratio, fit once before round 1
+                        and held fixed after; NaN under `refine_update=
+                        'none'`. `lambda_c_stage1` (the frozen stage-1
+                        value, `model.lam`) is a `qij.py`-level product,
+                        not carried through this per-coordinate result.
     """
 
     coordinate: int
@@ -136,6 +143,7 @@ class CoordinateResult:
     failed: bool = False
     busy_delta: float = 0.0
     a_c: float = float('nan')
+    lambda_c_update: float = float('nan')
 
 
 @dataclass
@@ -184,6 +192,12 @@ class RefineState:
                         `core.stencils` before its first update, then
                         kept only for the final `CoordinateResult`
                         product.
+    lambda_c_update     the receptive-field rows' own re-estimated
+                        noise-to-signal ratio (spec section 8 item 3),
+                        set once by `core.stencils` and, like `a_c`,
+                        otherwise only carried through to the final
+                        `CoordinateResult`; NaN under `refine_update=
+                        'none'`.
     """
 
     X: np.ndarray
@@ -223,6 +237,7 @@ class RefineState:
     M_used: int
     busy_delta: float
     a_c: float
+    lambda_c_update: float = float('nan')
 
 
 def _variance(values: np.ndarray) -> float:
@@ -587,6 +602,7 @@ def prepare_coordinate(
     pool=None,
     start: np.ndarray = None,
     model_index: int = None,
+    skip_pricing: bool = False,
 ) -> Union[CoordinateResult, RefineState]:
     """
     One estimand coordinate's initial I-VQ, its full-data measurement,
@@ -601,7 +617,12 @@ def prepare_coordinate(
     `model` as given -- `core.stencils` immediately re-predicts and
     re-proposes every one of them against the updated model (spec
     section 4's 'before round 1' step), so the proposal made here is
-    thrown away there, never read.
+    thrown away there, never read. `skip_pricing=True` (spec section
+    10.1: stage 1 itself is a set-observation model under `refine_
+    update='stencils'`, `model` here is not an `InfluenceModel` at all)
+    skips that disposable pricing outright -- `core.stencils` is the
+    only caller that passes it, and passes `model=None` alongside it,
+    since neither is read anywhere else under `price=False` splits.
     """
     if model_index is None:
         model_index = coordinate
@@ -651,10 +672,11 @@ def prepare_coordinate(
         B_hat=B_hat, a_bca=a_bca, M_used=bins0.M_used, busy_delta=busy_delta,
         a_c=float('nan'),
     )
-    batch_v(list(leaves.values()), model, Z, model_index, sigma_c)
-    rho2 = compute_rho2(state.V_btw, state.sum_pubar2, N)
-    for leaf in leaves.values():
-        propose(leaf, rho2, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N)
+    if not skip_pricing:
+        batch_v(list(leaves.values()), model, Z, model_index, sigma_c)
+        rho2 = compute_rho2(state.V_btw, state.sum_pubar2, N)
+        for leaf in leaves.values():
+            propose(leaf, rho2, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N)
     return state
 
 
@@ -709,6 +731,7 @@ def finalize_coordinate(state: RefineState) -> CoordinateResult:
         B_hat=state.B_hat, a_bca=state.a_bca,
         M_X=state.M_X_used, M_used=state.M_used, n_refine_evals=state.n_refine_evals,
         bin_U=U_arr, busy_delta=state.busy_delta, a_c=state.a_c,
+        lambda_c_update=state.lambda_c_update,
     )
 
 

@@ -162,8 +162,9 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     per stage and per output, plus `ivqbins`, `survey`, `quantized_start`,
     `refine_schedule`/`n_rounds` (the marginal path's own schedule,
     spec/QIJ_mods_waves.md A14), `refine_update`/`n_update_rounds`/
-    `update_wall_time` and its own `a_c_<o>` product
-    (spec/QIJ_A17_stencil_update.md), `eta_full` (A15), the ABC
+    `update_wall_time`/`ridge_step_max`/`first_formation_wall_time` and
+    its own `a_c_<o>`/`lambda_c_stage1_<o>`/`lambda_c_update_<o>`
+    products (spec/QIJ_A17_stencil_update.md section 10), `eta_full` (A15), the ABC
     interval's ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`,
     `eta_Q`, spec/QIJ_mods_waves.md A10) and the joint scalars from the
     joint second stage (spec/method_notes.md section 6) -- the joint
@@ -181,6 +182,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
            'refine_schedule': res.refine_schedule, 'n_rounds': int(res.n_rounds),
            'refine_update': res.refine_update, 'n_update_rounds': int(res.n_update_rounds),
            'update_wall_time': float(res.update_wall_time),
+           'ridge_step_max': int(res.ridge_step_max),
+           'first_formation_wall_time': float(res.first_formation_wall_time),
            'beta_star': res.beta_star, 'cold_ll': res.cold_ll,
            'search_gap': res.search_gap, 'search_failed': bool(res.search_failed)}
     for stage in ('prototype', 'full_data', 'refinement', 'curvature', 'eta_full', 'total'):
@@ -221,6 +224,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'c_q_{o}'] = float(res.c_q[j])
         row[f'c_q_one_sided_{o}'] = bool(res.c_q_one_sided[j])
         row[f'a_c_{o}'] = float(res.a_c[j])
+        row[f'lambda_c_stage1_{o}'] = float(res.lambda_c_stage1[j])
+        row[f'lambda_c_update_{o}'] = float(res.lambda_c_update[j])
     return row
 
 

@@ -126,6 +126,10 @@ class QIJResult:
     n_update_rounds: int           # rounds the model was refit under 'stencils'; 0 under 'none'
     update_wall_time: float        # wall time of every refit/re-prediction under 'stencils'; 0.0 under 'none'
     a_c: np.ndarray                # (q,) the stencil update's fitted scale factor; NaN under 'none'
+    lambda_c_stage1: np.ndarray    # (q,) stage 1's own REML lam_c, whichever stage-1 fit ran
+    lambda_c_update: np.ndarray    # (q,) the section 10.1 'one full refit' lam_c; NaN under 'none'
+    ridge_step_max: int            # worst Cholesky ridge-ladder step (0-3) used under 'stencils'; 0 under 'none'
+    first_formation_wall_time: float  # wall time of the one full refit's own K.A formation + search; 0.0 under 'none'
     beta_star: float               # A16 item 6, from theta_hat's own T.last_fit_info
     cold_ll: float                 # A16 item 6, theta_hat's own final penalized log-likelihood
     search_gap: float              # A16.7's search audit

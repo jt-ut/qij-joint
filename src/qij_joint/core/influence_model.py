@@ -1074,21 +1074,26 @@ def bin_posterior_variance(
     return out
 
 
-# --- A17: measured sets as exact observations (spec/QIJ_A17_stencil_update.md
-# sections 3 and 8). Every row of the augmented design -- a prototype's own
-# receptive field, or an output's own current leaf -- is a SET (a point-index
-# array): a stencil, or the prototype survey itself, is an observation of the
-# mean of psi_c over that set's own points (section 8 item 2: the survey
-# rows are set observations too, not point observations). The whole design
-# is REBUILT each update from the CURRENT sets only (section 8 item 1a):
-# when a leaf is split, its row leaves the design and its two children's
-# take its place, so no linearly-dependent parent-and-children rows ever
-# coexist. `core.stencils` owns the round schedule and every output's own
-# noise/response bookkeeping; this section owns the shared kernel geometry
-# (per coordinate group, section 8 item 4) and the per-coordinate posterior.
+# --- A17: the stencils update the influence model, and stage 1 itself is a
+# set-observation model under 'stencils' (spec/QIJ_A17_stencil_update.md
+# section 10, final; supersedes sections 3, 8 and 9 where they differ).
+# Every row of the design -- a prototype's own receptive field, or an
+# output's own current leaf -- is a SET (a point-index array): a stencil, or
+# the prototype survey itself, is an observation of the mean of psi_c over
+# that set's own points, never a value at a point. `fit_rows_model` is stage
+# 1's own fit under 'stencils' (section 10.1); `core.stencils` owns the round
+# schedule, the "one full refit" after a_c, and every output's own
+# noise/response bookkeeping. Two exact linear dependences are removed
+# structurally, before any solve, rather than cut by rank afterward (section
+# 10.2): a split's parent row is replaced by its children's rows
+# (`core.stencils`'s own concern); and, since every partition of the N
+# points implies the same global-mean functional, the row of the LARGEST
+# set is dropped from each partition (the receptive-field partition, here;
+# each output's own leaf partition, `core.stencils`'s). The posterior solve
+# is Cholesky with the ridge ladder `fit_influence_model` already uses,
+# never an eigendecomposition-based rank cut.
 
 _SET_CHUNK = 2048  # row chunk for one set's own kernel-to-N-points column (E4)
-_EIGH_REL_CUTOFF = 1e-10  # section 8 item 1c: relative to the largest eigenvalue
 
 
 def _set_kernel_column(
@@ -1140,206 +1145,444 @@ def assemble_K_ss(Kx: np.ndarray, all_idx: Sequence[np.ndarray]) -> np.ndarray:
     return 0.5 * (K_ss + K_ss.T)
 
 
-def build_design(
-    Zw: np.ndarray, all_idx: Sequence[np.ndarray], gpwidth: str, ell_or_c: float,
-    h_full: Optional[np.ndarray], bmu: Optional[np.ndarray], d_z: int, m_g: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    The augmented design's shared (coordinate-independent) geometry over
-    `all_idx` (one point-index array per row), rebuilt from scratch
-    every time this is called -- no set's own column is assumed cached
-    from a previous call. `core.stencils`'s own production path caches
-    a receptive field's column per group (formed once, at the first
-    update) and a leaf's column per (group, leaf) (formed when the leaf
-    is created, dropped when it is split, spec section 9 item 2); this
-    function is the uncached reference the caching is checked against.
-    Returns (Kx, H_all, K_ss): Kx (N, n) = k(x_i, S) for every draw
-    point and every row (also the per-point kernel-to-design block at
-    re-prediction, no second computation); H_all (n, m_g) = h(S); K_ss
-    from `assemble_K_ss`.
-    """
+def _cholesky_ridge_step(A: np.ndarray, K: np.ndarray, M_used: int):
+    """`_cholesky_with_jitter`, plus which ladder position it used (0-3),
+    for the products spec section 10.2/10.3 ask for: `_cholesky_with_
+    jitter` itself is untouched (still exactly what `fit_influence_
+    model`'s own final solve calls), so the ladder step is read back
+    from its own returned jitter value against the same base it would
+    have computed, rather than changed to return one itself."""
+    chol, jit = _cholesky_with_jitter(A, K, M_used)
+    base = 1e-10 * float(np.trace(K)) / M_used
+    if jit == 0.0:
+        step = 0
+    elif jit == base:
+        step = 1
+    elif jit == base * 10.0:
+        step = 2
+    else:
+        step = 3
+    return chol, step
+
+
+def _rows_kernel_matrix(
+    Zw: np.ndarray, all_idx: Sequence[np.ndarray], gpwidth: str, param: float,
+    h_full: Optional[np.ndarray], bmu: Optional[np.ndarray], d_z: int,
+) -> np.ndarray:
+    """K(S, S') for every row in `all_idx` at kernel parameter `param`
+    (spec section 10.1): the K.A construction (`_set_kernel_column`
+    against every one of the N draw points, `assemble_K_ss` to read the
+    row-against-row values back), formed FRESH -- the hyperparameter
+    search calls this once per candidate, since the covariance itself
+    depends on the width/c being searched over."""
     Kx = np.stack(
-        [_set_kernel_column(Zw, idx, gpwidth, ell_or_c, h_full, bmu, d_z) for idx in all_idx],
+        [_set_kernel_column(Zw, idx, gpwidth, param, h_full, bmu, d_z) for idx in all_idx],
         axis=1,
     )
-    H_all = np.stack([_set_basis_row(Zw, idx, m_g) for idx in all_idx], axis=0)
-    K_ss = assemble_K_ss(Kx, all_idx)
-    return Kx, H_all, K_ss
+    return assemble_K_ss(Kx, all_idx)
 
 
-def _eigh_pinv(A: np.ndarray, rel_cutoff: float = _EIGH_REL_CUTOFF) -> Tuple[np.ndarray, np.ndarray]:
+def _rows_grid_candidate(
+    log_param: float, gpwidth: str, Zw: np.ndarray, all_idx: Sequence[np.ndarray],
+    h_full: Optional[np.ndarray], bmu: Optional[np.ndarray], d_z: int,
+    W_g: np.ndarray, tau_g: float, M_minus_m: int, cols_g: Sequence[int],
+    psi_proj: Dict[int, np.ndarray], n_c2_g: Dict[int, float],
+) -> Tuple[dict, float]:
+    """One width/c-grid candidate's outer objective over the ROW
+    covariance (spec section 10.1): mirrors `_width_grid_candidate`
+    exactly from the kernel onward (same QR-projected eigh, same
+    per-coordinate profiled-lam REML, same `_lambda_floor`), differing
+    only in how K is formed (`_rows_kernel_matrix` in place of a direct
+    point kernel). Run serially here (`fit_rows_model` does not batch
+    this on a pool) -- 10.6: not answered by the document; the ported
+    SEARCH SHAPE stands, its pool batching does not, and is noted here
+    rather than built."""
+    t0 = time.perf_counter()
+    param = math.exp(log_param)
+    K = _rows_kernel_matrix(Zw, all_idx, gpwidth, param, h_full, bmu, d_z)
+
+    C = W_g.T @ K
+    E = C @ W_g
+    E[np.diag_indices_from(E)] += tau_g
+    WC = W_g @ C
+    A = K - WC - WC.T + W_g @ (E @ W_g.T)
+    Lambda, V = np.linalg.eigh(A)
+    Lambda = np.maximum(Lambda[:M_minus_m], 0.0)
+    V = V[:, :M_minus_m]
+
+    per_c: Dict[int, dict] = {}
+    total_nll = 0.0
+    for c in cols_g:
+        z = V.T @ psi_proj[c]
+
+        def inner(log_lam: float, _z=z, _Lambda=Lambda) -> float:
+            denom = _Lambda + math.exp(log_lam)
+            s2_val = np.sum(_z ** 2 / denom) / M_minus_m
+            s2_val = max(s2_val, 1e-300)
+            return (M_minus_m / 2.0) * math.log(s2_val) + 0.5 * np.sum(np.log(denom))
+
+        lam_floor_c = _lambda_floor(z, Lambda, M_minus_m, n_c2_g[c])
+        lo_bound = max(math.log(lam_floor_c), _LOG_LAM_LO)
+        if lo_bound >= _LOG_LAM_HI:
+            log_lam_star = _LOG_LAM_HI
+            nll_c = inner(log_lam_star)
+        else:
+            ir = minimize_scalar(inner, bounds=(lo_bound, _LOG_LAM_HI), method='bounded')
+            log_lam_star = float(ir.x)
+            nll_c = float(ir.fun)
+        per_c[c] = dict(log_lam=log_lam_star, nll=nll_c, lam_floor=lam_floor_c)
+        total_nll += nll_c
+
+    entry = dict(log_param=log_param, param=param, K=K, per_c=per_c, nll=total_nll)
+    return entry, time.perf_counter() - t0
+
+
+def _rows_group_fit(
+    Zw: np.ndarray, gpwidth: str, h_full: Optional[np.ndarray], bmu: Optional[np.ndarray],
+    d_z: int, all_idx: Sequence[np.ndarray], Hb_g: np.ndarray, m_g: int, cols_g: Sequence[int],
+    response: Dict[int, np.ndarray], param_min: float, param_max: float,
+    n_c2_g: Dict[int, float],
+) -> Tuple[dict, dict]:
     """
-    The Moore-Penrose-style pseudo-inverse spectrum of a symmetric `A`
-    (spec section 8 item 1c): an eigendecomposition A = V diag(w) V^T,
-    every eigenvalue at or below `rel_cutoff` of the largest one DROPPED
-    (its own inverse-weight set to 0), never floored or jittered like
-    `_cholesky_with_jitter`'s escalation. Returns (V, w_inv); a caller
-    forms A^-1 @ x as `V @ (w_inv * (V.T @ x))`, batched over x's
-    trailing columns when x is 2-D.
+    One group's full hyperparameter search and final per-coordinate
+    solve over its own ROW design (spec section 10.1): the 5-point
+    log-spaced grid plus one bounded refinement `fit_influence_model`'s
+    own width search uses (`_rows_grid_candidate`), then, at the chosen
+    width/c, each coordinate's own lam_c (from the search) and a
+    Cholesky-with-ridge-ladder final solve (section 10.2 -- no eigh,
+    no rank cut; `noise[c]` on each row is strictly positive by
+    construction, the caller's job). Returns (per_coordinate dict,
+    shared dict with `param`, `K` and the group's own `formation_wall_
+    time` -- the search's own total wall time, section 10.3).
     """
-    w, V = np.linalg.eigh(A)
-    cutoff = rel_cutoff * float(w.max()) if w.size else 0.0
-    keep = w > cutoff
-    w_inv = np.where(keep, np.divide(1.0, w, out=np.ones_like(w), where=keep), 0.0)
-    return V, w_inv
+    n_g = len(all_idx)
+    M_minus_m = n_g - m_g
+
+    Qfull, _R = np.linalg.qr(Hb_g, mode='complete')
+    Q = Qfull[:, m_g:]
+    W_g = Qfull[:, :m_g]
+    tau_g = 2.0 * float(n_g)
+    psi_proj = {c: Q @ (Q.T @ response[c]) for c in cols_g}
+
+    grid_log_param = np.linspace(math.log(param_min), math.log(param_max), _N_WIDTH_GRID)
+    t_formation = 0.0
+    trace = []
+    for lp in grid_log_param:
+        entry, wall = _rows_grid_candidate(
+            float(lp), gpwidth, Zw, all_idx, h_full, bmu, d_z, W_g, tau_g, M_minus_m,
+            cols_g, psi_proj, n_c2_g)
+        trace.append(entry)
+        t_formation += wall
+
+    grid_nlls = [t['nll'] for t in trace]
+    best_idx = int(np.argmin(grid_nlls))
+    if best_idx == _N_WIDTH_GRID - 1:
+        lo = hi = None
+    elif best_idx == 0:
+        lo, hi = grid_log_param[0], grid_log_param[1]
+    else:
+        lo, hi = grid_log_param[best_idx - 1], grid_log_param[best_idx + 1]
+    if lo is not None and hi > lo:
+        def outer_obj(log_param: float) -> float:
+            entry, wall = _rows_grid_candidate(
+                log_param, gpwidth, Zw, all_idx, h_full, bmu, d_z, W_g, tau_g, M_minus_m,
+                cols_g, psi_proj, n_c2_g)
+            trace.append(entry)
+            nonlocal_wall[0] += wall
+            return entry['nll']
+        nonlocal_wall = [0.0]
+        minimize_scalar(outer_obj, bounds=(float(lo), float(hi)), method='bounded')
+        t_formation += nonlocal_wall[0]
+
+    best = min(trace, key=lambda t: t['nll'])
+    param_val = best['param']
+    K = best['K']
+
+    per_coord = {}
+    for c in cols_g:
+        lam_c = math.exp(best['per_c'][c]['log_lam'])
+        noise = np.full(n_g, lam_c, dtype=float)
+        A = K + np.diag(noise)
+        chol, ridge_step = _cholesky_ridge_step(A, K, n_g)
+        AinvHb = cho_solve(chol, Hb_g)
+        G = Hb_g.T @ AinvHb
+        G_chol = cho_factor(G, lower=True)
+        resp_c = response[c]
+        Ainv_resp = cho_solve(chol, resp_c)
+        u_vec = Hb_g.T @ Ainv_resp
+        beta_c = cho_solve(G_chol, u_vec)
+        alpha_c = Ainv_resp - AinvHb @ beta_c
+        resid_quad = float(resp_c @ Ainv_resp - u_vec @ beta_c)
+        s2_c = max(resid_quad, 0.0) / M_minus_m
+        per_coord[c] = dict(alpha=alpha_c, beta=beta_c, chol=chol, g_chol=G_chol,
+                             ainv_hb=AinvHb, s2=s2_c, lam=lam_c, ridge_step=ridge_step)
+
+    shared = dict(param=param_val, K=K, formation_wall_time=t_formation, all_idx=list(all_idx),
+                  Hb=Hb_g, m=m_g)
+    return per_coord, shared
 
 
-def _apply_pinv(V: np.ndarray, w_inv: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """V @ diag(w_inv) @ V.T @ x, x a vector or a matrix of columns."""
-    if x.ndim == 1:
-        return V @ (w_inv * (V.T @ x))
-    return V @ (w_inv[:, None] * (V.T @ x))
-
-
-def fit_lambda_c(
-    K_ss: np.ndarray, H_all: np.ndarray, M_proto: int, leaf_noise_ratio: np.ndarray,
-    s2_c: float, response: np.ndarray, lam_lo: float = 1e-10, lam_hi: float = 1e2,
-    n_grid: int = _N_WIDTH_GRID,
-) -> float:
+def fit_rows_model(
+    Z: np.ndarray, xvq, I_proto: np.ndarray, theta_Q: np.ndarray, eta: float,
+    gptrend: str = 'affine', gpwidth: str = 'global',
+    extra_idx: Optional[Sequence[np.ndarray]] = None,
+    extra_response: Optional[np.ndarray] = None,
+    extra_noise_ratio: Optional[np.ndarray] = None,
+) -> Tuple[dict, dict, dict, dict]:
     """
-    One-dimensional REML search for lam_c, the receptive-field rows'
-    own noise-to-signal ratio (spec section 8 item 3): the leaf rows'
-    noise stays at their own declared ratio (`leaf_noise_ratio`, fixed),
-    the width and s2_c stay at their stage-1 values (`s2_c` fixed, not
-    profiled here -- unlike the stage-1 width search, which profiles
-    s2 given lam). A log-spaced grid of `n_grid` candidates and one
-    bounded refinement between the best grid point's neighbours, the
-    outer shape `fit_influence_model`'s own width search uses. The
-    inner linear algebra of the search itself uses the same truncated
-    pseudo-inverse as the final solve (`_eigh_pinv`), for one consistent
-    notion of the design's own rank at every candidate.
+    The set-observation influence model, from its first fit (spec
+    section 10.1): every row is a receptive field (its own member
+    points, never the prototype's position), or -- when `extra_idx` is
+    given (the 'one full refit' after a_c, called from `core.stencils`)
+    -- also an output's own current leaf, its declared noise-to-signal
+    ratio `extra_noise_ratio`'s own column (already floored, already
+    positive: section 10.2's own rule is the caller's to keep). Section
+    10.2b's structural redundancy removal (the largest receptive field
+    row dropped from each group) happens here, once, before any solve;
+    a caller drops each output's own largest leaf row from `extra_idx`
+    itself before calling.
+
+    Grouping mirrors `fit_influence_model`'s own (coordinates sharing
+    an identical finite `I_proto` pattern -- spec/QIJ_A17_stencil_
+    update.md section 9 item 1's per-output missing-row rule, not
+    superseded by section 10); a coordinate whose own spread over its
+    finite receptive fields is degenerate is `constant_path`, exactly
+    the stage-1 rule (method_notes section 3), ported since section 10
+    does not address it (10.6).
+
+    Returns (per_coordinate, shared_by_group, constant, aux):
+    per_coordinate[c] is `_rows_group_fit`'s own per-coordinate dict;
+    shared_by_group[gi] is its own shared dict, plus `cols` (the
+    group's own coordinates) and `ids_reduced` (the group's own live
+    receptive-field ids, post section 10.2b's drop); constant[c] is
+    (is_constant, const_value); aux carries `whitening`, `h_full`,
+    `bmu_full`, `d_z` and `proto_idx` (id -> point-index array, every
+    live receptive field, pre section 10.2b) for a caller building
+    `Zw`/further rows (`core.stencils`'s own 'one full refit' and every
+    later round) without re-deriving them.
     """
-    n = K_ss.shape[0]
+    p = np.asarray(xvq.p, dtype=float)
+    I_proto = np.asarray(I_proto, dtype=float)
+    theta_Q = np.asarray(theta_Q, dtype=float)
+    M_X_used, q = I_proto.shape
+    raw_centers = np.asarray(xvq.centers, dtype=float)
+    d_z = raw_centers.shape[1]
 
-    def nll(log_lam: float) -> float:
-        lam = math.exp(log_lam)
-        noise = np.concatenate([np.full(M_proto, lam), leaf_noise_ratio])
-        A = K_ss + np.diag(noise)
-        V, w_inv = _eigh_pinv(A)
-        AinvHb = _apply_pinv(V, w_inv, H_all)
-        G = H_all.T @ AinvHb
-        GV, Gw_inv = _eigh_pinv(G)
-        Ainv_y = _apply_pinv(V, w_inv, response)
-        u_vec = H_all.T @ Ainv_y
-        beta = _apply_pinv(GV, Gw_inv, u_vec)
-        resid_quad = float(response @ Ainv_y - u_vec @ beta)
-        log_det_A = float(np.sum(np.log(1.0 / w_inv[w_inv > 0])))
-        log_det_G = float(np.sum(np.log(1.0 / Gw_inv[Gw_inv > 0])))
-        return 0.5 * log_det_A + 0.5 * log_det_G + 0.5 * resid_quad / s2_c
+    mean, transform = _whitening_from(Z)
+    centers_full = (raw_centers - mean) @ transform.T
+    Za = np.asarray(Z, dtype=float)
+    if Za.ndim == 1:
+        Za = Za.reshape(-1, 1)
+    Zw = (Za - mean) @ transform.T
 
-    grid = np.linspace(math.log(lam_lo), math.log(lam_hi), n_grid)
-    vals = [nll(float(g)) for g in grid]
-    best = int(np.argmin(vals))
-    best_val = vals[best]
-    best_log_lam = float(grid[best])
-    if 0 < best < n_grid - 1:
-        lo, hi = float(grid[best - 1]), float(grid[best + 1])
-        result = minimize_scalar(nll, bounds=(lo, hi), method='bounded')
-        if result.fun < best_val:
-            best_val, best_log_lam = float(result.fun), float(result.x)
+    if gpwidth == 'local':
+        D_proto_full = cdist(centers_full, centers_full)
+        h_full = _conn_spacing(xvq.conn, D_proto_full)
+        bmu_full = np.asarray(xvq.bmu, dtype=np.intp)
+    else:
+        h_full = np.full(M_X_used, np.nan, dtype=float)
+        bmu_full = None
 
-    return math.exp(best_log_lam)
+    proto_idx: Dict[int, np.ndarray] = {j: np.where(np.asarray(xvq.bmu) == j)[0] for j in range(M_X_used)}
+
+    finite = np.isfinite(I_proto)
+    constant: Dict[int, Tuple[bool, float]] = {}
+    groups: Dict[tuple, List[int]] = {}
+    for c in range(q):
+        idx_c = np.where(finite[:, c])[0]
+        M_c = idx_c.size
+        if M_c == 0:
+            constant[c] = (True, 0.0)
+            continue
+        p_c = p[idx_c]
+        mass_c = float(p_c.sum())
+        psi_bar = float(np.sum(p_c * I_proto[idx_c, c]) / mass_c) if mass_c > 0.0 else 0.0
+        coord_constant = M_c < 3
+        if not coord_constant:
+            p_c_norm = p_c / mass_c
+            spread = float(np.sqrt(np.sum(p_c_norm * (I_proto[idx_c, c] - psi_bar) ** 2)))
+            coord_constant = spread <= 1e-10 * max(abs(float(theta_Q[c])), 1e-300)
+        if coord_constant:
+            constant[c] = (True, psi_bar)
+        else:
+            constant[c] = (False, 0.0)
+            groups.setdefault(tuple(idx_c.tolist()), []).append(c)
+
+    m_full = (d_z + 1) if gptrend == 'affine' else (1 + d_z + d_z * (d_z + 1) // 2)
+    delta_f = forward_step(eta)
+
+    per_coordinate: Dict[int, dict] = {}
+    shared_by_group: Dict[int, dict] = {}
+    for gi, (idx_key, cols_g) in enumerate(groups.items()):
+        idx_g = list(idx_key)
+        # Section 10.2b: the group's own largest receptive field row is
+        # structurally redundant (its partition's mass-weighted mean is
+        # the same global-mean functional every partition implies) and
+        # is dropped before any solve; an empty one (no data point has
+        # that BMU) was never a row to begin with (ruling 9.1).
+        idx_g = [j for j in idx_g if proto_idx[j].size > 0]
+        if idx_g:
+            drop_j = max(idx_g, key=lambda j: p[j])
+            idx_g = [j for j in idx_g if j != drop_j]
+        all_idx = [proto_idx[j] for j in idx_g] + list(extra_idx or [])
+        n_g = len(all_idx)
+        m_g = 1 if n_g <= m_full + 1 else m_full
+        Hb_g = np.stack([_set_basis_row(Zw, idx, m_g) for idx in all_idx], axis=0)
+
+        response = {}
+        for c in cols_g:
+            proto_resp = np.array([I_proto[j, c] for j in idx_g])
+            if extra_idx:
+                extra_resp_c = np.asarray(extra_response)[:, c]
+                response[c] = np.concatenate([proto_resp, extra_resp_c])
+            else:
+                response[c] = proto_resp
+
+        centers_g = centers_full[idx_g]
+        conn_g = xvq.conn[idx_g, :][:, idx_g]
+        D_full_g = cdist(centers_g, centers_g)
+        ell_min, ell_max = _length_scale_bounds(conn_g, D_full_g)
+        if gpwidth == 'global':
+            param_min, param_max = ell_min, ell_max
+        else:
+            h_design_g = h_full[idx_g]
+            param_min = ell_min / float(np.median(h_design_g))
+            param_max = ell_max / float(np.min(h_design_g))
+
+        p_g = p[idx_g]
+        t_g = delta_f * p_g / (1.0 - p_g)
+        inv_t2_median_g = float(np.median(1.0 / t_g ** 2))
+        n_c2_g = {c: 2.0 * eta ** 2 * float(theta_Q[c]) ** 2 * inv_t2_median_g for c in cols_g}
+
+        pc, shared = _rows_group_fit(
+            Zw, gpwidth, h_full, bmu_full, d_z, all_idx, Hb_g, m_g, cols_g, response,
+            param_min, param_max, n_c2_g,
+        )
+        shared['cols'] = list(cols_g)
+        shared['ids_reduced'] = idx_g
+        for c in cols_g:
+            per_coordinate[c] = pc[c]
+        shared_by_group[gi] = shared
+
+    aux = dict(whitening=(mean, transform), h_full=h_full, bmu_full=bmu_full, d_z=d_z,
+               proto_idx=proto_idx)
+    return per_coordinate, shared_by_group, constant, aux
 
 
-def augmented_solve(K_ss: np.ndarray, H_all: np.ndarray, noise: np.ndarray, response: np.ndarray) -> dict:
+def rows_solve(
+    Kx: np.ndarray, all_idx: Sequence[np.ndarray], Hb: np.ndarray, n_proto: int, m_g: int,
+    cols_g: Sequence[int], response: Dict[int, np.ndarray], lam_by_c: Dict[int, float],
+    leaf_noise_ratio_by_c: Dict[int, np.ndarray],
+) -> dict:
     """
-    One coordinate's posterior over the augmented design (spec section
-    8 item 1c): A = K_ss + diag(noise) (noise the row-and-coordinate
-    own noise-to-signal ratio -- lam_c on a receptive-field row,
-    the declared stencil ratio on a leaf row); inverted by the
-    truncated-eigendecomposition pseudo-inverse (`_eigh_pinv`), never a
-    bare Cholesky. alpha/beta solved the same way `fit_influence_
-    model`'s own per-coordinate solve does, over the augmented H_all
-    and response. Returns the pieces `augmented_point_terms`/
-    `augmented_bin_posterior_variance` need to act on new points/groups
-    without re-solving.
+    Re-solve every coordinate in `cols_g` at a FIXED width/c (already
+    baked into the given `Kx`, spec section 10.1: the hyperparameter
+    search runs once, after a_c) and FIXED lam_c (`lam_by_c`), over the
+    CURRENT `all_idx`/`Kx`/`Hb` -- a caller (`core.stencils`) forms
+    these from its own cached per-row columns (section 10.3: a
+    receptive field's column is a per-draw invariant, formed once and
+    reused; a leaf's is formed at its creation and dropped at its
+    split), so no kernel evaluation happens here, only the assembly
+    (`assemble_K_ss`) and the final solve. `all_idx`'s first `n_proto`
+    rows are the group's own live receptive fields (lam_c on their
+    diagonal); the rest are leaves (`leaf_noise_ratio_by_c[c]`'s own
+    declared ratio, already floored positive by the caller, section
+    10.2). No eigh, no rank cut -- Cholesky with the ridge ladder
+    (`_cholesky_ridge_step`), exactly `_rows_group_fit`'s own final
+    solve.
     """
-    V, w_inv = _eigh_pinv(K_ss + np.diag(noise))
-    AinvHb = _apply_pinv(V, w_inv, H_all)
-    G = H_all.T @ AinvHb
-    GV, Gw_inv = _eigh_pinv(G)
+    K = assemble_K_ss(Kx, all_idx)
+    n = len(all_idx)
+    M_minus_m = n - m_g
 
-    Ainv_y = _apply_pinv(V, w_inv, response)
-    u_vec = H_all.T @ Ainv_y
-    beta = _apply_pinv(GV, Gw_inv, u_vec)
-    alpha = Ainv_y - AinvHb @ beta
+    per_coord = {}
+    for c in cols_g:
+        noise = np.concatenate([np.full(n_proto, lam_by_c[c]), leaf_noise_ratio_by_c[c]])
+        A = K + np.diag(noise)
+        chol, ridge_step = _cholesky_ridge_step(A, K, n)
+        AinvHb = cho_solve(chol, Hb)
+        G = Hb.T @ AinvHb
+        G_chol = cho_factor(G, lower=True)
+        resp_c = response[c]
+        Ainv_resp = cho_solve(chol, resp_c)
+        u_vec = Hb.T @ Ainv_resp
+        beta_c = cho_solve(G_chol, u_vec)
+        alpha_c = Ainv_resp - AinvHb @ beta_c
+        resid_quad = float(resp_c @ Ainv_resp - u_vec @ beta_c)
+        s2_c = max(resid_quad, 0.0) / M_minus_m if M_minus_m > 0 else 0.0
+        per_coord[c] = dict(alpha=alpha_c, beta=beta_c, chol=chol, g_chol=G_chol,
+                             ainv_hb=AinvHb, s2=s2_c, lam=lam_by_c[c], ridge_step=ridge_step)
 
-    return dict(alpha=alpha, beta=beta, V=V, w_inv=w_inv, AinvHb=AinvHb, GV=GV, Gw_inv=Gw_inv)
+    return per_coord
 
 
-def augmented_point_terms(
-    model: InfluenceModel, group_cols: Sequence[int], coord_state: Dict[int, dict],
-    Kx: np.ndarray, Zw: np.ndarray, m_g: int,
+def rows_point_terms(
+    per_coordinate: Dict[int, dict], cols_g: Sequence[int], Kx: np.ndarray, Zw: np.ndarray,
+    m_g: int,
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, np.ndarray]]:
     """
     psi0 and sigma at every one of the N draw points `Zw`, for every
-    coordinate in `group_cols`, from each coordinate's own augmented
-    posterior (`coord_state[c]`, `augmented_solve`'s own dict), chunked
-    over N exactly as `_point_terms` -- `Kx` (already covering every
-    row of the design against every one of the N points, `build_
-    design`'s own return) supplies the per-chunk kernel block directly,
-    no separate prototype/set split. Unlike `_point_terms`, the noise
-    is not a uniform scalar shift across the whole design (a receptive
-    field's own lam_c differs from a leaf's own declared ratio), so
-    there is no group-shared eigendecomposition to reuse across
-    coordinates here; each coordinate's own pseudo-inverse spectrum
-    (`_apply_pinv`) is used directly. Returns (psi0, sigma, R) dicts
-    keyed by coordinate, R the (N, m_g) affine-mean residual
-    `augmented_bin_posterior_variance` needs.
+    coordinate in `cols_g`, from each coordinate's own solve
+    (`per_coordinate[c]`) and the ALREADY-FORMED `Kx` (N, n): a caller
+    (`core.stencils`) forms `Kx` from its own cached per-row columns
+    (spec section 10.3 -- a receptive field's column is a per-draw
+    invariant, a leaf's is formed at its creation and dropped at its
+    split), so no kernel evaluation happens here. Standard posterior
+    mean/variance from a Cholesky solve, never eigh (section 10.2).
+    Returns (psi0, sigma, R) dicts keyed by coordinate, R the (N, m_g)
+    affine-mean residual `rows_bin_posterior_variance` needs.
     """
     N = Zw.shape[0]
-    psi0_out = {c: np.empty(N, dtype=float) for c in group_cols}
-    sigma_out = {c: np.zeros(N, dtype=float) for c in group_cols}
-    R_out = {c: np.empty((N, m_g), dtype=float) for c in group_cols}
+
+    psi0_out = {c: np.empty(N, dtype=float) for c in cols_g}
+    sigma_out = {c: np.zeros(N, dtype=float) for c in cols_g}
+    R_out = {c: np.empty((N, m_g), dtype=float) for c in cols_g}
 
     batch = _UNCERTAINTY_BATCH_CAP
     for start in range(0, N, batch):
         sl = slice(start, start + batch)
         Hc = _basis(Zw[sl], m_g)
         Kc = Kx[sl]
-
-        for c in group_cols:
-            st = coord_state[c]
+        for c in cols_g:
+            st = per_coordinate[c]
             psi0_out[c][sl] = Hc @ st['beta'] + Kc @ st['alpha']
-            AinvK = _apply_pinv(st['V'], st['w_inv'], Kc.T)
+            AinvK = cho_solve(st['chol'], Kc.T)
             term1 = np.einsum('ij,ji->i', Kc, AinvK)
-            Rc = Hc - Kc @ st['AinvHb']
+            Rc = Hc - Kc @ st['ainv_hb']
             R_out[c][sl] = Rc
-            GinvR = _apply_pinv(st['GV'], st['Gw_inv'], Rc.T)
-            term2 = np.einsum('ij,ji->i', Rc, GinvR)
-            sigma2 = float(model.s2[c]) * (1.0 - term1 + term2)
+            GinvRcT = cho_solve(st['g_chol'], Rc.T)
+            term2 = np.einsum('ij,ji->i', Rc, GinvRcT)
+            sigma2 = st['s2'] * (1.0 - term1 + term2)
             sigma2 = np.maximum(sigma2, 0.0)
             sigma_out[c][sl] = np.sqrt(sigma2)
 
     return psi0_out, sigma_out, R_out
 
 
-def augmented_bin_posterior_variance(
-    model: InfluenceModel, coordinate: int, st: dict, groups: Sequence[np.ndarray],
+def rows_bin_posterior_variance(
+    per_coordinate: Dict[int, dict], coordinate: int, groups: Sequence[np.ndarray],
     sigma_c: np.ndarray, Zw: np.ndarray, R_full: np.ndarray, Kx: np.ndarray,
-    gpwidth: str, ell_or_c: float, h_full: Optional[np.ndarray], bmu: Optional[np.ndarray],
+    gpwidth: str, param: float, h_full: Optional[np.ndarray], bmu: Optional[np.ndarray],
 ) -> np.ndarray:
     """
-    v_k for coordinate `coordinate`'s augmented posterior, at each group
-    in `groups` (point-index arrays into the N draw points): the same
-    formula `bin_posterior_variance` implements, over the augmented
-    design. SS_k (the bin's own raw point-pair kernel sum) is UNCHANGED
-    by the augmentation -- point-level structure, not a property of the
-    design's rows -- and computed exactly as `bin_posterior_variance`'s
-    own chunked pass; `s_vec` is a row-sum of `Kx` (already covering
-    every row of the design, no new kernel evaluation); `R_vec` is a
-    row-sum of `R_full` (this coordinate's own augmented residuals,
-    from `augmented_point_terms`). Both quadratic forms go through this
-    coordinate's own pseudo-inverse spectrum (`st['V']`/`st['GV']`),
-    not a shared eigendecomposition (`augmented_point_terms`'s own
-    docstring explains why one is not available here).
+    v_k for `coordinate`'s row-observation posterior, at each group in
+    `groups` (point-index arrays into the N draw points): the same
+    formula `bin_posterior_variance` implements. SS_k (the bin's own
+    raw point-pair kernel sum) is a point-level quantity, unaffected by
+    the row representation, and computed exactly as `bin_posterior_
+    variance`'s own chunked pass; `s_vec` is a row-sum of `Kx` (already
+    formed by `rows_point_terms`, no new kernel evaluation); `R_vec` is
+    a row-sum of `R_full`. Both quadratic forms go through this
+    coordinate's own Cholesky solve (`st['chol']`/`st['g_chol']`) --
+    never a shared eigendecomposition or a rank cut (section 10.2).
     """
+    st = per_coordinate[coordinate]
     n_groups = len(groups)
     out = np.zeros(n_groups, dtype=float)
     d_z = Zw.shape[1]
     is_local = gpwidth == 'local'
     one_dim = (d_z == 1) and not is_local
-    s2_c = float(model.s2[coordinate])
+    s2_c = st['s2']
 
     for gi, idx in enumerate(groups):
         idx = np.asarray(idx)
@@ -1349,7 +1592,7 @@ def augmented_bin_posterior_variance(
         Zw_k = Zw[idx]
         mean_diag = float(np.mean(sigma_c[idx] ** 2))
 
-        SS_k = _matern32_self_sum_1d(Zw_k[:, 0], ell_or_c) if one_dim else 0.0
+        SS_k = _matern32_self_sum_1d(Zw_k[:, 0], param) if one_dim else 0.0
         if not one_dim:
             for start in range(0, n_k, _BPV_CHUNK):
                 sl = slice(start, start + _BPV_CHUNK)
@@ -1358,20 +1601,20 @@ def augmented_bin_posterior_variance(
                     sl2 = slice(start2, start2 + _BPV_CHUNK)
                     Dcc = cdist(Zc, Zw_k[sl2])
                     if is_local:
-                        ell_row_bin = ell_or_c * h_full[bmu[idx[sl]]]
-                        ell_row_bin2 = ell_or_c * h_full[bmu[idx[sl2]]]
+                        ell_row_bin = param * h_full[bmu[idx[sl]]]
+                        ell_row_bin2 = param * h_full[bmu[idx[sl2]]]
                         Kcc = _matern32_nonstationary(Dcc, ell_row_bin, ell_row_bin2, d_z)
                     else:
-                        Kcc = _matern32(Dcc, ell_or_c)
+                        Kcc = _matern32(Dcc, param)
                     SS_k += float(Kcc.sum())
 
         s_vec = Kx[idx].sum(axis=0)
         R_vec = R_full[idx].sum(axis=0)
 
-        AinvS = _apply_pinv(st['V'], st['w_inv'], s_vec)
-        quad_A = float(s_vec @ AinvS)
-        GinvR = _apply_pinv(st['GV'], st['Gw_inv'], R_vec)
-        mean_Sigma = (s2_c / (n_k ** 2)) * (SS_k - quad_A + R_vec @ GinvR)
+        Ainv_s = cho_solve(st['chol'], s_vec)
+        quad_A = float(s_vec @ Ainv_s)
+        Ginv_R = cho_solve(st['g_chol'], R_vec)
+        mean_Sigma = (s2_c / (n_k ** 2)) * (SS_k - quad_A + R_vec @ Ginv_R)
         out[gi] = max(mean_diag - mean_Sigma, 0.0)
 
     return out
