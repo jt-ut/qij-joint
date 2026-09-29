@@ -81,14 +81,28 @@ not name it -- amended by the planner's ruling of the same day):
   returns them all, spec A11 -- only the curvature's own evaluation loop
   and the reported `V`/`a`/`b_hat`/`c_q` are restricted to `measured`.
 
-A NaN at either of a point's fits (forward always; backward too when
-`point_curvature`) leaves that point's psi (and, ON, its Δ²T/t^2) NaN for
-the outputs the failing fit returned NaN for; summing into V then NaNs
+A failed forward fit (`point_curvature` off, step 3): an exception
+(`_point_task`'s own boundary) or any NaN across the point's T vector.
+Every failed point is retried once, backward, at the same per-point
+step -t_i (`_retry_backward`): a point whose retry succeeds carries
+the backward first difference for every output; a point whose retry
+also fails is DROPPED -- excluded from `_center_psi`'s centering and
+from `V`, whose divisor shrinks from N to N - n_dropped to match
+(`_center_psi` itself is unchanged, called with the kept points'
+masses renormalized to 1/(N - n_dropped)). `psi` stays NaN at a
+dropped point. `n_retried`/`n_dropped` report the two counts;
+`nan_fraction` is n_dropped/N, the fraction of points lost even after
+the retry.
+
+`point_curvature` ON has no retry: a NaN at either of a point's two
+stencil fits leaves that point's psi (and its Δ²T/t^2) NaN for the
+outputs the failing fit returned NaN for; summing into V then NaNs
 only those outputs (numpy's NaN propagation through the column sum),
 so one point's failure never voids an output it did not touch. A13's
 own words: "A NaN at any point fails the output's V ... the draw's
-other outputs stand." `nan_fraction` is the fraction of perturbed fits
-(forward, and backward when run) that returned NaN.
+other outputs stand." Its `nan_fraction` is the fraction of the 2N
+perturbed fits (forward and backward) that returned NaN; `n_retried`
+and `n_dropped` are always 0 under `point_curvature`.
 """
 from __future__ import annotations
 
@@ -119,11 +133,13 @@ class IJFDResult:
     `outputs_full`'s full T-output width: the comparison against `ij`'s
     own full-width `psi` needs every output, and centering/differencing
     it costs nothing extra at that width, unlike the ABC curvature's own
-    two evaluations per reported output. `psi` (N, q_full) is the
-    forward-difference influence of A13's base draw when
-    `point_curvature` was off, or the central-difference influence when
-    it was on (module docstring) -- never both; `V` is computed from
-    whichever `psi` this is, then restricted to `outputs`."""
+    two evaluations per reported output. `psi` (N, q_full) is A13's base
+    draw's forward-difference influence when `point_curvature` was off
+    (a retried point's own row is the backward difference instead, a
+    dropped point's NaN -- module docstring), or the central-difference
+    influence when it was on -- never a mix of forward/backward/central
+    within one `psi`; `V` is computed from whichever `psi` this is, then
+    restricted to `outputs`."""
 
     outputs: Tuple[str, ...]
     outputs_full: Tuple[str, ...]
@@ -142,7 +158,9 @@ class IJFDResult:
     busy_time_total: float
     workers: int
     step_ratio: np.ndarray         # (10, q); step 5
-    nan_fraction: float            # perturbed fits that returned NaN, over all such fits run
+    n_retried: int                 # off: forward failures retried backward; 0 under point_curvature
+    n_dropped: int                 # off: retried points whose backward fit also failed; 0 under point_curvature
+    nan_fraction: float            # off: n_dropped/N; point_curvature ON: NaN share of the 2N perturbed fits
     psi: np.ndarray                # (N, q_full); see the class docstring
 
     @property
@@ -201,7 +219,8 @@ def _failed_result(outputs: Tuple[str, ...], outputs_full: Tuple[str, ...], N: i
         a=np.full(q, np.nan), b_hat=np.full(q, np.nan), c_q=np.full(q, np.nan),
         eta_full=float('nan'), evals_by_stage=evals, rows_by_stage=rows_by,
         wall_time_total=wall, busy_time_total=wall, workers=workers,
-        step_ratio=np.full((_N_CHECK_POINTS, q), np.nan), nan_fraction=1.0,
+        step_ratio=np.full((_N_CHECK_POINTS, q), np.nan),
+        n_retried=0, n_dropped=0, nan_fraction=1.0,
         psi=np.full((N, q_full), np.nan),
     )
 
@@ -242,6 +261,45 @@ def _perturbed_fits(counter: Counter, X: np.ndarray, omega0: np.ndarray, p: np.n
             n_failed += int(failed)
             busy += wall
     return T_signed, t_of, n_failed, busy
+
+
+def _retry_backward(counter: Counter, X: np.ndarray, omega0: np.ndarray, p: np.ndarray,
+                     theta_hat: np.ndarray, delta_f: float, failed: np.ndarray,
+                     pool) -> Tuple[np.ndarray, np.ndarray, float]:
+    """The backward-difference retry for the points whose forward fit
+    failed (`failed`, their indices into the full N): `_step_prototype`'s
+    own weight construction at -delta_f, the SAME per-point step
+    magnitude the forward pass used, `start=theta_hat`. One pool batch,
+    `_point_task`'s own task shape -- the forward pass's own failure
+    boundary. Returns (T(omega(-t_i)) per retried point (len(failed), q),
+    that retry's own failure flag per point, busy_delta)."""
+    N = len(X)
+    q = len(theta_hat)
+    m = len(failed)
+    T_minus = np.empty((m, q))
+    retry_failed = np.empty(m, dtype=bool)
+    busy = 0.0
+    if pool is None:
+        for k, i in enumerate(failed):
+            _, omega = _step_prototype(omega0, p, -delta_f, i)
+            result = np.asarray(counter(X, omega, start=theta_hat), dtype=float)
+            T_minus[k] = result
+            retry_failed[k] = bool(np.any(np.isnan(result)))
+    else:
+        pool.share(X)
+        tasks = []
+        for i in failed:
+            _, omega = _step_prototype(omega0, p, -delta_f, i)
+            tasks.append((i, omega, theta_hat))
+        t_map0 = time.perf_counter()
+        results = pool.map(_point_task, tasks)
+        busy = -(time.perf_counter() - t_map0)
+        for k, (_i, result, failed_k, wall) in enumerate(results):
+            T_minus[k] = result
+            counter.add(1, N, int(failed_k))
+            retry_failed[k] = failed_k
+            busy += wall
+    return T_minus, retry_failed, busy
 
 
 def _center_psi(psi_raw: np.ndarray, p: np.ndarray) -> np.ndarray:
@@ -446,17 +504,40 @@ class IJFD:
             V, a, b_hat, c_q = V_full[measured], a_full[measured], b_hat_full[measured], c_q_full[measured]
             n_perturbed_failed = n_fwd_failed + n_bwd_failed
             n_perturbed_total = 2 * N
+            n_retried, n_dropped = 0, 0
         else:
-            ev_bwd, rows_bwd = ev_fwd, rows_fwd
-            busy_backward = 0.0
-            psi = _center_psi((T_plus - theta_hat[None, :]) / t_of[:, None], p)
-            V = np.sum(psi ** 2, axis=0)[measured] / N ** 2
-            ev_abc, rows_abc = ev_fwd, rows_fwd
+            # A failed point (any NaN across its T vector) is retried
+            # backward at the same t_i, one pool batch (module
+            # docstring); a point whose retry also fails is dropped.
+            psi_raw = (T_plus - theta_hat[None, :]) / t_of[:, None]
+            failed = np.where(np.any(np.isnan(T_plus), axis=1))[0]
+            n_retried = len(failed)
+            if n_retried:
+                T_minus, retry_failed, busy_backward = _retry_backward(
+                    counter, X, omega0, p, theta_hat, delta_f, failed, pool)
+                psi_raw[failed] = (theta_hat[None, :] - T_minus) / t_of[failed][:, None]
+                dropped = failed[retry_failed]
+            else:
+                busy_backward = 0.0
+                dropped = failed
+            ev_bwd, rows_bwd = counter.snapshot()
+            n_dropped = len(dropped)
+            # `_center_psi` unchanged, over masses renormalized to the
+            # kept points only (module docstring); a dropped point's psi
+            # is forced NaN so the stored product reflects the drop.
+            kept = np.ones(N, dtype=bool)
+            kept[dropped] = False
+            N_kept = N - n_dropped
+            p_kept = np.where(kept, 1.0 / N_kept, 0.0)
+            psi_raw[dropped] = np.nan
+            psi = _center_psi(psi_raw, p_kept)
+            V = np.sum(np.where(kept[:, None], psi ** 2, 0.0), axis=0)[measured] / N_kept ** 2
+            ev_abc, rows_abc = ev_bwd, rows_bwd
             busy_curvature = 0.0
             a = np.full(q, np.nan)
             b_hat = np.full(q, np.nan)
             c_q = np.full(q, np.nan)
-            n_perturbed_failed = n_fwd_failed
+            n_perturbed_failed = n_dropped
             n_perturbed_total = N
 
         # Step 5, at outputs_full's own width (T's evaluation returns
@@ -486,5 +567,6 @@ class IJFD:
             theta_hat=theta_hat[measured], theta_hat_full=theta_hat, V=V, a=a, b_hat=b_hat, c_q=c_q,
             eta_full=eta_full, evals_by_stage=evals_by_stage, rows_by_stage=rows_by_stage,
             wall_time_total=wall_time_total, busy_time_total=busy_time_total, workers=workers,
-            step_ratio=step_ratio, nan_fraction=n_perturbed_failed / n_perturbed_total, psi=psi,
+            step_ratio=step_ratio, n_retried=n_retried, n_dropped=n_dropped,
+            nan_fraction=n_perturbed_failed / n_perturbed_total, psi=psi,
         )
