@@ -71,6 +71,49 @@ def _fixed_point(counter, X: np.ndarray, theta: np.ndarray, eta_full: float,
     return theta, _FP_CAP, r, False
 
 
+def _periods(counter, outputs: Sequence[str]) -> np.ndarray:
+    """One period per column of `outputs` (an estimator's measured
+    output names, in `response`'s own column order): `counter.periodic`
+    (a name -> period map; `{}` on an estimator declaring none) gives
+    the period for a periodic column, 0.0 marking a non-periodic one."""
+    periodic = getattr(counter, 'periodic', {})
+    return np.array([periodic.get(name, 0.0) for name in outputs], dtype=float)
+
+
+def _wrap_deviation(response: np.ndarray, periods: np.ndarray) -> np.ndarray:
+    """`response`'s (2n, q) deviations from theta_base, with its
+    periodic columns (`periods[j] > 0`) wrapped into [-P/2, P/2):
+    d = ((r + P/2) mod P) - P/2, so a response that crossed the
+    output's branch edge reads as a small deviation instead of one near
+    a full period P. Non-periodic columns (`periods[j] == 0`) pass
+    `response` through unchanged, bit for bit."""
+    is_periodic = (periods > 0.0)[None, :]
+    safe_periods = np.where(periods > 0.0, periods, 1.0)[None, :]
+    wrapped = np.mod(response + 0.5 * safe_periods, safe_periods) - 0.5 * safe_periods
+    return np.where(is_periodic, wrapped, response)
+
+
+def _unscented_stats(response: np.ndarray, theta_base_measured: np.ndarray,
+                      periods: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The unscented mean/sd/bias of the 2n sigma-point responses (spec
+    2.5): the plain (equally-weighted) average of their deviations --
+    wrapped per `_wrap_deviation` on a periodic column, unchanged on a
+    non-periodic one -- added back onto `theta_base_measured` for the
+    mean, and its own centering for S. `bias` is that average deviation
+    (the wrapped mean deviation on a periodic column, spec 2.5's
+    `m - theta_hat` on the rest); `sd` is `sqrt(diag(S))`. A periodic
+    column's `mean` therefore lands within [theta_base - P/2, theta_base
+    + P/2) of its own base fixed point, which need not be the output's
+    declared reporting branch -- that branch's edge is not available
+    here, only the period, so this is reported as the closest
+    equivalent, within one half-period of theta_base."""
+    d = _wrap_deviation(response, periods)
+    bias = d.mean(axis=0)
+    centered = d - bias
+    S = (centered.T @ centered) / d.shape[0]
+    return theta_base_measured + bias, np.sqrt(np.diag(S)), bias
+
+
 def _directions(psi_hat: np.ndarray, N: int) -> Tuple[np.ndarray, np.ndarray]:
     """The kept eigenpairs of C = mean_i(psi_hat_i psi_hat_i^T) / N (spec
     2.3), lambda_k > 1e-12*lambda_max, sorted by decreasing lambda_k.
@@ -90,10 +133,13 @@ def fit(counter, X: np.ndarray, theta_hat: np.ndarray, psi_hat: np.ndarray,
     covariance directions (2.3-2.4), and their unscented mean/covariance
     (2.5). `theta_hat` is the FULL (q_full,) fit, the continuation's own
     layout; `psi_hat` is (N, q) at the MEASURED outputs; `measured` the
-    absolute indices of those q columns in `theta_hat`. `pool.share(X)`
-    is assumed already done for this draw (spec 5)."""
+    absolute indices of those q columns in `theta_hat`. A measured
+    output periodic on `counter.periodic` has its mean/S formed from
+    wrapped deviations (`_unscented_stats`); the rest are unaffected.
+    `pool.share(X)` is assumed already done for this draw (spec 5)."""
     measured = np.asarray(measured, dtype=int)
     q = measured.size
+    periods = _periods(counter, [counter.outputs[i] for i in measured])
     theta_base, n_fp, r_fp, converged = _fixed_point(
         counter, X, np.asarray(theta_hat, dtype=float), eta_full, N)
     empty = np.zeros(0, dtype=int)
@@ -147,9 +193,6 @@ def fit(counter, X: np.ndarray, theta_hat: np.ndarray, psi_hat: np.ndarray,
         return SigmaResult('eval_failed', n_fp, r_fp, n, max_abs_d, n_failed, busy,
                             nan_q, nan_q, nan_q, k_idx, sign_idx, response)
 
-    mean_delta = response.mean(axis=0)                     # m - theta_base, spec 2.5
-    centered = response - mean_delta
-    S = (centered.T @ centered) / (2 * n)
+    mean, sd, bias = _unscented_stats(response, theta_base_measured, periods)  # spec 2.5
     return SigmaResult('ok', n_fp, r_fp, n, max_abs_d, 0, busy,
-                        theta_base_measured + mean_delta, np.sqrt(np.diag(S)), mean_delta,
-                        k_idx, sign_idx, response)
+                        mean, sd, bias, k_idx, sign_idx, response)

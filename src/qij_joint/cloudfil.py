@@ -154,8 +154,10 @@ class _SubjectMixture:
     derived outputs' indices.
 
     A subclass sets the class attributes `_role` (the subject's `role`
-    key in the packaged `.npz`), `_prefix` (its output-name prefix) and
-    `_pa_lo` (its position-angle branch's lower edge)."""
+    key in the packaged `.npz`), `_prefix` (its output-name prefix),
+    `_pa_lo` (its position-angle branch's lower edge) and `periodic`
+    (its periodic outputs' names and periods, `{'<prefix>_pa': pi}`
+    here, read by the sigma-points stage, `core/sigma_points.py`)."""
 
     takes_start = True
     _role: str = None
@@ -228,6 +230,7 @@ class P2Mixture(_SubjectMixture):
     _role = 'P2 on-filament'
     _prefix = 'p2'
     _pa_lo = 0.0
+    periodic = {'p2_pa': np.pi}
 
 
 class P1Mixture(_SubjectMixture):
@@ -239,3 +242,4 @@ class P1Mixture(_SubjectMixture):
     _role = 'P1 embedded'
     _prefix = 'p1'
     _pa_lo = -np.pi / 2
+    periodic = {'p1_pa': np.pi}
