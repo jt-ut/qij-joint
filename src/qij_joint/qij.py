@@ -74,6 +74,16 @@ restart estimator, the polish's own acceptance tolerance (the per-call
 dedicated `'eta_full'` stage, outside `'total'`'s audited meaning. Zero
 evaluations, and `eta_full == T.eta` exactly, for an estimator without
 `takes_start`, so every audited path stays bit-identical.
+
+`sigma_points` (spec/QIJ_sigma_points_spec.md), off by default, runs an
+optional stage after refinement and the curvature stage, on the full
+data: the base fit is first brought to a fixed point of its own
+continuation, then evaluated at 2n resample-scale perturbations along
+the eigendirections of the refined influence estimate's own covariance,
+in one pool batch (`core.sigma_points`, its own `'sigma'` stage, outside
+`'total'`'s audited meaning). It adds `QIJResult.sigma_interval`; every
+other product is exactly as before this option existed when it is
+False.
 """
 from __future__ import annotations
 
@@ -93,6 +103,7 @@ from .core.influence_model import uncertainty as _uncertainty
 from .core.joint import run_joint
 from .core.refine import run_refinement
 from .core.rounds import run_refinement_rounds
+from .core.sigma_points import fit as fit_sigma_points
 from .core.xvq import cost_rule_M, run_xvq
 from .parallel import prepared
 from .result import QIJResult
@@ -120,6 +131,20 @@ def _marginal_defaults(N: int, q: int) -> dict:
         n_refine_evals=np.zeros(q, dtype=int),
         psi_hat=np.full((N, q), np.nan), bin_label=np.full((N, q), -1, dtype=int),
         bin_U=(),
+    )
+
+
+def _sigma_defaults(q: int) -> dict:
+    """The `sigma_*` `QIJResult` fields when the stage did not run
+    (spec/QIJ_sigma_points_spec.md 3), either `sigma_points=False` or a
+    draw that failed before the stage was reached; `sigma_points` itself
+    is set by the caller, not here."""
+    return dict(
+        sigma_status=None, n_fp_sigma=0, r_fp_sigma=float('nan'), n_failed_sigma=0,
+        n_dirs_sigma=0, max_abs_d_sigma=float('nan'),
+        sigma_mean=np.full(q, np.nan), sigma_sd=np.full(q, np.nan),
+        sigma_bias=np.full(q, np.nan), sigma_k=np.zeros(0, dtype=int),
+        sigma_sign=np.zeros(0, dtype=int), sigma_response=np.zeros((0, q)),
     )
 
 
@@ -163,7 +188,7 @@ def _empty_pilot_products(q: int) -> dict:
 
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
-                  sv, quantized_start, refine_schedule, pilot) -> QIJResult:
+                  sv, quantized_start, refine_schedule, pilot, sigma_points) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -173,7 +198,9 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
     `eta_full` (spec/QIJ_mods_waves.md A15), which need stage 2 and the
     curvature/eta_full stages none of which ever ran, are NaN/False. The
     second stage never ran under either value of `ivqbins`, so both the
-    marginal and the joint fields are inert. `I_proto` and `sv.step_ratio`
+    marginal and the joint fields are inert, and the sigma-points stage
+    (spec/QIJ_sigma_points_spec.md), which needs stage 2's own refined
+    influence, never ran either. `I_proto` and `sv.step_ratio`
     are the full-width survey products; `measured` restricts them to the
     reported outputs, exactly as the successful path does (spec
     QIJ_mods_waves.md A11)."""
@@ -190,11 +217,11 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         gptrend=gptrend, gpwidth=gpwidth, c=nan_q, c_bound=false_q,
         M_X=xvq.M_used, M_X_source=M_X_source, n_failed=counter.failed,
         evals_by_stage={'prototype': ev, 'full_data': 0, 'refinement': 0,
-                        'curvature': 0, 'eta_full': 0, 'total': ev},
+                        'curvature': 0, 'eta_full': 0, 'sigma': 0, 'total': ev},
         rows_by_stage={'prototype': rows, 'full_data': 0, 'refinement': 0,
-                       'curvature': 0, 'eta_full': 0, 'total': rows},
+                       'curvature': 0, 'eta_full': 0, 'sigma': 0, 'total': rows},
         wall_time_by_stage={'prototype': wall, 'full_data': 0.0, 'refinement': 0.0,
-                            'curvature': 0.0, 'eta_full': 0.0, 'total': wall},
+                            'curvature': 0.0, 'eta_full': 0.0, 'sigma': 0.0, 'total': wall},
         busy_time_total=wall, workers=workers,
         psi0=nan_Nq, sigma=nan_Nq,
         bmu=xvq.bmu, prototype_p=xvq.p,
@@ -204,8 +231,9 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        pilot=pilot,
+        pilot=pilot, sigma_points=sigma_points,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_empty_pilot_products(q),
+        **_sigma_defaults(q),
     )
 
 
@@ -216,7 +244,8 @@ class QIJ:
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
-                 refine_schedule: str = 'queue', pilot: str = 'affine') -> None:
+                 refine_schedule: str = 'queue', pilot: str = 'affine',
+                 sigma_points: bool = False) -> None:
         if pilot not in ('affine', 'gp'):
             raise ValueError(f"unknown pilot {pilot!r}")
         self.eps = eps
@@ -230,12 +259,15 @@ class QIJ:
         self.refine_schedule = refine_schedule
         self.quantized_start = quantized_start
         self.pilot = pilot
+        self.sigma_points = sigma_points
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
         influences), the shared full-data base evaluation, the ABC
-        curvature stage, then per-output refinement, on `pool` per the
-        module docstring."""
+        curvature stage, then per-output refinement, then, under
+        `sigma_points=True`, the optional sigma-points interval stage
+        (spec/QIJ_sigma_points_spec.md), on `pool` per the module
+        docstring."""
         if self.ivqbins == 'joint' and self.pilot == 'affine':
             # The joint check's own pricing (`core.joint`) is not
             # restructured for the bridge score in this build (spec/
@@ -348,7 +380,7 @@ class QIJ:
                 return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                      self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                      self.survey, sv, self.quantized_start, self.refine_schedule,
-                                     self.pilot)
+                                     self.pilot, self.sigma_points)
             psi0_all = _psi0(model, Z)
             sigma_all = _uncertainty(model, Z)
             offset = np.asarray(model.offset, dtype=float)
@@ -565,6 +597,31 @@ class QIJ:
         wall_time_refinement = time.perf_counter() - t0
         ev3, rows3 = counter.snapshot()
 
+        # The sigma-points stage (spec/QIJ_sigma_points_spec.md 2): after
+        # refinement and the curvature stage, on the full data, from the
+        # method's own refined influence estimate (`psi_hat`, already at
+        # the measured width regardless of `ivqbins`). A no-op, at zero
+        # cost, under `sigma_points=False` (module docstring); `pool`
+        # already shares `X` (re-shared above stage 2, never replaced by
+        # stage 2 itself).
+        t0 = time.perf_counter()
+        if self.sigma_points:
+            sr = fit_sigma_points(counter, X, theta_hat, second_stage_fields['psi_hat'],
+                                   eta_full, N, measured, pool=pool)
+            sigma_busy = sr.busy
+            sigma_fields = dict(
+                sigma_points=True, sigma_status=sr.status, n_fp_sigma=sr.n_fp,
+                r_fp_sigma=sr.r_fp, n_failed_sigma=sr.n_failed, n_dirs_sigma=sr.n_dirs,
+                max_abs_d_sigma=sr.max_abs_d, sigma_mean=sr.mean, sigma_sd=sr.sd,
+                sigma_bias=sr.bias, sigma_k=sr.k, sigma_sign=sr.sign,
+                sigma_response=sr.response)
+        else:
+            sigma_busy = 0.0
+            sigma_fields = dict(sigma_points=False, **_sigma_defaults(q))
+        wall_sigma = time.perf_counter() - t0
+        ev3b, rows3b = counter.snapshot()
+        evals_sigma, rows_sigma = ev3b - ev3, rows3b - rows3
+
         # 'prototype' is stage 1's own work, net of the early theta_hat
         # evaluation `quantized_start='full-data'` may have spent before
         # it (ev0/rows0, 0 under 'multistart'); that evaluation's cost
@@ -577,21 +634,22 @@ class QIJ:
         evals_by_stage = {'prototype': ev1 - ev0,
                            'full_data': ev0 + (ev3 - ev1c) - second_stage_evals - evals_eta_full,
                            'refinement': second_stage_evals, 'curvature': evals_curvature,
-                           'eta_full': evals_eta_full,
+                           'eta_full': evals_eta_full, 'sigma': evals_sigma,
                            'total': ev3 - evals_curvature - evals_eta_full}
         rows_by_stage = {'prototype': rows1 - rows0,
                           'full_data': rows0 + (rows3 - rows1c) - second_stage_evals * N - rows_eta_full,
                           'refinement': second_stage_evals * N, 'curvature': rows_curvature,
-                          'eta_full': rows_eta_full,
+                          'eta_full': rows_eta_full, 'sigma': rows_sigma,
                           'total': rows3 - rows_curvature - rows_eta_full}
         wall_time_total = time.perf_counter() - t_start
         wall_time_by_stage = {'prototype': wall_time_prototype, 'full_data': wall_time_full_data,
                                'refinement': wall_time_refinement, 'curvature': wall_time_curvature,
-                               'eta_full': wall_time_eta_full, 'total': wall_time_total}
+                               'eta_full': wall_time_eta_full, 'sigma': wall_sigma,
+                               'total': wall_time_total}
         # Parent work plus every pool task's own time, in place of each
         # parallel stage's share of the elapsed total.
         busy_time_total = (wall_time_total + xvq_busy + model_busy + full_data_busy
-                            + second_stage_busy + curvature_busy)
+                            + second_stage_busy + curvature_busy + sigma_busy)
 
         if self.pilot == 'gp':
             # at_bound[:, 0] is whichever width parameter gpwidth fits
@@ -642,5 +700,5 @@ class QIJ:
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
             pilot=self.pilot,
-            **second_stage_fields, **joint_fields, **pilot_products,
+            **second_stage_fields, **joint_fields, **pilot_products, **sigma_fields,
         )

@@ -41,11 +41,21 @@ search of any kind), and `bridge_j`/`bridge_k`/`bridge_m`/`bridge_delta`
 cell) and `cell_p`/`cell_mu`/`cell_g` (the affine field's own per-cell
 mass, mean and gradient) are populated; both are empty under `'gp'`,
 whose every other field stays exactly as before this option existed.
+
+`sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
+interval stage that runs after refinement and the curvature stage, on
+the full data: `.sigma_interval(level)` from the stored `sigma_mean`/
+`sigma_sd`, beside `.interval`/`.abc_interval`, which it changes
+nothing about. `sigma_status` is `None` under `sigma_points=False`;
+`'ok'`, `'base_unconverged'` (the base fixed point missed its cap) or
+`'eval_failed'` (a NaN/exception among the 2n evaluations) under
+`True`, both failures leaving `sigma_mean`/`sigma_sd`/`sigma_bias`/
+`sigma_k`/`sigma_sign`/`sigma_response` NaN or empty.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 from scipy.stats import norm
@@ -141,6 +151,20 @@ class QIJResult:
     cell_p: np.ndarray             # (M,) p_j; empty under pilot='gp'
     cell_mu: np.ndarray            # (M, d_z) mu_j; empty under pilot='gp'
     cell_g: np.ndarray             # (M, d_z, q) g_j; empty under pilot='gp'
+    sigma_points: bool              # spec/QIJ_sigma_points_spec.md 1
+    sigma_status: Optional[str]     # None under sigma_points=False; else 'ok'/
+                                     # 'base_unconverged'/'eval_failed'
+    n_fp_sigma: int                 # base fixed-point iterations (2.2); 0 without a start
+    r_fp_sigma: float               # the base fixed point's own residual (2.2)
+    n_failed_sigma: int             # of the 2n direction evaluations (2.4)
+    n_dirs_sigma: int               # n, the kept influence-covariance eigendirections (2.3)
+    max_abs_d_sigma: float          # max_i |d_i| over every kept direction (2.3)
+    sigma_mean: np.ndarray          # (q,) m, the unscented mean (2.5)
+    sigma_sd: np.ndarray            # (q,) sqrt(S_oo) (2.5)
+    sigma_bias: np.ndarray          # (q,) m - theta_hat at the base fixed point (2.5)
+    sigma_k: np.ndarray             # (2n,) int, the direction index of each evaluation
+    sigma_sign: np.ndarray          # (2n,) int, +-1
+    sigma_response: np.ndarray      # (2n, q) R^(k+-), raw (spec section 3)
 
     @property
     def variance(self) -> np.ndarray:
@@ -162,6 +186,15 @@ class QIJResult:
         A10)."""
         sigma = np.sqrt(np.maximum(self.V_btw, 0.0))
         return _abc.abc_interval(self.theta_hat, sigma, self.a, self.b_hat, self.c_q, level)
+
+    def sigma_interval(self, level: float) -> np.ndarray:
+        """(q, 2) [lo, hi]: sigma_mean +/- z_{(1+level)/2}*sigma_sd, the
+        unscented interval of the sigma-points stage
+        (spec/QIJ_sigma_points_spec.md 2.5); `interval`/`abc_interval`
+        are unchanged by this stage (`QIJResult` has no `interval_btw`,
+        that is `QIJTResult`'s own method). NaN when `sigma_points` is
+        False or the stage failed."""
+        return _normal_interval(self.sigma_mean, self.sigma_sd ** 2, level)
 
 
 @dataclass

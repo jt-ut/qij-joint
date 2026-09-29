@@ -185,6 +185,21 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['n_check_rounds'] = int(res.joint_n_check_rounds)
     row['n_check_evals'] = int(res.joint_n_check_evals)
     row['check_capped'] = bool(res.joint_check_capped)
+    # The sigma-points stage (spec/QIJ_sigma_points_spec.md 3): its own
+    # 'sigma' stage entry (outside the loop above, whose own product
+    # names -- 'wall_sigma', not 'wall_time_sigma' -- differ from the
+    # other stages'), all NaN/0/None under `sigma_points=False`.
+    row['sigma_points'] = bool(res.sigma_points)
+    row['sigma_status'] = res.sigma_status
+    row['n_fp_sigma'] = int(res.n_fp_sigma)
+    row['r_fp_sigma'] = float(res.r_fp_sigma)
+    row['evals_sigma'] = int(res.evals_by_stage['sigma'])
+    row['rows_sigma'] = int(res.rows_by_stage['sigma'])
+    row['wall_sigma'] = float(res.wall_time_by_stage['sigma'])
+    row['n_failed_sigma'] = int(res.n_failed_sigma)
+    row['n_dirs_sigma'] = int(res.n_dirs_sigma)
+    row['max_abs_d_sigma'] = float(res.max_abs_d_sigma)
+    lo_sigma, hi_sigma = res.sigma_interval(0.95).T
     for j, o in enumerate(res.outputs):
         row[f'V_btw_{o}'] = float(res.V_btw[j])
         row[f'V_win_hat_{o}'] = float(res.V_win_hat[j])
@@ -207,6 +222,11 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'b_hat_{o}'] = float(res.b_hat[j])
         row[f'c_q_{o}'] = float(res.c_q[j])
         row[f'c_q_one_sided_{o}'] = bool(res.c_q_one_sided[j])
+        row[f'sigma_mean_{o}'] = float(res.sigma_mean[j])
+        row[f'sigma_sd_{o}'] = float(res.sigma_sd[j])
+        row[f'sigma_bias_{o}'] = float(res.sigma_bias[j])
+        row[f'lo_sigma_{o}'] = float(lo_sigma[j])
+        row[f'hi_sigma_{o}'] = float(hi_sigma[j])
     return row
 
 
@@ -318,12 +338,24 @@ def _qij_cells(res) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _qij_sigma_points(res) -> pd.DataFrame:
+    """`sigma_points` for every draw under `sigma_points=True`
+    (spec/QIJ_sigma_points_spec.md 3): one row per evaluation, `k`
+    (direction index), `sign`, `response_<o>` per measured output, raw
+    (R^(k+-), section 2.4-2.5)."""
+    data = {'k': res.sigma_k, 'sign': res.sigma_sign}
+    for j, o in enumerate(res.outputs):
+        data[f'response_{o}'] = res.sigma_response[:, j]
+    return pd.DataFrame(data)
+
+
 def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
             out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
             workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
             M_X: Optional[int] = None, ivqbins: str = 'marginal',
             survey: str = 'points', quantized_start: str = 'multistart',
-            refine_schedule: str = 'queue', pilot: str = 'affine') -> Tuple[int, int]:
+            refine_schedule: str = 'queue', pilot: str = 'affine',
+            sigma_points: bool = False) -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -339,7 +371,10 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     `--diag-draws` like `points`/`prototypes`/`bins` are. `pilot`
     (spec/QIJ_affine_pilot_spec.md) picks stage 1's initial influence
     estimate; under `'affine'`, every draw also writes the `bridge` and
-    `cells` array products (section 4)."""
+    `cells` array products (section 4). `sigma_points`
+    (spec/QIJ_sigma_points_spec.md), off by default, runs the optional
+    sigma-points interval stage after refinement; when True, every draw
+    also writes the `sigma_points` array product."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -355,8 +390,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
-                  refine_schedule=refine_schedule, pilot=pilot).fit(
-                      X, T, pool=pool)
+                  refine_schedule=refine_schedule, pilot=pilot,
+                  sigma_points=sigma_points).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}
@@ -370,6 +405,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         if pilot == 'affine':
             arrays['bridge'] = _qij_bridge(res)
             arrays['cells'] = _qij_cells(res)
+        if res.sigma_points:
+            arrays['sigma_points'] = _qij_sigma_points(res)
         if s in diag:
             arrays['points'] = _qij_points(res)
             arrays['prototypes'] = _qij_prototypes(res)
