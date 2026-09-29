@@ -2,11 +2,12 @@
 
 `Case` bundles what a draw needs: the data-generating function, a
 factory for a fresh estimator instance, and the VQ transform (if any)
-QIJ should quantize in. Eight cases: the paper's six, matching
+QIJ should quantize in. Nine cases: the paper's six, matching
 `datasets.py`'s four draws -- pareto (shape, tail), mvt (nu, tail), fp
-(all), imf (all, Chabrier) -- plus two demo mixtures: mix11 (all,
-`GMM2D`, spec/method_notes.md section 5) and cloudfil (p2, `P2Mixture`,
-spec/QIJ_mods_waves.md A11).
+(all), imf (all, Chabrier) -- plus three demo mixtures: mix11 (all,
+`GMM2D`, spec/method_notes.md section 5) and cloudfil's two subject
+cores, p2 (`P2Mixture`) and p1 (`P1Mixture`) (spec/QIJ_mods_waves.md
+A11).
 """
 
 import json
@@ -48,6 +49,8 @@ _CASES = {
                             lambda: gmm.GMM2D(K=9), None),
     ('cloudfil', 'p2'): Case('cloudfil', 'p2', datasets.cloudfil_G_B6_P3_v1,
                               lambda: cloudfil.P2Mixture(), None),
+    ('cloudfil', 'p1'): Case('cloudfil', 'p1', datasets.cloudfil_G_B6_P3_v1,
+                              lambda: cloudfil.P1Mixture(), None),
 }
 
 
