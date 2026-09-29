@@ -117,11 +117,37 @@ refinement is set up, never a flag inside the loop).
 
 ### 3.3 The joint path
 
-`ivqbins='joint'` prices with the same `v_k` today; under `'affine'` it
-uses `bridge_gain_value` the same way. If its code cannot take the
-second pricer without restructuring, the coordinator says so and
-`ivqbins='joint'` with `pilot='affine'` raises a clear error for this
-build; the marginal path is what the study runs.
+`ivqbins='joint'` runs under either pilot. A bin's flag rule and its
+check's split-kind rule (`core.joint.run_joint`) are priced by the same
+two pricers as the marginal path, selected once where the check is set
+up (R2), never re-chosen inside the loop:
+
+* **Flag rule.** Under `'affine'`, `u` (the GP posterior's own
+  contribution) is 0 throughout, so a bin is flagged when for some
+  output c, `p_k*(U_kc - a_c*m_kc)^2 > eps*V_hat_c/L`; `a_c` is fitted
+  once from every bin after the first measurement and held fixed, as
+  today.
+* **Kind rule.** A flagged bin under `'affine'` prices BOTH kinds, per
+  output, at rho2 = 1, and compares the summed normalized gains: level
+  from the bin's own `two_means_split` on Ψ̃, priced by
+  `level_gain_value`; adjacency from `g_adj,c = bridge_gain_value
+  (bridge_kc, 1) = bridge_kc/4`, `bridge_kc` = Sum over the bin's own
+  second-order cells (jk) of `m_jk*Delta_jk^2` (the same per-leaf
+  bridge sum the marginal path's `batch_bridge` computes, batched over
+  every measured output at once). Level is chosen when its summed
+  normalized gain is at least the adjacency one; the adjacency geometry
+  itself is `_try_adjacency_split` on whichever output c* has the
+  largest `g_adj,c/V_btw,c`, trying the remaining outputs in descending
+  order if c*'s split is infeasible. An infeasible chosen kind falls
+  back to the other; both infeasible closes the bin, as today.
+* **V_win_hat.** With no posterior variance under `'affine'`,
+  `V_win_hat_c = (1/N)*Sum_k p_k*Var_k(psi0_c)` over the final bins
+  (the same expression as today's `p_k*(Var_k + v_k)` with `v_k` = 0
+  throughout), and `V_tot_hat = V_btw + V_win_hat`.
+
+Growth, the check's evaluation cap, mass balance, `split_gamma`, and
+`joint_psi_hat` (which reads only `V_btw`/psi0, independent of the
+pilot's posterior) are unchanged under either pilot.
 
 ## 4. Products
 
