@@ -15,12 +15,13 @@ import numpy as np
 class Counter:
     """
     Counting wrapper around one estimator T, over N rows of the full
-    data. `outputs`/`name`/`eta`/`takes_start` are copied from T at
-    construction (`takes_start` false when T has no such attribute). If
-    T has `prepare`, `T.prepare(A)` is computed once per distinct array
-    object A this Counter is called on and reused for that object,
-    held by reference (keyed on identity) so its id cannot be reused
-    while cached. An estimator without `prepare` is called T(A, w).
+    data. `outputs`/`name`/`eta`/`takes_start`/`periodic` are copied
+    from T at construction (`takes_start` false and `periodic` `{}`
+    when T has no such attribute). If T has `prepare`, `T.prepare(A)`
+    is computed once per distinct array object A this Counter is
+    called on and reused for that object, held by reference (keyed on
+    identity) so its id cannot be reused while cached. An estimator
+    without `prepare` is called T(A, w).
     """
 
     def __init__(self, T, N: int) -> None:
@@ -30,6 +31,7 @@ class Counter:
         self.name = T.name
         self.eta = T.eta
         self.takes_start = getattr(T, 'takes_start', False)
+        self.periodic = getattr(T, 'periodic', {})
         self._has_prepare = hasattr(T, 'prepare')
         self._prep_cache = {}  # id(A) -> (A, prep); holds A alive
 
