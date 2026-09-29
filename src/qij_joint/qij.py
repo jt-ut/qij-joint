@@ -100,7 +100,7 @@ from .core.eta import measure_eta_full
 from .core.influence_model import fit_influence_model
 from .core.influence_model import psi0 as _psi0
 from .core.influence_model import uncertainty as _uncertainty
-from .core.joint import run_joint
+from .core.joint import joint_psi_hat, run_joint
 from .core.refine import run_refinement
 from .core.rounds import run_refinement_rounds
 from .core.sigma_points import fit as fit_sigma_points
@@ -124,7 +124,10 @@ def _joint_defaults(N: int, q: int) -> dict:
 
 
 def _marginal_defaults(N: int, q: int) -> dict:
-    """The marginal-only `QIJResult` fields, inert under `ivqbins='joint'`."""
+    """The marginal-only `QIJResult` fields, inert under `ivqbins='joint'` --
+    except `psi_hat`/`rho`, which the joint branch of `QIJ.fit` overrides
+    with `core.joint.joint_psi_hat`'s own field/rho_c on a draw that did
+    not fail; these NaN defaults are what a failed joint draw keeps."""
     return dict(
         L=np.zeros(q, dtype=int), n_level_splits=np.zeros(q, dtype=int),
         n_adjacency_splits=np.zeros(q, dtype=int), rho=np.full(q, np.nan),
@@ -491,6 +494,17 @@ class QIJ:
                                         V_tot_hat=jr.V_tot_hat, gain_ratio=jr.gain_ratio,
                                         a=jr.a_bca[measured], b_hat=jr.B_hat[measured],
                                         **_marginal_defaults(N, q))
+            if not jr.failed:
+                # psi_hat/rho (spec/method_notes.md section 6): the
+                # marginal path's own per-coordinate field, evaluated on
+                # the joint path's shared final bins instead of a private
+                # partition per output; NaN (the `_marginal_defaults`
+                # above) when the draw failed, since `bin_label`/`bin_U`
+                # may then be unusable (`joint_psi_hat`'s own docstring).
+                psi_hat, rho = joint_psi_hat(psi0_all, offset, jr.bin_label, jr.bin_U,
+                                              jr.bin_mass, jr.V_btw)
+                second_stage_fields['psi_hat'] = psi_hat
+                second_stage_fields['rho'] = rho
             joint_fields = dict(
                 joint_S_pred=jr.S_pred, joint_a=jr.a,
                 joint_S_pred_pre_lloyd=jr.S_pred_pre_lloyd,

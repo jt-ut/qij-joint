@@ -10,6 +10,12 @@ measurement and every check round's evaluations run through `pool`.
 the check's adjacency split reads it (`refine.adjacency_split_gain`) to
 score a split along a prototype's own gradient direction. `QIJ.fit`
 passes it in on every call.
+
+`joint_psi_hat`, called by `qij.py` after `run_joint`, builds the
+per-point refined influence estimate on `run_joint`'s own final shared
+bins, `refine.CoordinateResult.field`'s formula applied per output to
+that shared partition in place of the marginal path's own private one
+per output.
 """
 
 from __future__ import annotations
@@ -24,9 +30,9 @@ from ..parallel import call_T
 from .differences import forward_step, perturbed_weights, step_parameter
 from .influence_model import bin_posterior_variance
 from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences
-from .refine import adjacency_gain_value, adjacency_split_gain, level_gain_value
+from .refine import adjacency_gain_value, adjacency_split_gain, compute_rho2, level_gain_value
 
-__all__ = ["Growth", "JointResult", "grow", "run_joint", "two_means_split"]
+__all__ = ["Growth", "JointResult", "grow", "joint_psi_hat", "run_joint", "two_means_split"]
 
 _CHUNK = 2048  # row chunk for the full-partition Lloyd reassignment: bounds memory
 
@@ -582,3 +588,40 @@ def run_joint(
         bin_mass=bin_mass, bin_U=bin_U, bin_m=bin_m, bin_flagged=bin_flagged,
         bin_label=bin_label, busy_delta=busy_delta,
     )
+
+
+def joint_psi_hat(
+    psi0_all: np.ndarray, offset: np.ndarray, bin_label: np.ndarray,
+    bin_U: np.ndarray, bin_mass: np.ndarray, V_btw: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    The joint path's own per-point refined influence estimate, on
+    `run_joint`'s final shared bins (`bin_label`/`bin_U`/`bin_mass`/
+    `V_btw`): `refine.CoordinateResult.field`'s formula, per measured
+    output c, evaluated on the shared partition in place of that
+    output's own private one --
+
+        psi_hat_i,c = U_{k(i),c} + rho_c*(psi0c_i,c - ubar_{k(i),c})
+
+    psi0c = psi0_all - offset, the same centering
+    `refine.prepare_coordinate` builds `psi_centered` with; ubar_{k,c}
+    is psi0c's plain per-bin mean (points weighted 1/N), by one grouped
+    `bincount` sum per output -- never a loop over points; rho_c =
+    sqrt(V_btw_c / ((1/N) sum_k p_k ubar_kc^2)) via `refine.compute_rho2`,
+    NaN for output c when that denominator is 0. Callers must not call
+    this when `JointResult.failed` is True (`bin_label` may then hold
+    -1, or `bin_U` be all NaN).
+    """
+    N, q = psi0_all.shape
+    L = bin_U.shape[0]
+    psi0c = psi0_all - offset[None, :]
+    counts = np.bincount(bin_label, minlength=L).astype(float)
+    sums = np.column_stack(
+        [np.bincount(bin_label, weights=psi0c[:, c], minlength=L) for c in range(q)])
+    ubar = sums / counts[:, None]
+    sum_pubar2 = np.sum(bin_mass[:, None] * ubar ** 2, axis=0)
+    rho2 = np.array([compute_rho2(float(V_btw[c]), float(sum_pubar2[c]), N) for c in range(q)])
+    rho = np.where(np.isfinite(rho2) & (rho2 >= 0.0), np.sqrt(np.maximum(rho2, 0.0)), np.nan)
+    psi_hat = bin_U[bin_label] + rho[None, :] * (psi0c - ubar[bin_label])
+    psi_hat[:, ~np.isfinite(rho)] = np.nan
+    return psi_hat, rho

@@ -10,9 +10,12 @@ comparator's replicates, theta_hat, the percentile interval and
 one partition per output) or `'joint'` (one partition shared by every
 output, method_notes joint section). `V_btw`/`V_win_hat`/`V_tot_hat`/`gain_ratio`
 are populated by whichever stage ran; the marginal-only fields (`L`,
-`rho`, `psi_hat`, `bin_label`, `bin_U`, the refinement counts) are
-NaN/0/-1/empty under `'joint'`; the `joint_*` fields are
-NaN/0/False/empty under `'marginal'`.
+`bin_label`, `bin_U`, the refinement counts) are NaN/0/-1/empty under
+`'joint'`; the `joint_*` fields are NaN/0/False/empty under `'marginal'`.
+`rho` and `psi_hat` are populated under both: under `'joint'` they are
+`core.joint.joint_psi_hat`'s per-output rho_c and the refined field on
+the joint path's own shared final bins, in place of the marginal path's
+per-coordinate partition.
 
 `refine_schedule` picks the marginal path's own schedule
 (spec/QIJ_mods_waves.md A14): `'queue'` (ported, the default) or
@@ -79,7 +82,7 @@ class QIJResult:
     L: np.ndarray                  # (q,) int; 0 under ivqbins='joint'
     n_level_splits: np.ndarray     # (q,) int; 0 under ivqbins='joint'
     n_adjacency_splits: np.ndarray  # (q,) int; 0 under ivqbins='joint'
-    rho: np.ndarray                # (q,); NaN under ivqbins='joint'
+    rho: np.ndarray                # (q,); under ivqbins='joint', core.joint.joint_psi_hat's rho_c
     gain_ratio: np.ndarray         # (q,); populated by whichever stage ran
     n_refine_evals: np.ndarray     # (q,) int; 0 under ivqbins='joint'
     ell: np.ndarray                # (q,); NaN under gpwidth='local'
@@ -100,7 +103,7 @@ class QIJResult:
     workers: int
     psi0: np.ndarray               # (N, q)
     sigma: np.ndarray              # (N, q)
-    psi_hat: np.ndarray            # (N, q); NaN under ivqbins='joint'
+    psi_hat: np.ndarray            # (N, q); under ivqbins='joint', core.joint.joint_psi_hat's field
     bin_label: np.ndarray          # (N, q) int; -1 under ivqbins='joint'
     bin_U: Tuple[np.ndarray, ...]  # per output (L_c, q); every measured output's
                                     # derivative on this output's own final bins
