@@ -542,12 +542,13 @@ def _qijdt_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> 
     remainder diagnostic `P_unbought`, and the three level-0.95
     intervals (section 8.4)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N, 's': s, 'seed': seed,
-           'eps': float(res.eps), 'workers': int(res.workers),
+           'eps': float(res.eps), 'M_floor': int(res.M_floor), 'workers': int(res.workers),
            'status': res.status, 'theta_hat_status': res.theta_hat_status,
            'eta_full': float(res.eta_full), 'eta_full_failed': bool(res.eta_full_failed),
            'n_fp': int(res.n_fp), 'r_fp': float(res.r_fp), 'n_rounds': int(res.n_rounds),
            'n_measured': int(res.n_measured), 'n_leaves': int(res.n_leaves),
            'max_depth': int(res.max_depth), 'n_failed': int(res.n_failed),
+           'n_nonsmooth': int(res.n_nonsmooth), 'n_halvings_total': int(res.n_halvings_total),
            'tree_status': res.tree_status, 'n_pairs_bought': int(res.n_pairs_bought),
            'n_quad_bought': int(res.n_quad_bought), 'n_below_closed': int(res.n_below_closed),
            'evals_total': int(sum(res.evals_by_stage[st] for st in _QIJDT_STAGES)),
@@ -560,6 +561,7 @@ def _qijdt_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> 
     lo_abc, hi_abc = res.abc_interval(_QIJT_LEVEL).T
     for j, o in enumerate(res.outputs):
         row[f'theta_hat_{o}'] = float(res.theta_hat[res.measured[j]])
+        row[f'nu_{o}'] = float(res.nu[j])
         row[f'V_btw_{o}'] = float(res.V_btw[j])
         row[f'V_win_{o}'] = float(res.V_win[j])
         row[f'V_tot_{o}'] = float(res.V_tot[j])

@@ -9,13 +9,16 @@ The hierarchy is a LAZY point-level bisection in Z (spec 3.2): a node's
 children are built only when first selected for measurement, so only
 the measured part of the tree ever exists. `_init_state` builds a
 root-only `core.tree.TreeState` (every node "point" kind, unit row
-weights) so `core.tree`'s bisection, node measurement, node-splitting,
-leaf-geometry and contrast primitives are reused unmodified --
-`core.tree.py` itself is untouched here. The round loop (spec 5.2,
-tolerance-based, no budget), the within-term's tolerance-based buying
-(spec 7), the bias stencil (spec 6) and the per-point reconstruction
-(spec 8.1) have no qijt analogue (qijt's own versions are budget- and
-cell/opening-based) and so are written here rather than imported.
+weights) so `core.tree`'s bisection, node-splitting, leaf-geometry and
+contrast-direction primitives are reused unmodified -- `core.tree.py`
+itself carries only two new, purely additive primitives: `fixed_point_nu`
+(2.1's absolute noise needs the fixed point's final pair, which
+`fixed_point`'s relative-residual-only return does not carry) and
+`step_verify` (4.3's batched halving loop, shared by every contrast type
+here). Node measurement (4.1-4.3), the round loop (5.2), the within-
+term's buying (7) and the per-point reconstruction (8.1) have no qijt
+analogue (qijt's own versions are budget- and cell/opening-based, with
+no step verification) and so are written here rather than imported.
 """
 from __future__ import annotations
 
@@ -32,11 +35,11 @@ from .core.abc import curvature as _curvature
 from .core.counter import Counter
 from .core.differences import central_step, difference, forward_step, step_parameter
 from .core.eta import measure_eta_full
-from .core.tree import (TreeState, frame, pair_h, candidate_priority, quad_h, response, sibling,
-                        split_node, weight, active_rows, fixed_point, is_degenerate,
-                        is_point_leaf, leaf_V_btw, leaves, measure_nodes, node_mass, node_rows,
-                        run_batch, set_weights)
-from .core.xvq import SurveyRows
+from .core.tree import (TreeState, active_rows, candidate_priority, frame, fixed_point_nu,
+                        is_degenerate, is_point_leaf, leaf_V_btw, leaves, measured_child,
+                        node_mass, node_rows, pair_h, quad_h, run_batch, set_weights, sibling,
+                        split_node, step_verify)
+from .core.xvq import SurveyRows, cost_rule_M
 from .qij import _wrap
 from .result import _normal_interval
 
@@ -66,6 +69,7 @@ class QIJDTResult:
     measured: np.ndarray
     N: int
     eps: float
+    M_floor: int
     workers: int
     status: str
     theta_hat_status: str
@@ -78,6 +82,8 @@ class QIJDTResult:
     n_leaves: int
     max_depth: int
     n_failed: int
+    n_nonsmooth: int
+    n_halvings_total: int
     tree_status: str
     n_pairs_bought: int
     n_quad_bought: int
@@ -87,6 +93,7 @@ class QIJDTResult:
     evals_by_stage: Dict[str, int]
     wall_time_by_stage: Dict[str, float]
     theta_hat: np.ndarray            # (q_full,)
+    nu: np.ndarray                    # (q,) spec 2.1
     V_btw: np.ndarray                # (q,)
     V_win: np.ndarray                # (q,)
     V_tot: np.ndarray                # (q,)
@@ -122,7 +129,7 @@ class QIJDTResult:
                               self.b_hat, self.c_q, level)
 
 
-def _nan_result(outputs, measured, N, eps, workers, status, theta_hat_status, eta_full,
+def _nan_result(outputs, measured, N, eps, M_floor, workers, status, theta_hat_status, eta_full,
                  eta_full_failed, evals, wall, t_start, counter, theta_hat,
                  n_fp=0, r_fp=0.0) -> QIJDTResult:
     """A failed draw (spec 10): NaN variances/intervals, the status,
@@ -132,14 +139,15 @@ def _nan_result(outputs, measured, N, eps, workers, status, theta_hat_status, et
     wall_time = time.perf_counter() - t_start
     return QIJDTResult(
         outputs=outputs, measured=np.asarray(measured, dtype=int), N=N, eps=eps,
-        workers=workers, status=status, theta_hat_status=theta_hat_status,
+        M_floor=int(M_floor), workers=workers, status=status, theta_hat_status=theta_hat_status,
         eta_full=float(eta_full), eta_full_failed=bool(eta_full_failed),
         n_fp=int(n_fp), r_fp=float(r_fp), n_rounds=0, n_measured=0, n_leaves=0,
-        max_depth=0, n_failed=int(counter.failed), tree_status='', n_pairs_bought=0,
-        n_quad_bought=0, n_below_closed=0, busy_time=float(wall_time), wall_time=float(wall_time),
+        max_depth=0, n_failed=int(counter.failed), n_nonsmooth=0, n_halvings_total=0,
+        tree_status='', n_pairs_bought=0, n_quad_bought=0, n_below_closed=0,
+        busy_time=float(wall_time), wall_time=float(wall_time),
         evals_by_stage=evals, wall_time_by_stage=wall,
-        theta_hat=np.asarray(theta_hat, dtype=float), V_btw=nan_q, V_win=nan_q, V_tot=nan_q,
-        accel=nan_q, b_hat=nan_q, c_q=nan_q, P_unbought=nan_q,
+        theta_hat=np.asarray(theta_hat, dtype=float), nu=nan_q, V_btw=nan_q, V_win=nan_q,
+        V_tot=nan_q, accel=nan_q, b_hat=nan_q, c_q=nan_q, P_unbought=nan_q,
         nodes=pd.DataFrame(), leaves=pd.DataFrame(), pairs=pd.DataFrame(), curve=pd.DataFrame(),
         psi_hat=np.full((N, q), np.nan), leaf_of_point=np.full(N, -1, dtype=int),
     )
@@ -149,10 +157,12 @@ def _init_state(X, Z, theta_hat, eta_full, eta_f, measured, q_full, node_cap) ->
     """The root-only `TreeState` for qijdt's lazy point tree (spec 3.2):
     one point-kind node (id 0) spanning all N points, unit row weights,
     no cells. `theta_Q`/`eta_Q` are set to `theta_hat`/`eta_full` (no
-    quantization stage exists), so `core.tree`'s node-measurement and
-    contrast primitives need no change. The dummy cell/opening fields
-    are never read: node_kind is 1 (point) everywhere, so every
-    `core.tree` branch keyed on kind == 0 is dead code for this state."""
+    quantization stage exists) purely so the dataclass is satisfied;
+    qijdt's own node/pair/quadratic measurement (below) reads
+    `state.theta_hat`/`state.eta_full` directly and never `theta_Q`. The
+    dummy cell/opening fields are never read: node_kind is 1 (point)
+    everywhere, so every `core.tree` branch keyed on kind == 0 is dead
+    code for this state."""
     N, d = X.shape[0], Z.shape[1]
     q = len(measured)
     U = np.full((node_cap, q_full), np.nan)
@@ -184,50 +194,126 @@ def _init_state(X, Z, theta_hat, eta_full, eta_f, measured, q_full, node_cap) ->
     )
 
 
-def _grow(state: TreeState, T, counter, pool, eps: float):
-    """The round loop (spec 5.2): round 0 measures the root; each later
-    round judges round r-1's nodes against tau_o = eps*V_btw,o/L (state
-    at the round's start), closes a lineage after two consecutive
-    below-threshold splits, and measures every remaining candidate in
-    one batch, in priority order. Only the tolerance rule stops it (no
-    budget). Returns (curve_rows, 'tolerance', n_rounds, n_below_closed,
-    below)."""
-    split_node(state, 0)
-    measure_nodes(state, T, counter, pool, [0], 0)
+def _omega_h(omega0: np.ndarray, pos_l: np.ndarray, h: np.ndarray, t: float) -> np.ndarray:
+    """omega(t) along h at positions pos_l (spec 7.2/7.3's omega_i(t) =
+    1 + t*h_i), generalized to the arbitrary t values 4.3's halving
+    needs beyond the initial delta_f-set step."""
+    omega_t = omega0.copy()
+    omega_t[pos_l] = omega0[pos_l] * (1.0 + t * h)
+    return omega_t
+
+
+def _measure_nodes_verified(state: TreeState, T, counter, pool, nodes, round_: int,
+                             nu_full: np.ndarray, n_halv: np.ndarray, nonsmooth: np.ndarray
+                             ) -> None:
+    """Measure each node in `nodes` (spec 4.1, 4.3): the step-verified
+    forward difference of U_A along its measured child, then U_B, y_c,
+    E_c and the pass rule (4.2) at the accepted step. `n_halv`/
+    `nonsmooth` are (node_cap,) arrays, written in place for the nodes
+    table (11.2)."""
+    row_ids, rows_x, omega0 = active_rows(state)
+    specs, info = {}, {}
+    for c in nodes:
+        A, B = measured_child(state, c)
+        p_A, p_B = node_mass(state, A), node_mass(state, B)
+        t_A = step_parameter(state.delta_f, p_A)
+        pos_A = np.searchsorted(row_ids, node_rows(state, A))
+        specs[c] = dict(t=t_A,
+                         omega=lambda t, pos_A=pos_A, p_A=p_A: set_weights(omega0, pos_A, p_A, t))
+        info[c] = (A, B, p_A, p_B)
+    verified = step_verify(specs, T, counter, pool, rows_x, state.theta_hat, state.eta_full,
+                            nu_full, state.measured, state.z_n)
+    meas = state.measured
+    for c in nodes:
+        v, (A, B, p_A, p_B) = verified[c], info[c]
+        p_c = p_A + p_B
+        if v['failed']:
+            U_A_full = np.full(state.q_full, np.nan)
+            U_B_full = np.full(state.q_full, np.nan)
+            y = s = np.full(meas.size, np.nan)
+            E = np.zeros(meas.size)
+            passes = np.zeros(meas.size, dtype=bool)
+        else:
+            U_A_full = v['U']
+            U_B_full = (p_c * state.U[c] - p_A * U_A_full) / p_B
+            y = (U_A_full - U_B_full)[meas]
+            s = np.sqrt(2.0) * nu_full[meas] / v['t'] * (p_c / p_B)
+            passes = np.abs(y) > state.z_n * s
+            E = (1.0 / state.N) * (p_A * p_B / p_c) * y ** 2 * passes
+            n_halv[c], nonsmooth[c] = v['n_halvings'], v['nonsmooth']
+        state.U[A], state.U[B] = U_A_full, U_B_full
+        state.y[c, :], state.s[c, :], state.E[c, :], state.passes[c, :] = y, s, E, passes
+        state.node_t[c], state.node_status[c], state.node_round[c] = v['t'], v['status'], round_
+        state.meas_child[c] = 0 if A == state.node_child0[c] else 1
+        state.node_measured[c] = True
+
+
+def _grow(state: TreeState, T, counter, pool, eps: float, nu_full: np.ndarray, M_floor: int):
+    """The round loop (spec 5.2): round 0 measures the root. Below
+    M_floor, every non-leaf child of a round's measured nodes is a
+    candidate and nothing closes (4.2's noise rule only gates energy);
+    at or above it, a node with no passing output is closed and a
+    lineage closes after two consecutive below-threshold splits, as
+    qijt's own refinement rule. Stops with 'tolerance' once two
+    consecutive rounds, at or above the floor, both have
+    max_o G_r,o/V_btw,o < eps, or with 'exhausted' when there are no
+    candidates. Returns (curve_rows, tree_status, n_rounds,
+    n_below_closed, below, n_halv, nonsmooth)."""
     below = np.zeros(state.node_cap, dtype=bool)
+    n_halv = np.zeros(state.node_cap, dtype=int)
+    nonsmooth = np.zeros(state.node_cap, dtype=bool)
+
+    split_node(state, 0)
+    _measure_nodes_verified(state, T, counter, pool, [0], 0, nu_full, n_halv, nonsmooth)
     n_below_closed, evals_total, round_ = 0, 1, 0
     V0 = leaf_V_btw(state)
     curve_rows = [dict(round=0, evals_total=evals_total, L=len(leaves(state)), n_selected=1,
-                        V_btw=V0, tau=np.full_like(V0, np.nan))]
+                        below_floor=True, V_btw=V0, tau=np.full_like(V0, np.nan), G=state.E[0])]
+    # max_o G_o/V_o with 0 where V_o = 0: the same ratio-with-floor
+    # `candidate_priority` already computes for spec 5.2 step 3.
+    prev_ratio = candidate_priority(state.E[0], V0)
+
     while True:
         V_prev, L_prev = curve_rows[-1]['V_btw'], curve_rows[-1]['L']
         tau = eps * V_prev / L_prev
         measured_prev = np.nonzero(state.node_round[:state.n_nodes] == round_)[0]
+        floor_round = L_prev < M_floor
+        candidates: List[int] = []
         for c in measured_prev:
-            below[c] = bool(np.all((~state.passes[c]) | (state.E[c] < tau)))
-        candidates = []
-        for c in measured_prev:
-            if not state.passes[c].any():
-                continue
-            parent = int(state.node_parent[c])
-            if below[c] and parent >= 0 and below[parent]:
-                n_below_closed += 1
-                continue
-            for child in (int(state.node_child0[c]), int(state.node_child1[c])):
-                if not is_point_leaf(state, child) and not is_degenerate(state, child):
-                    candidates.append(child)
+            if floor_round:
+                kids = (int(state.node_child0[c]), int(state.node_child1[c]))
+            else:
+                below[c] = bool(np.all((~state.passes[c]) | (state.E[c] < tau)))
+                if not state.passes[c].any():
+                    continue
+                parent = int(state.node_parent[c])
+                if below[c] and parent >= 0 and below[parent]:
+                    n_below_closed += 1
+                    continue
+                kids = (int(state.node_child0[c]), int(state.node_child1[c]))
+            candidates.extend(k for k in kids
+                               if not is_point_leaf(state, k) and not is_degenerate(state, k))
         if not candidates:
-            return curve_rows, 'tolerance', round_ + 1, n_below_closed, below
+            return curve_rows, 'exhausted', round_ + 1, n_below_closed, below, n_halv, nonsmooth
+
         priority = [candidate_priority(state.E[state.node_parent[c]], V_prev) for c in candidates]
         order = sorted(range(len(candidates)), key=lambda i: (-priority[i], candidates[i]))
         selected = [candidates[i] for i in order]
         for c in selected:
             split_node(state, c)
         round_ += 1
-        measure_nodes(state, T, counter, pool, selected, round_)
+        _measure_nodes_verified(state, T, counter, pool, selected, round_, nu_full, n_halv,
+                                 nonsmooth)
         evals_total += len(selected)
-        curve_rows.append(dict(round=round_, evals_total=evals_total, L=len(leaves(state)),
-                                n_selected=len(selected), V_btw=leaf_V_btw(state), tau=tau))
+        V_new, L_new = leaf_V_btw(state), len(leaves(state))
+        G = np.sum(state.E[selected], axis=0)
+        ratio = candidate_priority(G, V_new)
+        curve_rows.append(dict(round=round_, evals_total=evals_total, L=L_new,
+                                n_selected=len(selected), below_floor=floor_round,
+                                V_btw=V_new, tau=tau, G=G))
+        if L_new >= M_floor and ratio < eps and prev_ratio < eps:
+            return curve_rows, 'tolerance', round_ + 1, n_below_closed, below, n_halv, nonsmooth
+        prev_ratio = ratio
 
 
 def _bias(state: TreeState, T, counter, pool, eta_f: float) -> np.ndarray:
@@ -275,10 +361,12 @@ def _leaf_geometry(state: TreeState):
     return leaf_ids, frames, ghat, row_z, pos, omega0, rows_x
 
 
-def _buy_pairs(state, T, counter, pool, leaf_ids, frames, ghat, tau, row_z, pos, omega0, rows_x):
+def _buy_pairs(state: TreeState, T, counter, pool, leaf_ids, frames, ghat, tau, row_z, pos,
+               omega0, rows_x, nu_full: np.ndarray):
     """Score every (leaf, j) candidate (spec 7.2) and buy the descending
-    prefix with score >= 1; the remainder's predicted terms sum to
-    `P_unbought` (spec 11.1)."""
+    prefix with score >= 1, each contrast step-verified (4.3); the
+    remainder's predicted terms sum to `P_unbought` (spec 11.1). Returns
+    (pairs, A, P_unbought, n_nonsmooth, n_halvings)."""
     safe_tau = np.where(tau > 0, tau, 1.0)
     scored = []
     for ell in leaf_ids:
@@ -292,27 +380,48 @@ def _buy_pairs(state, T, counter, pool, leaf_ids, frames, ghat, tau, row_z, pos,
             scored.append((score, int(ell), j, P))
     scored.sort(key=lambda s: (-s[0], s[1], s[2]))
     n_bought = sum(1 for s in scored if s[0] >= 1.0)
-    tasks, meta = [], []
+
+    specs, meta = {}, {}
     for _, ell, j, _ in scored[:n_bought]:
         pos_l, h = pair_h(frames[ell], j, row_z, pos)
-        omega_t, t = weight(omega0, pos_l, h, state.delta_f)
-        tasks.append(((ell, j), omega_t, state.theta_Q, state.eta_full))
-        meta.append((ell, j, t))
-    results = run_batch(T, counter, pool, rows_x, tasks) if tasks else []
+        t0 = state.delta_f / np.max(np.abs(h))
+        specs[(ell, j)] = dict(
+            t=t0, omega=lambda t, pos_l=pos_l, h=h: _omega_h(omega0, pos_l, h, t))
+        meta[(ell, j)] = frames[ell]['p']
+    verified = step_verify(specs, T, counter, pool, rows_x, state.theta_hat, state.eta_full,
+                            nu_full, state.measured, state.z_n) if specs else {}
+
+    meas = state.measured
     pairs, A = [], {}
-    for (_, value, failed, status, _w), (ell, j, t) in zip(results, meta):
-        D, W, s, passed = response(state, value, failed, t, frames[ell]['p'])
-        pairs.append(dict(leaf=ell, j=j, D=D, W=W, t=t, s=s, passed=passed, status=status))
+    n_nonsmooth = n_halvings = 0
+    for (ell, j), p_l in meta.items():
+        v = verified[(ell, j)]
+        D = v['U']
+        if v['failed']:
+            W = np.zeros(meas.size)
+            s = np.full(meas.size, np.nan)
+            passed = np.zeros(meas.size, dtype=bool)
+        else:
+            s = np.sqrt(2.0) * nu_full[meas] / v['t']
+            passed = np.abs(D[meas]) > state.z_n * s
+            W = np.where(passed, D[meas] ** 2 / (state.N * p_l), 0.0)
+            n_nonsmooth += int(v['nonsmooth'])
+            n_halvings += v['n_halvings']
+        pairs.append(dict(leaf=ell, j=j, D=D, W=W, t=v['t'], s=s, passed=passed,
+                           status=v['status'], n_halvings=v['n_halvings'],
+                           nonsmooth=v['nonsmooth']))
         A[ell] = A.get(ell, np.zeros_like(W)) + W
     zero = np.zeros(len(state.measured))
     P_unbought = np.sum([P for _, _, _, P in scored[n_bought:]], axis=0) \
         if len(scored) > n_bought else zero
-    return pairs, A, P_unbought
+    return pairs, A, P_unbought, n_nonsmooth, n_halvings
 
 
-def _buy_quadratic(state, T, counter, pool, frames, A, tau, row_z, pos, omega0, rows_x):
+def _buy_quadratic(state: TreeState, T, counter, pool, frames, A, tau, row_z, pos, omega0,
+                    rows_x, nu_full: np.ndarray):
     """Score every leaf with a bought pair and n >= rank + 2 (spec 7.3)
-    and buy the descending prefix with score >= 1."""
+    and buy the descending prefix with score >= 1, step-verified (4.3).
+    Returns (quads, n_nonsmooth, n_halvings)."""
     safe_tau = np.where(tau > 0, tau, 1.0)
     scored = []
     for ell, A_ell in A.items():
@@ -323,21 +432,38 @@ def _buy_quadratic(state, T, counter, pool, frames, A, tau, row_z, pos, omega0, 
         scored.append((float(np.max(ratio)), ell))
     scored.sort(key=lambda s: (-s[0], s[1]))
     quad_leaves = [ell for score, ell in scored if score >= 1.0]
-    tasks, meta = [], []
+
+    specs, meta = {}, []
     for ell in quad_leaves:
         pos_l, h = quad_h(frames[ell], row_z, pos, omega0, state.N)
         if h is None:
             continue
-        omega_t, t = weight(omega0, pos_l, h, state.delta_f)
-        tasks.append((ell, omega_t, state.theta_Q, state.eta_full))
-        meta.append((ell, t))
-    results = run_batch(T, counter, pool, rows_x, tasks) if tasks else []
+        t0 = state.delta_f / np.max(np.abs(h))
+        specs[ell] = dict(t=t0, omega=lambda t, pos_l=pos_l, h=h: _omega_h(omega0, pos_l, h, t))
+        meta.append(ell)
+    verified = step_verify(specs, T, counter, pool, rows_x, state.theta_hat, state.eta_full,
+                            nu_full, state.measured, state.z_n) if specs else {}
+
+    meas = state.measured
     quads = []
-    for (_, value, failed, status, _w), (ell, t) in zip(results, meta):
-        Q, contribution, s, passed = response(state, value, failed, t, frames[ell]['p'])
-        quads.append(dict(leaf=ell, Q=Q, contribution=contribution, t=t, s=s, passed=passed,
-                           status=status))
-    return quads
+    n_nonsmooth = n_halvings = 0
+    for ell in meta:
+        v, p_l = verified[ell], frames[ell]['p']
+        Q = v['U']
+        if v['failed']:
+            contribution = np.zeros(meas.size)
+            s = np.full(meas.size, np.nan)
+            passed = np.zeros(meas.size, dtype=bool)
+        else:
+            s = np.sqrt(2.0) * nu_full[meas] / v['t']
+            passed = np.abs(Q[meas]) > state.z_n * s
+            contribution = np.where(passed, Q[meas] ** 2 / (state.N * p_l), 0.0)
+            n_nonsmooth += int(v['nonsmooth'])
+            n_halvings += v['n_halvings']
+        quads.append(dict(leaf=ell, Q=Q, contribution=contribution, t=v['t'], s=s, passed=passed,
+                           status=v['status'], n_halvings=v['n_halvings'],
+                           nonsmooth=v['nonsmooth']))
+    return quads, n_nonsmooth, n_halvings
 
 
 def _leaf_rows(state: TreeState, leaf_ids, frames, ghat, A, pairs, quads) -> List[dict]:
@@ -390,7 +516,7 @@ def _acceleration(psi_meas: np.ndarray) -> np.ndarray:
     return out
 
 
-def _nodes_table(state: TreeState, outputs, below) -> pd.DataFrame:
+def _nodes_table(state: TreeState, outputs, below, n_halv, nonsmooth) -> pd.DataFrame:
     """§11.2: one row per measured node and per leaf."""
     measured_mask = state.node_measured[:state.n_nodes]
     parent = state.node_parent[:state.n_nodes]
@@ -404,6 +530,7 @@ def _nodes_table(state: TreeState, outputs, below) -> pd.DataFrame:
                    p=float(node_mass(state, c)), node_measured=bool(measured_mask[c]),
                    round=int(state.node_round[c]), below=bool(below[c]),
                    measured_child=int(state.meas_child[c]), t=float(state.node_t[c]),
+                   n_halvings=int(n_halv[c]), nonsmooth=bool(nonsmooth[c]),
                    status=str(state.node_status[c]))
         for j, o in enumerate(outputs):
             row[f'U_{o}'] = float(state.U[c, state.measured[j]])
@@ -436,7 +563,8 @@ def _pairs_table(pairs, quads, outputs, measured) -> pd.DataFrame:
     rows = []
     for rec, j, resp in ([(p, p['j'], p['D']) for p in pairs]
                          + [(qd, 0, qd['Q']) for qd in quads]):
-        row = dict(leaf=int(rec['leaf']), j=int(j), t=float(rec['t']))
+        row = dict(leaf=int(rec['leaf']), j=int(j), t=float(rec['t']),
+                   n_halvings=int(rec['n_halvings']), nonsmooth=bool(rec['nonsmooth']))
         for k, o in enumerate(outputs):
             row[f'D_{o}'] = float(resp[measured[k]])
             row[f's_{o}'] = float(rec['s'][k])
@@ -450,10 +578,12 @@ def _curve_table(curve_rows, outputs) -> pd.DataFrame:
     rows = []
     for r in curve_rows:
         row = dict(round=int(r['round']), evals_total=int(r['evals_total']),
-                   L=int(r['L']), n_selected=int(r['n_selected']))
+                   L=int(r['L']), n_selected=int(r['n_selected']),
+                   below_floor=bool(r['below_floor']))
         for j, o in enumerate(outputs):
             row[f'V_btw_{o}'] = float(r['V_btw'][j])
             row[f'tau_{o}'] = float(r['tau'][j])
+            row[f'G_{o}'] = float(r['G'][j])
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -476,6 +606,7 @@ class QIJDT:
         q_full = len(outputs_full)
         measured = np.asarray(list(getattr(T, 'measured', range(q_full))), dtype=int)
         outputs = tuple(outputs_full[i] for i in measured)
+        M_floor = cost_rule_M(N, len(measured), self.eps)
         workers = pool.workers if pool is not None else 1
         counter = Counter(T, N)
         evals = {s: 0 for s in _STAGES}
@@ -493,40 +624,49 @@ class QIJDT:
                 T, counter, pool, X, [('theta_hat', np.ones(N), None, None)])
             theta_hat = np.asarray(result, dtype=float)
         if np.any(np.isnan(theta_hat)):
-            return _nan_result(outputs, measured, N, self.eps, workers, 'theta_hat_failed',
-                                theta_hat_status, float('nan'), False, evals, wall, t_start,
-                                counter, theta_hat)
+            return _nan_result(outputs, measured, N, self.eps, M_floor, workers,
+                                'theta_hat_failed', theta_hat_status, float('nan'), False,
+                                evals, wall, t_start, counter, theta_hat)
 
         # --- eta_full (spec 2 item 2) ---
         with _stage(evals, wall, counter, 'eta_full'):
             eta_full, _n_eta, eta_full_failed = measure_eta_full(counter, X, theta_hat)
 
-        # --- the base fit's own fixed point (spec 2.1), folded into full_fit ---
+        # --- the base fit's own fixed point (spec 2.1), folded into
+        # full_fit; `fixed_point_nu` also returns the last iteration's
+        # pre-image theta, so nu (2.1) can use the exact final pair.
         with _stage(evals, wall, counter, 'full_fit'):
             if counter.takes_start:
-                theta_hat, n_fp, r_fp, ok = fixed_point(
-                    lambda th: counter(X, np.ones(N), start=th, eta=eta_full), theta_hat, eta_full)
+                theta_hat, n_fp, r_fp, ok, theta_prev = fixed_point_nu(
+                    lambda th: counter(X, np.ones(N), start=th, eta=eta_full), theta_hat,
+                    eta_full)
             else:
-                n_fp, r_fp, ok = 0, 0.0, True
+                n_fp, r_fp, ok, theta_prev = 0, 0.0, True, theta_hat
         if np.any(np.isnan(theta_hat)):
-            return _nan_result(outputs, measured, N, self.eps, workers, 'theta_hat_failed',
-                                theta_hat_status, eta_full, eta_full_failed, evals, wall,
-                                t_start, counter, theta_hat, n_fp=n_fp, r_fp=r_fp)
+            return _nan_result(outputs, measured, N, self.eps, M_floor, workers,
+                                'theta_hat_failed', theta_hat_status, eta_full, eta_full_failed,
+                                evals, wall, t_start, counter, theta_hat, n_fp=n_fp, r_fp=r_fp)
         if not ok:
-            return _nan_result(outputs, measured, N, self.eps, workers, 'base_unconverged',
-                                theta_hat_status, eta_full, eta_full_failed, evals, wall,
-                                t_start, counter, theta_hat, n_fp=n_fp, r_fp=r_fp)
+            return _nan_result(outputs, measured, N, self.eps, M_floor, workers,
+                                'base_unconverged', theta_hat_status, eta_full, eta_full_failed,
+                                evals, wall, t_start, counter, theta_hat, n_fp=n_fp, r_fp=r_fp)
+        # nu_o = max(eta_f*|theta_hat_o|, |theta'_o - theta_o|) (spec
+        # 2.1); theta_prev == theta_hat with no iteration, giving
+        # nu = eta_f*|theta_hat| for a start-less T, as the spec's own
+        # start-less case (eta_full == T's declared eta there already).
+        nu_full = np.maximum(eta_full * np.abs(theta_hat), np.abs(theta_hat - theta_prev))
 
         # --- tree (spec 3, 5) ---
-        eta_f = eta_full if counter.takes_start else counter.eta
+        eta_f = eta_full  # spec 2.2's eta_f; always eta_full here (measure_eta_full already
+                          # returns T's declared eta in the start-less case)
         Z, _inv = self.vq_transform(X) if self.vq_transform is not None else (X, None)
         Z = np.asarray(Z, dtype=float)
         if Z.ndim == 1:
             Z = Z.reshape(-1, 1)
         state = _init_state(X, Z, theta_hat, eta_full, eta_f, measured, q_full, 2 * N)
         with _stage(evals, wall, counter, 'tree'):
-            curve_rows, tree_status, n_rounds, n_below_closed, below = _grow(
-                state, T, counter, pool, self.eps)
+            curve_rows, tree_status, n_rounds, n_below_closed, below, n_halv, nonsmooth = _grow(
+                state, T, counter, pool, self.eps, nu_full, M_floor)
 
         # --- bias (spec 6) ---
         with _stage(evals, wall, counter, 'bias'):
@@ -537,14 +677,17 @@ class QIJDT:
         L_final, V_btw_final = curve_rows[-1]['L'], curve_rows[-1]['V_btw']
         tau_final = self.eps * V_btw_final / L_final
         with _stage(evals, wall, counter, 'within'):
-            pairs, A, P_unbought = _buy_pairs(state, T, counter, pool, leaf_ids, frames, ghat,
-                                              tau_final, row_z, pos, omega0, rows_x)
+            pairs, A, P_unbought, ns_pairs, nh_pairs = _buy_pairs(
+                state, T, counter, pool, leaf_ids, frames, ghat, tau_final, row_z, pos, omega0,
+                rows_x, nu_full)
         with _stage(evals, wall, counter, 'quadratic'):
-            quads = _buy_quadratic(state, T, counter, pool, frames, A, tau_final, row_z, pos,
-                                   omega0, rows_x)
+            quads, ns_quad, nh_quad = _buy_quadratic(
+                state, T, counter, pool, frames, A, tau_final, row_z, pos, omega0, rows_x,
+                nu_full)
 
         # --- reconstruction (8.1), acceleration (8.2) ---
-        psi, leaf_of_point = _reconstruct(state, leaf_ids, frames, row_z, pos, omega0, pairs, quads)
+        psi, leaf_of_point = _reconstruct(state, leaf_ids, frames, row_z, pos, omega0, pairs,
+                                          quads)
         accel = _acceleration(psi[:, measured])
         q = len(measured)
         W_sum = np.sum([p['W'] for p in pairs], axis=0) if pairs else np.zeros(q)
@@ -568,19 +711,23 @@ class QIJDT:
         n_measured = int(np.sum(state.node_measured[:state.n_nodes]))
         max_depth = int(state.node_depth[:state.n_nodes].max()) if state.n_nodes else 0
         leaf_rows = _leaf_rows(state, leaf_ids, frames, ghat, A, pairs, quads)
+        n_nonsmooth = int(nonsmooth[:state.n_nodes].sum()) + ns_pairs + ns_quad
+        n_halvings_total = int(n_halv[:state.n_nodes].sum()) + nh_pairs + nh_quad
+        nu = nu_full[measured]
 
         return QIJDTResult(
-            outputs=outputs, measured=measured, N=N, eps=self.eps, workers=workers,
-            status='ok', theta_hat_status=theta_hat_status, eta_full=float(eta_full),
-            eta_full_failed=bool(eta_full_failed), n_fp=int(n_fp), r_fp=float(r_fp),
-            n_rounds=int(n_rounds), n_measured=n_measured, n_leaves=len(leaf_ids),
-            max_depth=max_depth, n_failed=int(counter.failed), tree_status=tree_status,
+            outputs=outputs, measured=measured, N=N, eps=self.eps, M_floor=M_floor,
+            workers=workers, status='ok', theta_hat_status=theta_hat_status,
+            eta_full=float(eta_full), eta_full_failed=bool(eta_full_failed), n_fp=int(n_fp),
+            r_fp=float(r_fp), n_rounds=int(n_rounds), n_measured=n_measured,
+            n_leaves=len(leaf_ids), max_depth=max_depth, n_failed=int(counter.failed),
+            n_nonsmooth=n_nonsmooth, n_halvings_total=n_halvings_total, tree_status=tree_status,
             n_pairs_bought=len(pairs), n_quad_bought=len(quads),
             n_below_closed=int(n_below_closed), busy_time=float(busy_time),
             wall_time=float(wall_time), evals_by_stage=evals, wall_time_by_stage=wall,
-            theta_hat=theta_hat, V_btw=V_btw, V_win=V_win, V_tot=V_tot, accel=accel,
+            theta_hat=theta_hat, nu=nu, V_btw=V_btw, V_win=V_win, V_tot=V_tot, accel=accel,
             b_hat=b_hat, c_q=c_q, P_unbought=P_unbought,
-            nodes=_nodes_table(state, outputs, below),
+            nodes=_nodes_table(state, outputs, below, n_halv, nonsmooth),
             leaves=_leaves_table(leaf_rows, outputs),
             pairs=_pairs_table(pairs, quads, outputs, measured),
             curve=_curve_table(curve_rows, outputs),

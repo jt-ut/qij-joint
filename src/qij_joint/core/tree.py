@@ -280,6 +280,27 @@ def fixed_point(step, start: np.ndarray, eta: float, cap: int = 5):
     return theta, cap, r, False
 
 
+def fixed_point_nu(step, start: np.ndarray, eta: float, cap: int = 5):
+    """As `fixed_point`, but also returns the pre-image theta of the
+    final iteration: qijdt's absolute noise scale nu (spec 2.1) needs
+    the exact final pair |theta'_o - theta_o| per output, which
+    `fixed_point`'s relative-residual-only return does not carry. An
+    estimator without a start never iterates (theta_prev = start, as
+    `fixed_point`'s own r = 0 case)."""
+    theta = np.asarray(start, dtype=float)
+    theta_prev = theta
+    r = float('nan')
+    for n in range(1, cap + 1):
+        theta_prime = np.asarray(step(theta), dtype=float)
+        if np.any(np.isnan(theta_prime)):
+            return theta_prime, n, float('nan'), False, theta
+        r = _fp_residual(theta_prime, theta)
+        theta_prev, theta = theta, theta_prime
+        if r <= eta:
+            return theta, n, r, True, theta_prev
+    return theta, cap, r, False, theta_prev
+
+
 def build_state(X, Z, bmu, centers_x, centers_z, measured, q_full, node_cap) -> TreeState:
     """The initial rows (one per cell, omega0 = n_j) and the cell-level
     tree, built once (spec 2.1, 3.2), root id 0, breadth-first ids."""
@@ -409,6 +430,81 @@ def run_batch(T, counter, pool, shared: np.ndarray, tasks: Sequence[Tuple]) -> L
     for _, _, failed, _, _ in results:
         counter.add(1, n_rows, int(failed))
     return results
+
+
+def _step_verify_level(active: Sequence, U: Dict, t0: Dict, lvl: int, nu_full: np.ndarray,
+                        measured: np.ndarray, z_n: float, cap: int, n_halvings: Dict,
+                        status: Dict, result: Dict) -> List:
+    """One while-check of `step_verify`'s halving loop (spec 4.3) at
+    level `lvl`: accepts (writes into `result`) every still-active key
+    whose last two levels agree within noise s(t) = sqrt(2)*nu/t on
+    every measured output, whose noise floor s(t) >= |U(t)| is reached
+    on a disagreeing output, or whose halving count is at `cap`.
+    Returns the accepted keys."""
+    resolved = []
+    for k in active:
+        t_cur = t0[k] / 2 ** lvl
+        s_cur = (np.sqrt(2.0) * nu_full / t_cur)[measured]
+        u_prev, u_cur = U[k][lvl - 1][measured], U[k][lvl][measured]
+        disagree = np.abs(u_cur - u_prev) > z_n * s_cur
+        active_dis = disagree & (s_cur < np.abs(u_cur))
+        if not active_dis.any() or n_halvings[k] >= cap:
+            result[k] = dict(U=U[k][lvl], t=t_cur, n_halvings=n_halvings[k],
+                              nonsmooth=bool(disagree.any()), failed=False, status=status[k])
+            resolved.append(k)
+    return resolved
+
+
+def step_verify(specs: Dict[Any, Dict[str, Any]], T, counter, pool, rows_x: np.ndarray,
+                 theta_hat: np.ndarray, eta_full: float, nu_full: np.ndarray,
+                 measured: np.ndarray, z_n: float, cap: int = 8) -> Dict[Any, dict]:
+    """Batched step verification (spec 4.3), shared by qijdt's node,
+    pair and quadratic contrasts. `specs` = {key: dict(t=t0,
+    omega=callable(t) -> omega array)}; each raw forward difference
+    U(t) = [T(omega(t)) - theta_hat] / t is halved until two consecutive
+    steps agree within noise on every measured output, the noise floor
+    is reached, or k = `cap`. One `run_batch` per halving level, over
+    only the keys still unresolved, so a run's batches depend on
+    returned values alone (spec 9.2). Returns key -> dict(U (theta_hat's
+    width,), t, n_halvings, nonsmooth, failed, status)."""
+    keys = list(specs)
+    t0 = {k: specs[k]['t'] for k in keys}
+    tasks = [((k, lvl), specs[k]['omega'](t0[k] / 2 ** lvl), theta_hat, eta_full)
+             for k in keys for lvl in (0, 1)]
+    raw, status = {}, {}
+    for (key, lvl), value, fail, st, _wall in run_batch(T, counter, pool, rows_x, tasks):
+        raw[(key, lvl)] = np.full_like(theta_hat, np.nan) if fail \
+            else np.asarray(value, dtype=float)
+        status[key] = st
+
+    result, U = {}, {}
+    for k in keys:
+        if np.any(np.isnan(raw[(k, 0)])) or np.any(np.isnan(raw[(k, 1)])):
+            result[k] = dict(U=np.full_like(theta_hat, np.nan), t=t0[k] / 2.0, n_halvings=0,
+                              nonsmooth=False, failed=True, status=status[k])
+        else:
+            U[k] = [(raw[(k, 0)] - theta_hat) / t0[k], (raw[(k, 1)] - theta_hat) / (t0[k] / 2.0)]
+    n_halvings = {k: 0 for k in U}
+    active, lvl = list(U), 1
+    while active:
+        resolved = _step_verify_level(active, U, t0, lvl, nu_full, measured, z_n, cap,
+                                       n_halvings, status, result)
+        active = [k for k in active if k not in resolved]
+        if not active:
+            break
+        lvl += 1
+        tasks = [((k,), specs[k]['omega'](t0[k] / 2 ** lvl), theta_hat, eta_full) for k in active]
+        for (key,), value, fail, st, _wall in run_batch(T, counter, pool, rows_x, tasks):
+            status[key] = st
+            if fail:
+                result[key] = dict(U=np.full_like(theta_hat, np.nan), t=t0[key] / 2 ** lvl,
+                                    n_halvings=n_halvings[key] + 1, nonsmooth=False,
+                                    failed=True, status=st)
+            else:
+                U[key].append((np.asarray(value, dtype=float) - theta_hat) / (t0[key] / 2 ** lvl))
+                n_halvings[key] += 1
+        active = [k for k in active if k not in result]
+    return result
 
 
 def measure_nodes(state: TreeState, T, counter, pool, nodes: Sequence[int], round_: int) -> None:
