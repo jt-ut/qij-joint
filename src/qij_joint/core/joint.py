@@ -370,6 +370,7 @@ def run_joint(
     X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
     sigma_all: np.ndarray, model, Z: np.ndarray, xvq, eta: float, eps: float,
     pool=None, I_proto: Optional[np.ndarray] = None, start: np.ndarray = None,
+    measured: Optional[Sequence[int]] = None,
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -380,9 +381,21 @@ def run_joint(
     split. `start` (A9's continuation rule, spec/QIJ_mods_waves.md A9)
     is passed to every full-data evaluation here -- the initial bin
     measurement and every check split; None reproduces today's
-    evaluations bit for bit.
+    evaluations bit for bit. `measured` (spec/QIJ_mods_waves.md A11) is
+    the absolute indices, into T's full output, that `psi0_all`/
+    `sigma_all`/`model`/`I_proto` already carry; `theta_hat`, and every
+    raw evaluation this function makes (`bin_differences`'s stencils,
+    a check split's own `val`), stay full width, one evaluation
+    reporting every output at no extra cost, and are cut down to
+    `measured`'s columns wherever they meet a psi0-driven quantity --
+    `bias_and_acceleration`'s `B_hat`/`a_bca` are the one exception,
+    read from the full bins and restricted to `measured` by the caller
+    instead (`qij.py`). `measured=None` defaults to identity
+    (0..q-1), reproducing today's evaluations bit for bit.
     """
     N, q = psi0_all.shape
+    if measured is None:
+        measured = list(range(q))
     M_X_used = xvq.M_used
 
     if np.any(model.constant_path):
@@ -398,22 +411,24 @@ def run_joint(
         return _failed_result(N, q, growth=growth, busy_delta=busy_delta)
 
     B_hat, a_bca = bias_and_acceleration(bins, N)
-    V_btw = np.array([between_terms(bins, c) for c in range(q)])
+    V_btw = np.array([between_terms(bins, c) for c in measured])
     V_hat = growth.std ** 2
     psi_tilde = psi0_all / growth.std
+    U0 = bins.U[:, measured]
+    centering_residual = bins.centering_residual[measured]
     _, m0, var0 = _bin_stats(psi0_all, bins.labels, L0)
-    a = _fit_scale(bins.p, bins.U, m0)
+    a = _fit_scale(bins.p, U0, m0)
     groups0 = [np.where(bins.labels == k)[0] for k in range(L0)]
     v0, u0 = _posterior_vu(model, Z, sigma_all, groups0)
     psi_centered = psi0_all - model.offset[None, :]
 
     leaves: Dict[int, dict] = {
-        k: dict(indices=groups0[k], n=int(bins.n[k]), U=bins.U[k].copy(), m=m0[k].copy(),
+        k: dict(indices=groups0[k], n=int(bins.n[k]), U=U0[k].copy(), m=m0[k].copy(),
                 var=var0[k].copy(), v=v0[k].copy(), ubar=psi_centered[groups0[k]].mean(axis=0))
         for k in range(L0)
     }
 
-    flagged_mask = _flag_mask(bins.p, bins.U, m0, a, V_hat, u0, L0, eps)
+    flagged_mask = _flag_mask(bins.p, U0, m0, a, V_hat, u0, L0, eps)
     n_flagged = int(flagged_mask.sum())
     current_flagged = set(np.where(flagged_mask)[0].tolist())
 
@@ -501,7 +516,7 @@ def run_joint(
             meta = proposals[k]
             leaf = leaves.pop(k)
             p_parent = leaf['n'] / N
-            U_small = (val - theta_hat) / meta['t_small'] - bins.centering_residual
+            U_small = (val[measured] - theta_hat[measured]) / meta['t_small'] - centering_residual
             U_large = (p_parent * leaf['U'] - meta['p_small'] * U_small) / meta['p_large']
             # /N: V_btw,c = (1/N) sum_k p_k U_kc^2 (ivq.between_terms).
             Delta = (meta['p_small'] * U_small ** 2 + meta['p_large'] * U_large ** 2

@@ -477,7 +477,7 @@ class QIJ:
             # A11; inert for the demo, which never runs this path).
             jr = run_joint(X, counter, theta_hat, psi0_all, sigma_all, model, Z, xvq, eta_full,
                            self.eps, pool=pool, I_proto=I_proto[:, measured],
-                           start=start_second_stage)
+                           start=start_second_stage, measured=measured)
             # A failed output, or a failed initial bin measurement before
             # any check ran, voids every output's variance quantities, as
             # the marginal path voids them on any one coordinate's failure.
