@@ -19,9 +19,11 @@ unused under `pilot='affine'`; `M_X` overrides the prototype-count rule
 when given (method_notes section 2); `survey` picks the prototype
 survey's receptive-field representation, `'points'` (one row per
 prototype) or `'moments'` (spec/method_notes.md section 2), passed to
-`run_xvq`. `ivqbins='joint'` with `pilot='affine'` raises `NotImplementedError`
-(spec/QIJ_affine_pilot_spec.md 3.3): the joint check's own pricing is
-not restructured for the bridge score in this build. `quantized_start`
+`run_xvq`. `ivqbins='joint'` runs under either pilot
+(spec/QIJ_affine_pilot_spec.md 3.3): `core.joint.run_joint`'s own flag
+and kind pricing follows `pilot` the same way the marginal path's
+`core.refine.prepare_coordinate` does, choosing once, at setup, between
+the GP posterior's rule and the bridge score's. `quantized_start`
 (spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
 `'multistart'` (ported) fits theta_Q from scratch on the survey rows;
 `'full-data'` runs theta_hat first (on `pool` when given) and continues
@@ -271,13 +273,6 @@ class QIJ:
         `sigma_points=True`, the optional sigma-points interval stage
         (spec/QIJ_sigma_points_spec.md), on `pool` per the module
         docstring."""
-        if self.ivqbins == 'joint' and self.pilot == 'affine':
-            # The joint check's own pricing (`core.joint`) is not
-            # restructured for the bridge score in this build (spec/
-            # QIJ_affine_pilot_spec.md 3.3); the marginal path is what
-            # the study runs under `pilot='affine'`.
-            raise NotImplementedError(
-                "ivqbins='joint' with pilot='affine' is not built; use ivqbins='marginal'")
         t_start = time.perf_counter()
         X = np.asarray(X)
         N = len(X)
@@ -478,9 +473,23 @@ class QIJ:
             # in the marginal path below), so they stay q_full wide and
             # are restricted to `measured` here (spec/QIJ_mods_waves.md
             # A11; inert for the demo, which never runs this path).
+            # `pilot` picks `run_joint`'s own flag/kind pricing the same
+            # way it picks the marginal path's below; under `'affine'`
+            # the bridge pair geometry and this draw's own m_jk*Delta_jk^2
+            # over every measured output (`bridge_value`, spec/QIJ_affine_
+            # pilot_spec.md 3.2) come from the same `pilot_result` the
+            # marginal path's `bridge_value_cols` reads per output.
+            if self.pilot == 'affine':
+                bridge_pair_id = pilot_result.pair_id
+                bridge_pair_n = pilot_result.pair_n
+                bridge_value = pilot_result.pair_mass[:, None] * pilot_result.pair_delta[:, measured] ** 2
+            else:
+                bridge_pair_id = bridge_pair_n = bridge_value = None
             jr = run_joint(X, counter, theta_hat, psi0_all, sigma_all, model, Z, xvq, eta_full,
-                           self.eps, pool=pool, I_proto=I_proto[:, measured],
-                           start=start_second_stage, measured=measured)
+                           self.eps, offset, pool=pool, I_proto=I_proto[:, measured],
+                           start=start_second_stage, measured=measured, pilot=self.pilot,
+                           bridge_pair_id=bridge_pair_id, bridge_pair_n=bridge_pair_n,
+                           bridge_value=bridge_value)
             # A failed output, or a failed initial bin measurement before
             # any check ran, voids every output's variance quantities, as
             # the marginal path voids them on any one coordinate's failure.

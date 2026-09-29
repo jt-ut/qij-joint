@@ -16,6 +16,13 @@ per-point refined influence estimate on `run_joint`'s own final shared
 bins, `refine.CoordinateResult.field`'s formula applied per output to
 that shared partition in place of the marginal path's own private one
 per output.
+
+`run_joint`'s `pilot` argument (spec/QIJ_affine_pilot_spec.md 3.3) picks
+the check's flag and kind pricing once, at setup, the same way
+`refine.prepare_coordinate` picks it for the marginal path: `'gp'`
+(today's rule, bit-identical) or `'affine'` (no posterior variance
+anywhere; the adjacency proposal is priced from the bridge score
+instead).
 """
 
 from __future__ import annotations
@@ -30,7 +37,10 @@ from ..parallel import call_T
 from .differences import forward_step, perturbed_weights, step_parameter
 from .influence_model import bin_posterior_variance
 from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences
-from .refine import adjacency_gain_value, adjacency_split_gain, compute_rho2, level_gain_value
+from .refine import (
+    _try_adjacency_split, adjacency_gain_value, adjacency_split_gain, bridge_gain_value,
+    compute_rho2, level_gain_value,
+)
 
 __all__ = ["Growth", "JointResult", "grow", "joint_psi_hat", "run_joint", "two_means_split"]
 
@@ -166,6 +176,25 @@ def _group_stats(psi0_all: np.ndarray, groups: Sequence[np.ndarray]):
         means[i] = rows.mean(axis=0)
         var[i] = np.maximum(rows.var(axis=0), 0.0)
     return means, var
+
+
+def _bridge_vectors(groups: Sequence[np.ndarray], pair_id: np.ndarray, pair_n: np.ndarray,
+                     pair_value: np.ndarray) -> np.ndarray:
+    """Per-group bridge-gain vector, every measured output at once
+    (spec/QIJ_affine_pilot_spec.md 3.2, design (b)): for each group, the
+    contained mask (`refine.batch_bridge`'s own containment test -- one
+    `bincount` of the group's own `pair_id` against `pair_n`) dotted
+    against `pair_value` = pair_mass[:, None] * pair_delta[:, measured]^2
+    (built once, by `qij.py`), giving Sum_{(jk) subset group} m_jk*Delta_jk^2
+    per output in one matrix product, never a loop over outputs or pairs."""
+    n_pairs = pair_n.size
+    q = pair_value.shape[1]
+    out = np.empty((len(groups), q))
+    for i, idx in enumerate(groups):
+        counts = np.bincount(pair_id[idx], minlength=n_pairs + 1)[:n_pairs]
+        contained = (counts == pair_n).astype(float)
+        out[i] = contained @ pair_value
+    return out
 
 
 def _predicted_share(psi0_all: np.ndarray, V_hat: np.ndarray, labels: np.ndarray, L: int):
@@ -375,8 +404,10 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
 def run_joint(
     X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
     sigma_all: np.ndarray, model, Z: np.ndarray, xvq, eta: float, eps: float,
-    pool=None, I_proto: Optional[np.ndarray] = None, start: np.ndarray = None,
-    measured: Optional[Sequence[int]] = None,
+    offset: np.ndarray, pool=None, I_proto: Optional[np.ndarray] = None,
+    start: np.ndarray = None, measured: Optional[Sequence[int]] = None,
+    pilot: str = 'gp', bridge_pair_id: Optional[np.ndarray] = None,
+    bridge_pair_n: Optional[np.ndarray] = None, bridge_value: Optional[np.ndarray] = None,
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -398,13 +429,34 @@ def run_joint(
     read from the full bins and restricted to `measured` by the caller
     instead (`qij.py`). `measured=None` defaults to identity
     (0..q-1), reproducing today's evaluations bit for bit.
+
+    `offset` (q,) is `psi0_all`'s own centering constant (`qij.py`'s
+    local `offset`, `model.offset` under `pilot='gp'`, the pilot-free
+    mean under `'affine'`), read here instead of `model.offset` so this
+    function never touches `model` when `pilot='affine'` (`model` is
+    then `None`). `pilot` picks the check's two flag/kind pricers
+    (spec/QIJ_affine_pilot_spec.md 3.3, R2), chosen once below, never
+    inside the check loop: `'gp'` (today's rule, bit-identical) reads
+    `model`/`sigma_all` for the within-bin posterior v_kc/u_kc and its
+    ported flag/kind rules; `'affine'` never calls `bin_posterior_
+    variance` (v_kc/u_kc are held at 0.0 throughout, so the flag rule's
+    posterior term vanishes and V_win_hat is the plain within-bin
+    variance), and instead prices a flagged bin's adjacency proposal
+    from the bridge score, `bridge_pair_id`/`bridge_pair_n`/
+    `bridge_value` (`bridge_value` = pair_mass[:, None] *
+    pair_delta[:, measured]^2, built once by `qij.py`) feeding
+    `_bridge_vectors`.
     """
     N, q = psi0_all.shape
     if measured is None:
         measured = list(range(q))
     M_X_used = xvq.M_used
 
-    if np.any(model.constant_path):
+    # `constant_path` is never raised under `pilot='affine'` (no `model`
+    # to read it from; a genuinely flat output is caught downstream by
+    # growth's own bin machinery instead, as the marginal path documents
+    # in `qij.py`).
+    if pilot == 'gp' and np.any(model.constant_path):
         return _failed_result(N, q)
 
     growth = grow(psi0_all, eps, M_X_used)
@@ -425,14 +477,29 @@ def run_joint(
     _, m0, var0 = _bin_stats(psi0_all, bins.labels, L0)
     a = _fit_scale(bins.p, U0, m0)
     groups0 = [np.where(bins.labels == k)[0] for k in range(L0)]
-    v0, u0 = _posterior_vu(model, Z, sigma_all, groups0)
-    psi_centered = psi0_all - model.offset[None, :]
+    # `pilot` selects the within-bin pricing input ONCE here (R2): 'gp'
+    # reads the GP posterior (v0/u0) via `_posterior_vu`; 'affine' never
+    # calls `bin_posterior_variance` (design (f)) and holds v0/u0 at 0.0
+    # (the flag rule's posterior term then vanishes, spec/QIJ_affine_
+    # pilot_spec.md 3.2 design (a)), pricing the adjacency proposal from
+    # each bin's own bridge vector instead (`_bridge_vectors`).
+    if pilot == 'gp':
+        v0, u0 = _posterior_vu(model, Z, sigma_all, groups0)
+        bridge0 = None
+    else:
+        v0 = np.zeros((L0, q))
+        u0 = np.zeros((L0, q))
+        bridge0 = _bridge_vectors(groups0, bridge_pair_id, bridge_pair_n, bridge_value)
+    psi_centered = psi0_all - offset[None, :]
 
     leaves: Dict[int, dict] = {
         k: dict(indices=groups0[k], n=int(bins.n[k]), U=U0[k].copy(), m=m0[k].copy(),
                 var=var0[k].copy(), v=v0[k].copy(), ubar=psi_centered[groups0[k]].mean(axis=0))
         for k in range(L0)
     }
+    if bridge0 is not None:
+        for k in range(L0):
+            leaves[k]['bridge'] = bridge0[k]
 
     flagged_mask = _flag_mask(bins.p, U0, m0, a, V_hat, u0, L0, eps)
     n_flagged = int(flagged_mask.sum())
@@ -445,10 +512,12 @@ def run_joint(
     delta_f = forward_step(eta)
     next_id = L0
 
-    def decide_split(leaf):
-        """The multi-output split-kind rule for a flagged bin: level
-        when sum_c Var_k(psi0_c)/V_btw_c >= sum_c v_kc/V_btw_c, else
-        adjacency; an infeasible kind falls back to the other."""
+    def decide_split_gp(leaf):
+        """`pilot='gp'`'s split-kind rule for a flagged bin (ported,
+        bit-identical): level when sum_c Var_k(psi0_c)/V_btw_c >=
+        sum_c v_kc/V_btw_c, else adjacency on whichever output's own
+        CADJ direction scores highest; an infeasible kind falls back to
+        the other."""
         idx = leaf['indices']
         p_k = leaf['n'] / N
         lhs = float(np.sum(leaf['var'] / V_btw))
@@ -469,6 +538,50 @@ def run_joint(
                     return (kind,) + best
         return None
 
+    def decide_split_affine(leaf):
+        """`pilot='affine'`'s split-kind rule for a flagged bin
+        (spec/QIJ_affine_pilot_spec.md 3.2 design (b)/(c)): BOTH kinds
+        are priced per output at rho2=1 -- the level split from
+        `two_means_split` on the bin's own Ψ̃ rows, priced by
+        `level_gain_value`; the adjacency gain from this leaf's own
+        bridge vector, priced by `bridge_gain_value` -- and level is
+        chosen when its summed normalized gain is at least the
+        adjacency one; the adjacency geometry itself comes from
+        `_try_adjacency_split` on whichever output c* has the largest
+        g_adj,c/V_btw,c, trying the remaining outputs in descending
+        order if c*'s split is infeasible. An infeasible chosen kind
+        falls back to the other; both infeasible closes the bin."""
+        idx = leaf['indices']
+        p_k = leaf['n'] / N
+        score_adj = bridge_gain_value(leaf['bridge'], 1.0) / V_btw
+
+        level_result = None
+        s_level = -np.inf
+        level_split = two_means_split(psi_tilde[idx])
+        if level_split is not None:
+            idx_a, idx_b = idx[level_split[0]], idx[level_split[1]]
+            ubar_a = psi_centered[idx_a].mean(axis=0)
+            ubar_b = psi_centered[idx_b].mean(axis=0)
+            g_level = level_gain_value(idx_a.size / N, ubar_a, idx_b.size / N, ubar_b,
+                                        p_k, leaf['ubar'], N, 1.0)
+            s_level = float(np.sum(g_level / V_btw))
+            level_result = ('level', idx_a, idx_b)
+
+        if level_result is not None and s_level >= float(np.sum(score_adj)):
+            return level_result
+
+        adjacency_result = None
+        if I_proto is not None:
+            for c in np.argsort(-score_adj):
+                split = _try_adjacency_split(idx, I_proto[:, c], xvq.bmu, xvq.bmu2)
+                if split is not None:
+                    adjacency_result = ('adjacency', split[0], split[1])
+                    break
+        return adjacency_result if adjacency_result is not None else level_result
+
+    # Chosen once (R2), never re-chosen inside the check loop below.
+    decide_split = decide_split_gp if pilot == 'gp' else decide_split_affine
+
     while current_flagged:
         if n_check_evals >= evals_cap:
             check_capped = True
@@ -482,7 +595,8 @@ def run_joint(
             kind, idx_a, idx_b = decided
             p_k = leaves[k]['n'] / N
             if kind == 'adjacency':
-                g = adjacency_gain_value(p_k, leaves[k]['v'], N, 1.0)
+                g = (adjacency_gain_value(p_k, leaves[k]['v'], N, 1.0) if pilot == 'gp'
+                     else bridge_gain_value(leaves[k]['bridge'], 1.0))
             else:
                 ubar_a, ubar_b = psi_centered[idx_a].mean(axis=0), psi_centered[idx_b].mean(axis=0)
                 g = level_gain_value(idx_a.size / N, ubar_a, idx_b.size / N, ubar_b,
@@ -544,13 +658,21 @@ def run_joint(
         idxs = [nl[1] for nl in new_leaves]
         Us = np.array([nl[2] for nl in new_leaves])
         means_new, var_new = _group_stats(psi0_all, idxs)
-        v_new, u_new = _posterior_vu(model, Z, sigma_all, idxs)
+        if pilot == 'gp':
+            v_new, u_new = _posterior_vu(model, Z, sigma_all, idxs)
+            bridge_new = None
+        else:
+            v_new = np.zeros((len(idxs), q))
+            u_new = np.zeros((len(idxs), q))
+            bridge_new = _bridge_vectors(idxs, bridge_pair_id, bridge_pair_n, bridge_value)
         p_new = np.array([idx.size for idx in idxs], dtype=float) / N
         L_current = len(leaves) + len(new_leaves)
         flagged_new = _flag_mask(p_new, Us, means_new, a, V_hat, u_new, L_current, eps)
         for i, nid in enumerate(ids):
             leaves[nid] = dict(indices=idxs[i], n=idxs[i].size, U=Us[i], m=means_new[i],
                                 var=var_new[i], v=v_new[i], ubar=psi_centered[idxs[i]].mean(axis=0))
+            if bridge_new is not None:
+                leaves[nid]['bridge'] = bridge_new[i]
             if flagged_new[i]:
                 current_flagged.add(nid)
 
