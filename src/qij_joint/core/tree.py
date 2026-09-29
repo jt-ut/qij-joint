@@ -158,7 +158,7 @@ def measured_child(state: TreeState, c: int):
     return (a0, a1) if node_mass(state, a0) >= node_mass(state, a1) else (a1, a0)
 
 
-def _split_node(state: TreeState, c: int) -> bool:
+def split_node(state: TreeState, c: int) -> bool:
     """Bisects node c in place if it has >= 2 members and is not
     degenerate, allocating two new nodes at the next free ids."""
     lo, hi = int(state.node_lo[c]), int(state.node_hi[c])
@@ -190,7 +190,7 @@ def _bfs_split(state: TreeState, roots) -> None:
     queue = deque(int(r) for r in roots)
     while queue:
         c = queue.popleft()
-        if _split_node(state, c):
+        if split_node(state, c):
             queue.append(int(state.node_child0[c]))
             queue.append(int(state.node_child1[c]))
 
@@ -494,7 +494,7 @@ def _open_candidates(state: TreeState, prev_round: int) -> List[int]:
     return candidates
 
 
-def _priority(E_parent: np.ndarray, V_btw: np.ndarray) -> float:
+def candidate_priority(E_parent: np.ndarray, V_btw: np.ndarray) -> float:
     """max_o E_parent,o / V_btw,o, 0 where V_btw,o = 0 (spec 5.2 step 2)."""
     ratio = np.zeros_like(V_btw)
     mask = V_btw > 0.0
@@ -563,7 +563,7 @@ def grow(state: TreeState, T, counter, pool, budget: int) -> Tuple[List[dict], s
             return curve_rows, 'exhausted', n_rounds, evals_tree
 
         V_btw = curve_rows[-1]['V_btw']
-        priority = [_priority(state.E[state.node_parent[c]], V_btw) for c in candidates]
+        priority = [candidate_priority(state.E[state.node_parent[c]], V_btw) for c in candidates]
         order = sorted(range(len(candidates)), key=lambda i: (-priority[i], candidates[i]))
         selected = [candidates[order[i]] for i in range(min(len(candidates), remaining))]
 
@@ -766,14 +766,14 @@ def leaves(state: TreeState) -> np.ndarray:
     return np.nonzero(is_leaf)[0]
 
 
-def _sibling(state: TreeState, node: int) -> int:
+def sibling(state: TreeState, node: int) -> int:
     """The other child of `node`'s parent (7.1's ĝ needs both)."""
     p = state.node_parent[node]
     c0, c1 = state.node_child0[p], state.node_child1[p]
     return c1 if node == c0 else c0
 
 
-def _frame(state: TreeState, node: int, row_z: np.ndarray, omega0: np.ndarray,
+def frame(state: TreeState, node: int, row_z: np.ndarray, omega0: np.ndarray,
            pos: np.ndarray, fn: np.ndarray, fm: np.ndarray, fc: np.ndarray) -> Dict[str, Any]:
     """Mass, mean, and eigen-geometry of node c's members in Z (7.1):
     its rows as they stand, or -- for an unopened single cell, one row
@@ -801,7 +801,7 @@ def _frame(state: TreeState, node: int, row_z: np.ndarray, omega0: np.ndarray,
                 eigval=vals, eigvec=vecs, rank=rank)
 
 
-def _pair_h(fr: Dict[str, Any], j: int, row_z: np.ndarray,
+def pair_h(fr: Dict[str, Any], j: int, row_z: np.ndarray,
             pos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """h_r for pair (leaf, j) (7.2): unit mass-weighted scatter along
     the leaf's j-th principal direction (1-indexed, j=1 largest)."""
@@ -810,7 +810,7 @@ def _pair_h(fr: Dict[str, Any], j: int, row_z: np.ndarray,
     return pos_l, (row_z[pos_l] - fr['mu']) @ v / np.sqrt(lam)
 
 
-def _quad_h(fr: Dict[str, Any], row_z: np.ndarray, pos: np.ndarray,
+def quad_h(fr: Dict[str, Any], row_z: np.ndarray, pos: np.ndarray,
             omega0: np.ndarray, N: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """h-tilde for the leaf's quadratic contrast (7.3): the Mahalanobis
     form under the rank-r pseudo-inverse of C_l (eigh, E3), centred and
@@ -832,7 +832,7 @@ def _quad_h(fr: Dict[str, Any], row_z: np.ndarray, pos: np.ndarray,
     return pos_l, h_tilde / np.sqrt(scale)
 
 
-def _weight(omega0: np.ndarray, pos_l: np.ndarray, h: np.ndarray,
+def weight(omega0: np.ndarray, pos_l: np.ndarray, h: np.ndarray,
             delta_f: float) -> Tuple[np.ndarray, float]:
     """omega(t) for one contrast (7.2-7.3): t set so the leaf's own
     largest |h| takes the step delta_f; every other row is unchanged."""
@@ -842,7 +842,7 @@ def _weight(omega0: np.ndarray, pos_l: np.ndarray, h: np.ndarray,
     return omega_t, t
 
 
-def _response(state: TreeState, value: np.ndarray, failed: bool, t: float,
+def response(state: TreeState, value: np.ndarray, failed: bool, t: float,
               p_l: float) -> Tuple[np.ndarray, np.ndarray]:
     """The response, noise and pass rule shared by a pair and a
     quadratic contrast (7.2-7.3): the unscaled contribution
@@ -865,13 +865,13 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
     pos = np.full(state.n_rows, -1, dtype=int)
     pos[row_ids] = np.arange(len(row_ids))
     fn, fm, fc = _field_moments(state.Z, state.bmu, state.M)
-    frames = {ell: _frame(state, ell, row_z, omega0, pos, fn, fm, fc) for ell in leaf_ids}
+    frames = {ell: frame(state, ell, row_z, omega0, pos, fn, fm, fc) for ell in leaf_ids}
 
     meas = state.measured
     ghat = {}
     for ell in leaf_ids:
-        sib = int(_sibling(state, ell))
-        sib_fr = frames.get(sib) or _frame(state, sib, row_z, omega0, pos, fn, fm, fc)
+        sib = int(sibling(state, ell))
+        sib_fr = frames.get(sib) or frame(state, sib, row_z, omega0, pos, fn, fm, fc)
         d_u = np.abs(state.U[ell, meas] - state.U[sib, meas])
         norm = np.linalg.norm(frames[ell]['mu'] - sib_fr['mu'])
         ghat[ell] = d_u / norm if norm > 0 else np.zeros_like(d_u)
@@ -901,12 +901,12 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
         pos = np.full(state.n_rows, -1, dtype=int)
         pos[row_ids] = np.arange(len(row_ids))
         for ell in {ell for _, ell, _ in bought}:
-            frames[ell] = _frame(state, ell, row_z, omega0, pos, fn, fm, fc)
+            frames[ell] = frame(state, ell, row_z, omega0, pos, fn, fm, fc)
 
     tasks, meta = [], []
     for _, ell, j in bought:
-        pos_l, h = _pair_h(frames[ell], j, row_z, pos)
-        omega_t, t = _weight(omega0, pos_l, h, state.delta_f)
+        pos_l, h = pair_h(frames[ell], j, row_z, pos)
+        omega_t, t = weight(omega0, pos_l, h, state.delta_f)
         tasks.append(((ell, j), omega_t, state.theta_Q, state.eta_full))
         meta.append((ell, j, t))
     results = run_batch(T, counter, pool, rows_x, tasks) if tasks else []
@@ -915,7 +915,7 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
     A: Dict[int, np.ndarray] = {}
     for (_, value, failed, status, _wall), (ell, j, t) in zip(results, meta):
         p_l = frames[ell]['p']
-        D, W, s, passed = _response(state, value, failed, t, p_l)
+        D, W, s, passed = response(state, value, failed, t, p_l)
         pairs.append(dict(leaf=ell, j=j, D=D, W=W, t=t, s=s, passed=passed, status=status))
         A[ell] = A.get(ell, np.zeros_like(V_btw_unscaled)) + W
 
@@ -927,10 +927,10 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
 
     tasks, meta = [], []
     for ell in quad_leaves:
-        pos_l, h = _quad_h(frames[ell], row_z, pos, omega0, state.N)
+        pos_l, h = quad_h(frames[ell], row_z, pos, omega0, state.N)
         if h is None:
             continue
-        omega_t, t = _weight(omega0, pos_l, h, state.delta_f)
+        omega_t, t = weight(omega0, pos_l, h, state.delta_f)
         tasks.append((ell, omega_t, state.theta_Q, state.eta_full))
         meta.append((ell, t))
     q_results = run_batch(T, counter, pool, rows_x, tasks) if tasks else []
@@ -938,7 +938,7 @@ def within(state: TreeState, T: Any, counter: Any, pool: Optional["Pool"],
     quads: List[Dict[str, Any]] = []
     for (_, value, failed, status, _wall), (ell, t) in zip(q_results, meta):
         p_l = frames[ell]['p']
-        Qv, contribution, s, passed = _response(state, value, failed, t, p_l)
+        Qv, contribution, s, passed = response(state, value, failed, t, p_l)
         quads.append(dict(leaf=ell, Q=Qv, contribution=contribution, t=t, s=s, passed=passed,
                           status=status))
 
@@ -971,18 +971,18 @@ def reconstruct(state: TreeState, pairs: List[Dict[str, Any]], quads: List[Dict[
     leaf_of_row = np.full(R, -1, dtype=int)
     frames: Dict[int, Dict[str, Any]] = {}
     for ell in leaves(state):
-        fr = _frame(state, ell, row_z, omega0, pos, fn, fm, fc)
+        fr = frame(state, ell, row_z, omega0, pos, fn, fm, fc)
         frames[ell] = fr
         pos_l = pos[fr['rows']]
         leaf_of_row[pos_l] = ell
         psi_rows[np.ix_(pos_l, meas)] += a * state.U[ell, meas]
     for pr in pairs:
         fr = frames[pr['leaf']]
-        pos_l, h = _pair_h(fr, pr['j'], row_z, pos)
+        pos_l, h = pair_h(fr, pr['j'], row_z, pos)
         psi_rows[np.ix_(pos_l, meas)] += np.outer(h, np.where(pr['passed'], a * pr['D'][meas] / fr['p'], 0.0))
     for qd in quads:
         fr = frames[qd['leaf']]
-        pos_l, h = _quad_h(fr, row_z, pos, omega0, state.N)
+        pos_l, h = quad_h(fr, row_z, pos, omega0, state.N)
         psi_rows[np.ix_(pos_l, meas)] += np.outer(h, np.where(qd['passed'], a * qd['Q'][meas] / fr['p'], 0.0))
 
     point_to_row = np.full(state.N, -1, dtype=int)

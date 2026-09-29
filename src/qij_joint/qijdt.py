@@ -32,8 +32,8 @@ from .core.abc import curvature as _curvature
 from .core.counter import Counter
 from .core.differences import central_step, difference, forward_step, step_parameter
 from .core.eta import measure_eta_full
-from .core.tree import (TreeState, _frame, _pair_h, _priority, _quad_h, _response, _sibling,
-                        _split_node, _weight, active_rows, fixed_point, is_degenerate,
+from .core.tree import (TreeState, frame, pair_h, candidate_priority, quad_h, response, sibling,
+                        split_node, weight, active_rows, fixed_point, is_degenerate,
                         is_point_leaf, leaf_V_btw, leaves, measure_nodes, node_mass, node_rows,
                         run_batch, set_weights)
 from .core.xvq import SurveyRows
@@ -192,7 +192,7 @@ def _grow(state: TreeState, T, counter, pool, eps: float):
     one batch, in priority order. Only the tolerance rule stops it (no
     budget). Returns (curve_rows, 'tolerance', n_rounds, n_below_closed,
     below)."""
-    _split_node(state, 0)
+    split_node(state, 0)
     measure_nodes(state, T, counter, pool, [0], 0)
     below = np.zeros(state.node_cap, dtype=bool)
     n_below_closed, evals_total, round_ = 0, 1, 0
@@ -218,11 +218,11 @@ def _grow(state: TreeState, T, counter, pool, eps: float):
                     candidates.append(child)
         if not candidates:
             return curve_rows, 'tolerance', round_ + 1, n_below_closed, below
-        priority = [_priority(state.E[state.node_parent[c]], V_prev) for c in candidates]
+        priority = [candidate_priority(state.E[state.node_parent[c]], V_prev) for c in candidates]
         order = sorted(range(len(candidates)), key=lambda i: (-priority[i], candidates[i]))
         selected = [candidates[i] for i in order]
         for c in selected:
-            _split_node(state, c)
+            split_node(state, c)
         round_ += 1
         measure_nodes(state, T, counter, pool, selected, round_)
         evals_total += len(selected)
@@ -255,7 +255,7 @@ def _leaf_geometry(state: TreeState):
     """Every current leaf's geometry (spec 7.1) and sibling derivative
     ĝ_ℓ,o (ranking only), plus the row arrays every contrast below
     needs: every point is always an active row for qijdt (no
-    compaction), so `pos` is `core.tree._frame`'s general row-position
+    compaction), so `pos` is `core.tree.frame`'s general row-position
     map, computed once and reused."""
     row_ids, rows_x, omega0 = active_rows(state)
     row_z = state.row_z[row_ids]
@@ -263,12 +263,12 @@ def _leaf_geometry(state: TreeState):
     pos[row_ids] = np.arange(len(row_ids))
     dummy, meas = np.zeros(0), state.measured
     leaf_ids = leaves(state)
-    frames = {int(ell): _frame(state, int(ell), row_z, omega0, pos, dummy, dummy, dummy)
+    frames = {int(ell): frame(state, int(ell), row_z, omega0, pos, dummy, dummy, dummy)
               for ell in leaf_ids}
     ghat = {}
     for ell in leaf_ids:
-        sib = int(_sibling(state, ell))
-        sib_fr = frames.get(sib) or _frame(state, sib, row_z, omega0, pos, dummy, dummy, dummy)
+        sib = int(sibling(state, ell))
+        sib_fr = frames.get(sib) or frame(state, sib, row_z, omega0, pos, dummy, dummy, dummy)
         d = np.abs(state.U[ell, meas] - state.U[sib, meas])
         norm = np.linalg.norm(frames[ell]['mu'] - sib_fr['mu'])
         ghat[ell] = d / norm if norm > 0 else np.zeros_like(d)
@@ -294,14 +294,14 @@ def _buy_pairs(state, T, counter, pool, leaf_ids, frames, ghat, tau, row_z, pos,
     n_bought = sum(1 for s in scored if s[0] >= 1.0)
     tasks, meta = [], []
     for _, ell, j, _ in scored[:n_bought]:
-        pos_l, h = _pair_h(frames[ell], j, row_z, pos)
-        omega_t, t = _weight(omega0, pos_l, h, state.delta_f)
+        pos_l, h = pair_h(frames[ell], j, row_z, pos)
+        omega_t, t = weight(omega0, pos_l, h, state.delta_f)
         tasks.append(((ell, j), omega_t, state.theta_Q, state.eta_full))
         meta.append((ell, j, t))
     results = run_batch(T, counter, pool, rows_x, tasks) if tasks else []
     pairs, A = [], {}
     for (_, value, failed, status, _w), (ell, j, t) in zip(results, meta):
-        D, W, s, passed = _response(state, value, failed, t, frames[ell]['p'])
+        D, W, s, passed = response(state, value, failed, t, frames[ell]['p'])
         pairs.append(dict(leaf=ell, j=j, D=D, W=W, t=t, s=s, passed=passed, status=status))
         A[ell] = A.get(ell, np.zeros_like(W)) + W
     zero = np.zeros(len(state.measured))
@@ -325,16 +325,16 @@ def _buy_quadratic(state, T, counter, pool, frames, A, tau, row_z, pos, omega0, 
     quad_leaves = [ell for score, ell in scored if score >= 1.0]
     tasks, meta = [], []
     for ell in quad_leaves:
-        pos_l, h = _quad_h(frames[ell], row_z, pos, omega0, state.N)
+        pos_l, h = quad_h(frames[ell], row_z, pos, omega0, state.N)
         if h is None:
             continue
-        omega_t, t = _weight(omega0, pos_l, h, state.delta_f)
+        omega_t, t = weight(omega0, pos_l, h, state.delta_f)
         tasks.append((ell, omega_t, state.theta_Q, state.eta_full))
         meta.append((ell, t))
     results = run_batch(T, counter, pool, rows_x, tasks) if tasks else []
     quads = []
     for (_, value, failed, status, _w), (ell, t) in zip(results, meta):
-        Q, contribution, s, passed = _response(state, value, failed, t, frames[ell]['p'])
+        Q, contribution, s, passed = response(state, value, failed, t, frames[ell]['p'])
         quads.append(dict(leaf=ell, Q=Q, contribution=contribution, t=t, s=s, passed=passed,
                            status=status))
     return quads
@@ -367,12 +367,12 @@ def _reconstruct(state: TreeState, leaf_ids, frames, row_z, pos, omega0, pairs, 
         psi[np.ix_(fr['rows'], meas)] += state.U[ell, meas]
     for pr in pairs:
         fr = frames[pr['leaf']]
-        _, h = _pair_h(fr, pr['j'], row_z, pos)
+        _, h = pair_h(fr, pr['j'], row_z, pos)
         psi[np.ix_(fr['rows'], meas)] += np.outer(
             h, np.where(pr['passed'], pr['D'][meas] / fr['p'], 0.0))
     for qd in quads:
         fr = frames[qd['leaf']]
-        _, h = _quad_h(fr, row_z, pos, omega0, state.N)
+        _, h = quad_h(fr, row_z, pos, omega0, state.N)
         psi[np.ix_(fr['rows'], meas)] += np.outer(
             h, np.where(qd['passed'], qd['Q'][meas] / fr['p'], 0.0))
     return psi, leaf_of_point
