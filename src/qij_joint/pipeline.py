@@ -421,15 +421,20 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
 
 def _ijfd_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> dict:
     """One `ijfd` scalar row (spec A13's product list): `eta_full`,
-    `nan_fraction`, timing/workers, the evaluation/row breakdown by
-    stage ('backward' and 'abc' are 0 under `point_curvature=False`,
-    the planner's ruling), and per output `V_ijfd`/`a`/`b_hat`/`c_q`
-    (the latter three NaN under `point_curvature=False`), one column per
-    `res.outputs` -- the measured subset (spec A11), mirroring `qij`'s
-    own `_qij_row`; identity `measured` reproduces every output."""
+    `nan_fraction` (under `point_curvature=False`, n_dropped/N: the
+    fraction lost even after `ijfd.py`'s backward retry; `n_retried`/
+    `n_dropped` are that retry's own counts, both 0 under
+    `point_curvature=True`, which has no retry), timing/workers, the
+    evaluation/row breakdown by stage ('abc' is 0 under
+    `point_curvature=False`, the planner's ruling), and per output
+    `V_ijfd`/`a`/`b_hat`/`c_q` (the latter three NaN under
+    `point_curvature=False`), one column per `res.outputs` -- the
+    measured subset (spec A11), mirroring `qij`'s own `_qij_row`;
+    identity `measured` reproduces every output."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'point_curvature': bool(res.point_curvature),
            'eta_full': float(res.eta_full), 'nan_fraction': float(res.nan_fraction),
+           'n_retried': int(res.n_retried), 'n_dropped': int(res.n_dropped),
            'wall_time_total': float(res.wall_time_total),
            'busy_time_total': float(res.busy_time_total), 'workers': int(res.workers)}
     for stage in ('cold', 'eta_full', 'forward', 'backward', 'abc', 'check', 'total'):
