@@ -71,8 +71,11 @@ row as the draw's seed. No budget arguments, no cap, no other options.
 
 ## 2. The base fit
 
-1. θ̂ = T(X, 1_N) (`_theta_hat_task` via the pool when given, else the
-   counter), status by `fit_status`. NaN → failed draw
+1. θ̂ = T(X, 1_N), as one batch task `('theta_hat', ones(N), None,
+   None)` through the same task function every other batch uses (9.2),
+   so its `fit_status` comes back from the task the same way at any
+   worker count (the pool's `_theta_hat_task` returns no status and
+   breaks bit identity of the status column). NaN → failed draw
    (`'theta_hat_failed'`).
 2. η_full by `measure_eta_full(counter, X, θ̂)`: 3 evaluations when T
    takes a start, else T's declared η with none.
@@ -98,6 +101,13 @@ noise estimate sees. So:
 Reaching the cap is a fit failure: failed draw, `status='base_unconverged'`.
 Products `n_fp`, `r_fp`. An estimator without a start is deterministic:
 no iteration, r = 0, no evaluation.
+
+The last iteration's two values also give the fit's **absolute
+reproducibility per output**, ν_o = max(η_f · |θ̂_o|, |θ'_o − θ_o|) with
+θ', θ the final pair (for a start-less T, ν_o = η_f · |θ̂_o|). ν is the
+noise scale of every contrast (4.2, 7.2): a relative scale alone
+returns no noise for an output near zero, which the build found.
+Product `nu_o`.
 
 ### 2.2 The weight construction and the step
 
@@ -150,9 +160,10 @@ A = the child of larger mass (ties: A₀), the other is B. p_c = p_A + p_B.
 
 ### 4.1 Coefficient and energy
 
-Measuring node c = one evaluation of U_A along its measured child (2.2),
-t_A = `step_parameter(δ_f, p_A)`. U_c is known (U_root = 0; otherwise
-from the parent's measurement), so
+Measuring node c = the step-verified forward difference (4.3) of U_A
+along its measured child (2.2), starting at t_A = `step_parameter(δ_f,
+p_A)`. U_c is known (U_root = 0; otherwise from the parent's
+measurement), so
 
     U_B = (p_c · U_c − p_A · U_A) / p_B,
     y_c = U_A − U_B,
@@ -163,12 +174,36 @@ is valid at every node.
 
 ### 4.2 Noise and the pass rule
 
-    s_c = √2 · η_full · |θ̂| / t_A · (p_c / p_B)      (per output; η_full = the declared η for a start-less T)
+    s_c = √2 · ν / t · (p_c / p_B)      (per output; ν from 2.1; t the accepted step of 4.3)
 
 Output o **passes** at node c when |y_c,o| > z_n · s_c,o, z_n = 5 (the
 filter tested offline; the constant is declared here and nowhere
 else). Energy is counted only where it passes: E_c,o ← E_c,o · 1[pass].
-A node with no passing output is **closed**: its children are leaves.
+A node with no passing output is **closed**: its children are leaves
+(not below the floor, 5.2).
+
+### 4.3 Step verification (every contrast: nodes, pairs, quadratic)
+
+A forward difference is accepted only when halving its step does not
+change it beyond noise. For a contrast whose first step is t (4.1 for a
+node; 7.2, 7.3 for the others), with U(t) its raw difference value and
+s(t) = √2 ν / t (times p_c/p_B for a node's y):
+
+    k = 0; measure U(t), U(t/2)
+    while some output o has |U(t/2^{k+1}) − U(t/2^k)| > z_n · s(t/2^{k+1})
+          and s(t/2^{k+1}) < |U(t/2^{k+1})| on such an o, and k < 8:
+        k ← k + 1; measure U(t/2^{k+1})
+    accept U(t/2^{k+1}) at step t/2^{k+1}, with its own s.
+
+Two evaluations per contrast in the usual case, one more per halving.
+A contrast that leaves the loop by the noise condition or the cap
+(k = 8, a failure boundary) is recorded as **non-smooth**: its accepted
+value is the smallest-step one, it passes or fails 4.2 as any other,
+and `nonsmooth = True` in its table row; `n_nonsmooth` is a scalar
+product. The build found nodes whose response changes sign between δ_f
+and 2δ_f and nodes exact at δ_f/2 but not at δ_f; both are caught here
+and neither is caught by any noise rule. This is the paper's
+step-doubling check applied to every contrast.
 
 A failed evaluation (exception, or any NaN in T's output): y_c = NaN on
 every output, no output passes, E_c = 0, `n_failed` += 1, the node is
@@ -183,38 +218,51 @@ flag), the current leaves (7.1's definition, maintained incrementally),
 per output V_btw,o = (1/N) Σ_leaves p_ℓ U_ℓ,o² and L = the number of
 leaves, and `evals_total` (every stage).
 
-### 5.2 Rounds and the tolerance rule
+### 5.2 Rounds, the floor, the lineage rule and the stop
 
-Round 0 measures the root. Then, per round r ≥ 1:
+M_floor = `cost_rule_M(N, q, eps)` (core.xvq; the paper's prototype
+count), the tree's minimum resolution: the survey's resolution the
+paper always had under its rule. Round 0 measures the root. Then, per
+round r ≥ 1:
 
-1. **Threshold** per output: τ_o = eps · V_btw,o / L, from the state at
-   the round's start. Each node measured in round r − 1 is now judged:
-   it is **below** when E_c,o < τ_o on every output (an output that
-   failed the noise rule counts as below). The flag is set once, here;
-   nodes measured in the final round are never judged and carry
-   below = False.
-2. **Candidates** = the children of nodes measured in round r − 1 that
-   are not closed, excluding point leaves and degenerate nodes, and
-   excluding the children of a node that is below AND whose parent is
-   below (a lineage closes after two consecutive below-threshold
-   splits; the root has no parent and is never closed by this rule).
+1. **Below the floor** (L < M_floor at the round's start): candidates
+   = every child of a node measured in round r − 1, excluding point
+   leaves and degenerate nodes; nothing closes, the noise rule of 4.2
+   only gates energy. Steps 3–6 as below.
+2. **At or above the floor**: the threshold per output
+   τ_o = eps · V_btw,o / L from the state at the round's start. Each
+   node measured in round r − 1 is judged once, now: **below** when
+   E_c,o < τ_o on every output (an output that failed the noise rule
+   counts as below); nodes measured in the final round carry
+   below = False. Candidates = the children of nodes measured in round
+   r − 1 that are not closed (4.2), excluding point leaves and
+   degenerate nodes, and excluding the children of a node that is below
+   AND whose parent is below (a lineage closes after two consecutive
+   below-threshold splits).
 3. **Priority** of a candidate = its parent's max_o E_o / V_btw,o (an
    output with V_btw,o = 0 contributes 0); ties: lower node id.
 4. **Selection**: every candidate, in priority order (the order fixes
-   node ids and batch order, nothing else). If there are no candidates,
-   stop with `tree_status='tolerance'`. The selected nodes' children are
-   built now (3.2).
-5. **Batch**: the selected nodes measured in one `pool.map` (9.2), in
-   selection order.
-6. The `curve` product gets one line per round.
+   node ids and batch order, nothing else). The selected nodes'
+   children are built now (3.2).
+5. **Batch**: the selected nodes measured in one `pool.map` per step of
+   4.3 (9.2), in selection order.
+6. **Level gain and the stop**: G_r,o = Σ over the round's measured
+   nodes of counted E_c,o. The descent stops after round r when
+   L ≥ M_floor and max_o G_r,o / V_btw,o < eps for this round and the
+   previous one (`tree_status='tolerance'`), or when there are no
+   candidates (`'exhausted'`). The `curve` product gets one line per
+   round with G_r,o.
 
-### 5.3 What the rule certifies and what it does not
+### 5.3 What the rules certify and what they do not
 
-The threshold is the paper's refinement rule transplanted: a split
-below the tolerance's share per leaf, twice in a row, closes the
-lineage. It does not bound the remainder in closed lineages; nothing
-measured can (no internal certificate exists, see QIJ_state_brief.md
-section 2). The remainder is reported, not estimated (11.1).
+The floor guarantees the resolution the paper's survey had, so a spike
+too deep for coarse contrasts to see (the build found one) is reached
+at the cost the paper paid. The level-gain stop has a fixed point on a
+spread influence, where a per-leaf threshold does not (the build ran
+two paper cases to the full data under the per-leaf rule alone). The
+lineage rule prunes below the floor. None of them bounds the remainder
+in closed lineages; nothing measured can (QIJ_state_brief.md section
+2). The remainder is reported, not estimated (11.1).
 
 ## 6. The bias stencil
 
@@ -262,7 +310,7 @@ elsewhere (mean 0 and mean of h² = 1 over ℓ, so Σ h = 0);
 ω_i(t) = 1 + t h_i, Σω = N; t = δ_f / max_i |h_i|. Response and
 contribution:
 
-    D_ℓj = [T(ω(t)) − θ̂] / t,        s = √2 · η_full · |θ̂| / t,
+    D_ℓj = [T(ω(t)) − θ̂] / t   step-verified by 4.3,   s = √2 · ν / t at the accepted step,
     W_ℓj,o = (1/N) · D_ℓj,o² / p_ℓ   where |D_ℓj,o| > z_n s_o, else 0.
 
 (For ψ affine in the leaf, D = p_ℓ (g·v_j) √λ_j, so W is exactly one
@@ -369,13 +417,13 @@ is the done marker.
 
 ### 11.1 Scalar row
 
-`s, seed, N, eps, workers, status, theta_hat_status,
+`s, seed, N, eps, M_floor, workers, status, theta_hat_status,
 eta_full, eta_full_failed, n_fp, r_fp, n_rounds, n_measured, n_leaves,
-max_depth, n_failed, tree_status, n_pairs_bought, n_quad_bought,
-evals_total, busy_time, wall_time`, per stage `evals_<stage>`,
-`wall_<stage>`, and per output o: `theta_hat_o, V_btw_o, V_win_o,
-V_tot_o, accel_o, b_hat_o, c_q_o, lo_o, hi_o, lo_btw_o, hi_btw_o,
-lo_abc_o, hi_abc_o` at level 0.95, plus the reported remainder
+max_depth, n_failed, n_nonsmooth, n_halvings_total, tree_status,
+n_pairs_bought, n_quad_bought, evals_total, busy_time, wall_time`, per
+stage `evals_<stage>`, `wall_<stage>`, and per output o: `theta_hat_o,
+nu_o, V_btw_o, V_win_o, V_tot_o, accel_o, b_hat_o, c_q_o, lo_o, hi_o,
+lo_btw_o, hi_btw_o, lo_abc_o, hi_abc_o` at level 0.95, plus the reported remainder
 `P_unbought_o` = the sum of 7.2's predicted terms over pairs NOT bought
 (a diagnostic, never in an interval) and `n_below_closed` = the number
 of lineages closed by the two-consecutive rule.
@@ -383,9 +431,10 @@ of lineages closed by the two-consecutive rule.
 ### 11.2 `nodes` (every draw)
 
 One row per measured node and per leaf: `node, parent, depth, n_points,
-p, node_measured (bool), round, below (bool), measured_child, t,
-status`, per output `U_o, y_o, s_o, E_o, pass_o` (NaN where not
-measured; U known for every row).
+p, node_measured (bool), round, below (bool), measured_child, t
+(accepted step), n_halvings, nonsmooth (bool), status`, per output
+`U_o, y_o, s_o, E_o, pass_o` (NaN where not measured; U known for every
+row).
 
 ### 11.3 `leaves` (every draw)
 
@@ -394,45 +443,41 @@ per output `U_o, ghat_o, A_o, Q2_o`.
 
 ### 11.4 `pairs` (every draw)
 
-One row per bought contrast: `leaf, j` (0 for the quadratic), `t`, per
-output `D_o, s_o, pass_o` (Q in the D column for j = 0).
+One row per bought contrast: `leaf, j` (0 for the quadratic), `t`
+(accepted step), `n_halvings, nonsmooth`, per output `D_o, s_o, pass_o`
+(Q in the D column for j = 0).
 
 ### 11.5 `curve` (every draw)
 
-One row per round: `round, evals_total, L, n_selected`, per output
-`V_btw_o, tau_o`.
+One row per round: `round, evals_total, L, n_selected, below_floor
+(bool)`, per output `V_btw_o, tau_o, G_o` (5.2 step 6).
 
 ### 11.6 `points` (only `--diag-draws`)
 
 `i, leaf`, per output `psi_hat_o`.
 
-## 12. Validation (a report; V3 is the one pass/fail item)
+## 12. Validation
 
-V1 **Paper cases.** (pareto, shape), (pareto, tail), (mvt, nu),
-(mvt, tail), (fp, all), (imf, all) at N = 2000, draws 0–9, eps 0.01,
-workers 8: from `curve`, the evals_total at which
-V_btw,o first reaches 0.99 of the `ij` product's V_ij,o (run `ij` for
-these draws if absent), V_tot,o / V_ij,o and evals_total at the end,
-tree_status, the three intervals' coverage of the registry truth over
-the 10 draws, b̂/accel/c_q per output. Beside it the existing method's
-cost on the same draws (`run.py <case> qij` at its defaults, run if
-absent), in evaluations and in size-N units.
+The author's rule (29 Sept): the tree is second-paper material and is
+not retested across the paper's cases on every change. Two tiers.
 
-V2 **cloudfil, draws 0 and 1**, eps 0.01, workers 14:
-the curve against the stored `ij` V_ij,o; V_tot,o / V_ij,o;
-evals by stage; n_below_closed and P_unbought_o against V_ij,o; the
-per-node y_o against the exact influence's contrast for every measured
-node at depth ≤ 5 (the node's member sets rebuilt in the validation
-script by the same bisection on the same Z, which is deterministic, and
-the contrast = mean ψ over A minus mean ψ over B from the `ij` product's
-ψ; no evaluation); busy/wall at workers 14 and 1 for draw 0.
+**Per change (the standing check, about ten minutes, no report beyond
+the numbers):**
+* cloudfil draw 1 (the converged-basin draw) and (pareto, shape) draw 0
+  at eps 0.01: V_tot,o / V_ij,o per output, evals_total, tree_status,
+  n_nonsmooth, n_halvings_total.
+* bit identity on (pareto, shape) draw 0 at workers 1 and 8 (every
+  product file byte-identical after dropping the timing columns): the
+  one pass/fail item.
+* the all-methods cloudfil smoke unchanged, `qijdt` in it at eps 0.05.
 
-V3 **Bit identity.** (pareto, tail) draw 0 and cloudfil draw 0 at
-workers 1 and 8: every product file identical (byte-for-byte after
-dropping the timing columns).
-
-V4 **Smoke.** The existing all-methods cloudfil smoke runs unchanged;
-`qijdt` is added at eps 0.05.
+**At a milestone the author calls, once (before the tree runs on
+Stampede3 for the second paper):** the six paper cases at N = 2000,
+draws 0–9, against the pipeline's `ij` and `qij` products (evals to
+0.99 of V_ij from the curve, V_tot/V_ij, coverage of the three
+intervals); cloudfil draws 0 and 1 with the offline node check against
+the exact influence (member sets rebuilt by the same bisection) and
+busy/wall at 14 and 1 workers. Not otherwise.
 
 Reports to `Research/QIJ_joint/qijdt_validation/` with the scripts.
 
@@ -464,8 +509,18 @@ Reports to `Research/QIJ_joint/qijdt_validation/` with the scripts.
   bought after the tree stops (7).
 * **What bounds the run?** Only the tolerance rule; the tree has at most
   N − 1 splits. The evaluation count is a product, not an input.
-* **Which η in the noise formulas for a start-less estimator?** The
-  declared η (4.2, 7.2), the same η_f that sets δ_f.
+* **Which noise scale for a start-less estimator?** ν_o = η_f · |θ̂_o|
+  with the declared η (2.1), the same η_f that sets δ_f; there is no
+  fixed-point pair to measure an absolute one from.
+* **How many evaluations does a node cost now?** Two in the usual case
+  (t and t/2), one more per halving (4.3); the tree's count roughly
+  doubles. Batches: one `pool.map` per step of the halving loop, over
+  the nodes still unresolved.
+* **What happens below the floor?** Every non-leaf child is measured
+  (5.2 step 1); no node closes, the noise rule only gates energy; the
+  lineage rule and the stop apply only once L ≥ M_floor.
+* **What is M_floor on cloudfil?** `cost_rule_M(10000, 7, 0.01)` = 1094,
+  the paper's number; on the paper's cases the paper's M_X values.
 * **What does `curvature` need that a `SurveyRows` normally carries?**
   Only `rows`, `omega0`, `eta_Q` (8.3); the rest is filled as stated
   and unused.
