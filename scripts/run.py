@@ -25,7 +25,7 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('dataset')
     p.add_argument('estimator')
-    p.add_argument('method', choices=['oracle', 'ij', 'boot', 'qij', 'qijt', 'ijfd'])
+    p.add_argument('method', choices=['oracle', 'ij', 'boot', 'qij', 'qijt', 'qijdt', 'ijfd'])
     p.add_argument('--N', type=int, required=True)
     p.add_argument('--draws', type=_range, required=True)
     p.add_argument('--seed', type=int, default=0)
@@ -94,6 +94,13 @@ def main(argv=None) -> None:
             workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
             ivqbins=args.ivqbins, survey=args.survey, quantized_start=args.quantized_start,
             refine_schedule=args.refine_schedule)
+    elif args.method == 'qijdt':
+        params['eps'] = args.eps
+        params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
+            if args.diag_draws else []
+        written, skipped = pipeline.run_qijdt(
+            args.dataset, args.estimator, args.N, args.draws, args.seed,
+            args.out, args.eps, args.diag_draws, args.force, workers=args.workers)
     elif args.method == 'qijt':
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
             if args.diag_draws else []

@@ -19,6 +19,7 @@ from .ijfd import IJFD
 from .audit import search_audit
 from .parallel import Pool, fit_status
 from .qij import QIJ
+from .qijdt import QIJDT
 from .qijt import QIJT
 
 
@@ -524,6 +525,94 @@ def run_qijt(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
                   'anchors': res.anchors, 'pairs': res.pairs}
         if s in diag:
             arrays['points'] = _qijt_points(res)
+        products.write_draw(md, s, row, arrays)
+        written += 1
+    if pool is not None:
+        pool.close()
+    return written, len(draws) - written
+
+
+_QIJDT_STAGES = ('full_fit', 'eta_full', 'tree', 'bias', 'within', 'quadratic', 'curvature')
+
+
+def _qijdt_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> dict:
+    """One `qijdt` scalar row (spec/QIJ_qijdt_spec.md section 11.1):
+    `QIJDTResult`'s scalars, the per-stage evaluation/wall-time
+    breakdown (section 9.1), and per output the coefficients, the
+    remainder diagnostic `P_unbought`, and the three level-0.95
+    intervals (section 8.4)."""
+    row = {'dataset': dataset, 'estimator': estimator, 'N': N, 's': s, 'seed': seed,
+           'eps': float(res.eps), 'workers': int(res.workers),
+           'status': res.status, 'theta_hat_status': res.theta_hat_status,
+           'eta_full': float(res.eta_full), 'eta_full_failed': bool(res.eta_full_failed),
+           'n_fp': int(res.n_fp), 'r_fp': float(res.r_fp), 'n_rounds': int(res.n_rounds),
+           'n_measured': int(res.n_measured), 'n_leaves': int(res.n_leaves),
+           'max_depth': int(res.max_depth), 'n_failed': int(res.n_failed),
+           'tree_status': res.tree_status, 'n_pairs_bought': int(res.n_pairs_bought),
+           'n_quad_bought': int(res.n_quad_bought), 'n_below_closed': int(res.n_below_closed),
+           'evals_total': int(sum(res.evals_by_stage[st] for st in _QIJDT_STAGES)),
+           'busy_time': float(res.busy_time), 'wall_time': float(res.wall_time)}
+    for stage in _QIJDT_STAGES:
+        row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
+        row[f'wall_{stage}'] = float(res.wall_time_by_stage[stage])
+    lo, hi = res.interval(_QIJT_LEVEL).T
+    lo_btw, hi_btw = res.interval_btw(_QIJT_LEVEL).T
+    lo_abc, hi_abc = res.abc_interval(_QIJT_LEVEL).T
+    for j, o in enumerate(res.outputs):
+        row[f'theta_hat_{o}'] = float(res.theta_hat[res.measured[j]])
+        row[f'V_btw_{o}'] = float(res.V_btw[j])
+        row[f'V_win_{o}'] = float(res.V_win[j])
+        row[f'V_tot_{o}'] = float(res.V_tot[j])
+        row[f'accel_{o}'] = float(res.accel[j])
+        row[f'b_hat_{o}'] = float(res.b_hat[j])
+        row[f'c_q_{o}'] = float(res.c_q[j])
+        row[f'P_unbought_{o}'] = float(res.P_unbought[j])
+        row[f'lo_{o}'] = float(lo[j])
+        row[f'hi_{o}'] = float(hi[j])
+        row[f'lo_btw_{o}'] = float(lo_btw[j])
+        row[f'hi_btw_{o}'] = float(hi_btw[j])
+        row[f'lo_abc_{o}'] = float(lo_abc[j])
+        row[f'hi_abc_{o}'] = float(hi_abc[j])
+    return row
+
+
+def _qijdt_points(res) -> pd.DataFrame:
+    """`points` for `--diag-draws` (spec section 11.6): `i, leaf`, per
+    output `psi_hat_o`."""
+    N = res.psi_hat.shape[0]
+    data = {'i': np.arange(N), 'leaf': np.asarray(res.leaf_of_point, dtype=np.int64)}
+    for j, o in enumerate(res.outputs):
+        data[f'psi_hat_{o}'] = res.psi_hat[:, j]
+    return pd.DataFrame(data)
+
+
+def run_qijdt(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
+              out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
+              workers: int = 1) -> Tuple[int, int]:
+    """`qijdt` (spec/QIJ_qijdt_spec.md): a sequential draw loop, one pool
+    shared across the run when `workers > 1` (mirrors `run_qijt`'s
+    pattern). Every draw writes `nodes`, `leaves`, `pairs`, `curve`
+    (sections 11.2-11.5) and, on `--diag-draws`, `points` (section
+    11.6)."""
+    draws = list(draws)
+    md = products.method_dir(out_dir, dataset, estimator, N, 'qijdt')
+    diag = set(diag_draws) if diag_draws is not None else set()
+    case = registry.case(dataset, estimator)
+    T = case.make_T()
+    pool = Pool(workers, T=T) if workers > 1 else None
+    written = 0
+    for s in draws:
+        if not force and products.is_done(md, s):
+            continue
+        dseed = seed + s
+        X = case.draw(N, dseed)
+        res = QIJDT(eps=eps, vq_transform=case.vq_transform).fit(X, T, pool=pool)
+        row = _qijdt_row(dataset, estimator, N, s, dseed, res)
+        row.update(search_audit(T, X, res.theta_hat, dataset, estimator))
+        arrays = {'nodes': res.nodes, 'leaves': res.leaves, 'pairs': res.pairs,
+                  'curve': res.curve}
+        if s in diag:
+            arrays['points'] = _qijdt_points(res)
         products.write_draw(md, s, row, arrays)
         written += 1
     if pool is not None:
