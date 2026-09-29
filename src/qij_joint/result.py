@@ -31,6 +31,16 @@ populated for every estimator; for one without `takes_start` the
 curvature and bias/acceleration ingredients still cost their declared
 evaluations (a and b_hat from the deterministic optimizer's own bins),
 only `eta_Q`/`survey_step_ratio` stay NaN (no continuation to check).
+
+`pilot` (spec/QIJ_affine_pilot_spec.md) picks stage 1's initial
+influence estimate: `'affine'` or `'gp'`. Under `'affine'`, `ell`,
+`lam`, `ell_bound`, `lam_bound`, `c`, `c_bound`, `sigma` and
+`prototype_h` are NaN/False (no posterior variance or width/local-scale
+search of any kind), and `bridge_j`/`bridge_k`/`bridge_m`/`bridge_delta`
+(the bridge score, one row per CADJ pair with a non-empty second-order
+cell) and `cell_p`/`cell_mu`/`cell_g` (the affine field's own per-cell
+mass, mean and gradient) are populated; both are empty under `'gp'`,
+whose every other field stays exactly as before this option existed.
 """
 from __future__ import annotations
 
@@ -123,6 +133,14 @@ class QIJResult:
                                     # without `takes_start`
     survey_step_ratio: np.ndarray  # (5, q) A9 item 4; NaN rows/columns as eta_Q is
     quantized_start: str           # 'multistart' or 'full-data' (A9 item 5)
+    pilot: str                     # 'affine' or 'gp' (spec/QIJ_affine_pilot_spec.md 1)
+    bridge_j: np.ndarray           # (P,) int; empty under pilot='gp'
+    bridge_k: np.ndarray           # (P,) int; empty under pilot='gp'
+    bridge_m: np.ndarray           # (P,) m_jk; empty under pilot='gp'
+    bridge_delta: np.ndarray       # (P, q) Delta_jk; empty under pilot='gp'
+    cell_p: np.ndarray             # (M,) p_j; empty under pilot='gp'
+    cell_mu: np.ndarray            # (M, d_z) mu_j; empty under pilot='gp'
+    cell_g: np.ndarray             # (M, d_z, q) g_j; empty under pilot='gp'
 
     @property
     def variance(self) -> np.ndarray:

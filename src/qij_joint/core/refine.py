@@ -26,9 +26,18 @@ even considered. `core.rounds.run_refinement_rounds`
 output's qualifying leaves are split together, all their evaluations
 sharing one pool batch. The two share this module's per-output setup
 (`prepare_coordinate`), per-leaf proposal (`new_leaf`, `propose`,
-`batch_v`, `compute_rho2`) and per-split update (`apply_split`) --
-everything but the selection and batching is the ported rule either
-way.
+`batch_v`/`batch_bridge`, `compute_rho2`) and per-split update
+(`apply_split`) -- everything but the selection and batching is the
+ported rule either way.
+
+`pilot` (spec/QIJ_affine_pilot_spec.md 3.2) picks, once in
+`prepare_coordinate`, which of two pricing functions a coordinate's
+whole refinement uses: `'gp'`'s `_gp_kind_split`/`batch_v` (the ported
+rule, a level split when Var_k(psi0) > v_k else adjacency, v_k the GP's
+within-bin posterior variance) or `'affine'`'s `_affine_kind_split`/
+`batch_bridge` (both proposals priced, the larger predicted gain taken,
+the adjacency gain from the bridge score's Delta_jk/m_jk in place of
+v_k). No posterior variance is read or computed under `'affine'`.
 """
 
 from __future__ import annotations
@@ -46,9 +55,9 @@ from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences, 
 __all__ = [
     "CoordinateResult", "RefineState", "run_refinement",
     "prepare_coordinate", "finalize_coordinate", "apply_split",
-    "new_leaf", "propose", "batch_v",
+    "new_leaf", "propose", "batch_v", "batch_bridge",
     "compute_rho2", "split_gamma",
-    "level_gain_value", "adjacency_gain_value",
+    "level_gain_value", "adjacency_gain_value", "bridge_gain_value",
     "level_split_gain", "adjacency_split_gain",
 ]
 
@@ -158,6 +167,15 @@ class RefineState:
     B_hat, a_bca, M_used, busy_delta
                         carried through from the initial-bin measurement
                         into the final `CoordinateResult`.
+    kind_split, batch_fn  the pilot's two selected functions
+                        (spec/QIJ_affine_pilot_spec.md 3.2, R2): `kind_
+                        split(leaf, rho2_local, psi0_c, psi_centered,
+                        I_proto_c, bmu, bmu2, N)` prices and picks this
+                        leaf's proposed split; `batch_fn(leaf_list)` sets
+                        whatever per-leaf pricing input `kind_split`
+                        reads (`leaf['v']` under `'gp'`, `leaf['bridge']`
+                        under `'affine'`). Chosen once in `prepare_
+                        coordinate`, never re-chosen inside a loop.
     """
 
     X: np.ndarray
@@ -196,6 +214,8 @@ class RefineState:
     a_bca: np.ndarray
     M_used: int
     busy_delta: float
+    kind_split: object
+    batch_fn: object
 
 
 def _variance(values: np.ndarray) -> float:
@@ -263,6 +283,14 @@ def adjacency_gain_value(p_k: float, v_k: float, N: int, rho2: float) -> float:
     return (rho2 * p_k * v_k) / N
 
 
+def bridge_gain_value(bridge_sum: float, rho2: float) -> float:
+    """rho2*bridge_sum/4 (spec/QIJ_affine_pilot_spec.md 3.2): the affine
+    pilot's adjacency-split predicted gain, `bridge_sum` = Sum over the
+    bin's own second-order cells (jk) of m_jk*Delta_jk^2 (`batch_bridge`).
+    """
+    return (rho2 * bridge_sum) / 4.0
+
+
 def level_split_gain(
     idx: np.ndarray, psi0_c: np.ndarray, psi_centered_c: np.ndarray,
     N: int, p_k: float, ubar_k: float, rho2: float,
@@ -300,11 +328,15 @@ def new_leaf(leaf_id: int, idx: np.ndarray, U: np.ndarray, gamma: float, strike:
              psi0_c: np.ndarray, psi_centered: np.ndarray) -> dict:
     """A leaf's Var(psi0) and mean depend only on its own fixed
     indices, so both are computed once here, at creation, and read
-    back everywhere else (spec/method_notes.md section 4)."""
+    back everywhere else (spec/method_notes.md section 4). `v` defaults
+    to 0.0 -- under `pilot='gp'` `batch_v` overwrites it on every leaf
+    with more than one point; under `pilot='affine'` there is no
+    posterior variance of any kind (spec/QIJ_affine_pilot_spec.md 1), so
+    `finalize_coordinate`'s V_win_hat reads it as 0.0 throughout."""
     return dict(
         id=leaf_id, indices=idx, n=int(idx.size), U=U,
         var_k=_variance(psi0_c[idx]), ubar=float(psi_centered[idx].mean()),
-        open=True, split=None, g=0.0, gamma=gamma, strike=strike,
+        open=True, split=None, g=0.0, gamma=gamma, strike=strike, v=0.0,
     )
 
 
@@ -322,6 +354,24 @@ def batch_v(leaf_list: List[dict], model, Z: np.ndarray, model_index: int,
     v_vals = bin_posterior_variance(model, Z, model_index, groups, sigma_c)
     for leaf, v in zip(qualifying, v_vals):
         leaf['v'] = float(v)
+
+
+def batch_bridge(leaf_list: List[dict], pair_id: np.ndarray, pair_n: np.ndarray,
+                  pair_value_c: np.ndarray) -> None:
+    """Set leaf['bridge'] -- Sum_{(jk) subset bin} m_jk*Delta_jk^2 for
+    this coordinate (spec/QIJ_affine_pilot_spec.md 2.2, 3.2, 6) -- on
+    every leaf in `leaf_list` that holds more than one point. A
+    second-order cell (jk) lies wholly inside a leaf exactly when the
+    leaf's own point count for `pair_id`'s pair p equals that pair's
+    TOTAL point count `pair_n[p]` (over the whole draw); a leaf's own
+    counts come from one `bincount` of its own indices, never a Python
+    loop over its points or over pairs."""
+    n_pairs = pair_n.size
+    for leaf in (l for l in leaf_list if l['n'] > 1):
+        idx = leaf['indices']
+        counts = np.bincount(pair_id[idx], minlength=n_pairs + 1)[:n_pairs]
+        contained = counts == pair_n
+        leaf['bridge'] = float(np.sum(pair_value_c[contained]))
 
 
 def compute_rho2(V_btw: float, sum_pubar2: float, N: int) -> float:
@@ -363,13 +413,46 @@ def _ported_kind_split(
     return kind, idx_a, idx_b, g
 
 
+def _gp_kind_split(leaf: dict, rho2_local: float, psi0_c: np.ndarray, psi_centered: np.ndarray,
+                    I_proto_c: np.ndarray, bmu: np.ndarray, bmu2: np.ndarray, N: int):
+    """`pilot='gp'`'s kind-split function (spec/QIJ_affine_pilot_spec.md
+    3.2): `_ported_kind_split` reading this leaf's own `var_k`/`v`."""
+    idx = leaf['indices']
+    p_k = leaf['n'] / N
+    return _ported_kind_split(idx, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N,
+                               p_k, leaf['ubar'], leaf['var_k'], leaf['v'], rho2_local)
+
+
+def _affine_kind_split(leaf: dict, rho2_local: float, psi0_c: np.ndarray, psi_centered: np.ndarray,
+                        I_proto_c: np.ndarray, bmu: np.ndarray, bmu2: np.ndarray, N: int):
+    """`pilot='affine'`'s kind-split function (spec/QIJ_affine_pilot_spec.md
+    3.2): both proposals are priced -- `level_split_gain` and the
+    adjacency geometry of `_try_adjacency_split` priced by
+    `bridge_gain_value` on this leaf's own precomputed bridge sum
+    (`batch_bridge`) -- and the larger predicted gain is taken; `leaf['v']`
+    is not read."""
+    idx = leaf['indices']
+    p_k = leaf['n'] / N
+    level = level_split_gain(idx, psi0_c, psi_centered, N, p_k, leaf['ubar'], rho2_local)
+    adj_split = _try_adjacency_split(idx, I_proto_c, bmu, bmu2)
+    adjacency = None
+    if adj_split is not None:
+        g_adj = bridge_gain_value(leaf['bridge'], rho2_local)
+        adjacency = (adj_split[0], adj_split[1], g_adj)
+    if level is None and adjacency is None:
+        return None
+    if adjacency is None or (level is not None and level[2] >= adjacency[2]):
+        return ('level', level[0], level[1], level[2])
+    return ('adjacency', adjacency[0], adjacency[1], adjacency[2])
+
+
 def propose(leaf: dict, rho2_current: float, psi0_c: np.ndarray, psi_centered: np.ndarray,
-            I_proto_c: np.ndarray, bmu: np.ndarray, bmu2: np.ndarray, N: int) -> None:
-    """The bin's proposed split and expected gain g, the ported rule
-    (spec/method_notes.md section 4, `_ported_kind_split`).
+            I_proto_c: np.ndarray, bmu: np.ndarray, bmu2: np.ndarray, N: int, kind_split) -> None:
+    """The bin's proposed split and expected gain g, from `kind_split`
+    (`_gp_kind_split` or `_affine_kind_split`, chosen once per coordinate
+    in `prepare_coordinate`, spec/QIJ_affine_pilot_spec.md 3.2, R2).
     `rho2_current` is the rho^2 in force when the leaf was created,
     frozen into the gain at proposal time."""
-    idx = leaf['indices']
     n_k = leaf['n']
     if n_k <= 1:
         leaf['open'] = False
@@ -377,10 +460,8 @@ def propose(leaf: dict, rho2_current: float, psi0_c: np.ndarray, psi_centered: n
         leaf['g'] = 0.0
         return
 
-    p_k = n_k / N
     rho2_local = rho2_current if np.isfinite(rho2_current) else 0.0
-    result = _ported_kind_split(idx, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N,
-                                 p_k, leaf['ubar'], leaf['var_k'], leaf['v'], rho2_local)
+    result = kind_split(leaf, rho2_local, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N)
     if result is None:
         leaf['open'] = False
         leaf['split'] = None
@@ -458,11 +539,11 @@ def apply_split(
         - p_parent * leaf['ubar'] ** 2
     )
 
-    # Both children need v_k regardless of what happens next: a child
-    # closed immediately below is still a final bin if it is never
-    # split again, and the V_win_hat gather reuses this same cached
-    # value.
-    batch_v([leaf_small, leaf_large], state.model, state.Z, state.model_index, state.sigma_c)
+    # Both children need their pricing input regardless of what happens
+    # next: a child closed immediately below is still a final bin if it
+    # is never split again, and the V_win_hat gather reuses this same
+    # cached value.
+    state.batch_fn([leaf_small, leaf_large])
 
     if close_children:
         leaf_small['open'] = False
@@ -470,9 +551,9 @@ def apply_split(
     else:
         rho2 = compute_rho2(state.V_btw, state.sum_pubar2, N)
         propose(leaf_small, rho2, state.psi0_c, state.psi_centered,
-                state.I_proto_c, state.bmu, state.bmu2, N)
+                state.I_proto_c, state.bmu, state.bmu2, N, state.kind_split)
         propose(leaf_large, rho2, state.psi0_c, state.psi_centered,
-                state.I_proto_c, state.bmu, state.bmu2, N)
+                state.I_proto_c, state.bmu, state.bmu2, N, state.kind_split)
 
 
 def _degenerate_result(coordinate: int, name: str, N: int, bins0: BinSet, M_X_used: int,
@@ -537,6 +618,10 @@ def prepare_coordinate(
     pool=None,
     start: np.ndarray = None,
     model_index: int = None,
+    pilot: str = 'gp',
+    bridge_pair_id: np.ndarray = None,
+    bridge_pair_n: np.ndarray = None,
+    bridge_value_c: np.ndarray = None,
 ) -> Union[CoordinateResult, RefineState]:
     """
     One estimand coordinate's initial I-VQ, its full-data measurement,
@@ -548,11 +633,30 @@ def prepare_coordinate(
     initial-bin measurement failed (spec section 5); otherwise a
     `RefineState`, its every open leaf already proposed a split against
     `model` as given.
+
+    `pilot` picks the two functions this coordinate's every leaf
+    proposal and pricing update uses from here on
+    (spec/QIJ_affine_pilot_spec.md 3.2, R2): `'gp'` (`_gp_kind_split`,
+    `batch_v` against `model`/`Z`/`sigma_c`) or `'affine'`
+    (`_affine_kind_split`, `batch_bridge` against `bridge_pair_id`/
+    `bridge_pair_n`/`bridge_value_c`, this coordinate's own m_jk*Delta_jk^2
+    per pair). Chosen once here, never re-chosen inside the refinement
+    loop.
     """
     if model_index is None:
         model_index = coordinate
     N = len(X)
     q = theta_hat.shape[0]
+
+    if pilot == 'gp':
+        kind_split = _gp_kind_split
+        batch_fn = lambda leaf_list: batch_v(leaf_list, model, Z, model_index, sigma_c)
+    elif pilot == 'affine':
+        kind_split = _affine_kind_split
+        batch_fn = lambda leaf_list: batch_bridge(leaf_list, bridge_pair_id, bridge_pair_n,
+                                                   bridge_value_c)
+    else:
+        raise ValueError(f"unknown pilot {pilot!r}")
 
     bins0 = build_bins(psi0_c, eps)
 
@@ -595,11 +699,12 @@ def prepare_coordinate(
         n_refine_evals=0, n_level_splits=0, n_adjacency_splits=0,
         sum_measured_delta=0.0, sum_expected_g=0.0, sum_pubar2=sum_pubar2,
         B_hat=B_hat, a_bca=a_bca, M_used=bins0.M_used, busy_delta=busy_delta,
+        kind_split=kind_split, batch_fn=batch_fn,
     )
-    batch_v(list(leaves.values()), model, Z, model_index, sigma_c)
+    state.batch_fn(list(leaves.values()))
     rho2 = compute_rho2(state.V_btw, state.sum_pubar2, N)
     for leaf in leaves.values():
-        propose(leaf, rho2, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N)
+        propose(leaf, rho2, psi0_c, psi_centered, I_proto_c, bmu, bmu2, N, kind_split)
     return state
 
 
@@ -720,6 +825,10 @@ def run_refinement(
     pool=None,
     start: np.ndarray = None,
     model_index: int = None,
+    pilot: str = 'gp',
+    bridge_pair_id: np.ndarray = None,
+    bridge_pair_n: np.ndarray = None,
+    bridge_value_c: np.ndarray = None,
 ) -> CoordinateResult:
     """
     Refinement for one estimand coordinate, `refine_schedule='queue'`
@@ -749,11 +858,15 @@ def run_refinement(
     spec/QIJ_mods_waves.md A9) and `eta` (A15's eta_full, the caller's
     own value) are passed to every full-data evaluation here -- the
     initial-bin stencils and every refinement split; `start=None`
-    reproduces today's evaluations bit for bit.
+    reproduces today's evaluations bit for bit. `pilot` and the
+    `bridge_*` arrays select and feed this coordinate's pricing
+    functions (spec/QIJ_affine_pilot_spec.md 3.2), passed straight to
+    `prepare_coordinate`.
     """
     setup = prepare_coordinate(
         X, counter, theta_hat, coordinate, name, psi0_c, m_c, sigma_c, I_proto_c, bmu, bmu2,
         eta, eps, M_X_used, constant_path, Z, model, pool, start, model_index,
+        pilot, bridge_pair_id, bridge_pair_n, bridge_value_c,
     )
     if isinstance(setup, CoordinateResult):
         return setup

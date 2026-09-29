@@ -3,20 +3,30 @@ section 4).
 
 `QIJ(eps=0.01, seed=0, vq_transform=None, gptrend='affine',
 gpwidth='global', M_X=None, ivqbins='marginal', survey='points',
-quantized_start='multistart').fit(X, T, pool=None)` runs stage 1 (the
-X-VQ, prototype influences, initial influence estimate) and stage 2
-(the shared full-data evaluation, then `ivqbins`'s `'marginal'`
-per-output refinement or `'joint'` shared partition, method_notes joint
-section), returning a `QIJResult`. `gptrend`/`gpwidth` pass straight to
-`fit_influence_model` (method_notes section 3); `M_X` overrides the
-prototype-count rule when given (method_notes section 2); `survey`
-picks the prototype survey's receptive-field representation, `'points'`
-(one row per prototype) or `'moments'` (spec/method_notes.md section 2),
-passed to `run_xvq`. `quantized_start` (spec/QIJ_mods_waves.md A9 item
-5) picks theta_Q's starting point: `'multistart'` (ported) fits theta_Q
-from scratch on the survey rows; `'full-data'` runs theta_hat first (on
-`pool` when given) and continues it onto the survey rows via `start`
-(a no-op for an estimator without `takes_start`). After stage 1, the
+quantized_start='multistart', pilot='affine').fit(X, T, pool=None)` runs
+stage 1 (the X-VQ, prototype influences, initial influence estimate)
+and stage 2 (the shared full-data evaluation, then `ivqbins`'s
+`'marginal'` per-output refinement or `'joint'` shared partition,
+method_notes joint section), returning a `QIJResult`. `pilot`
+(spec/QIJ_affine_pilot_spec.md) picks stage 1's initial influence
+estimate: `'affine'` (the default), the mean-preserving per-cell affine
+field of `core.affine_pilot`, with no posterior variance and the
+refinement's adjacency proposals priced by the bridge score
+(spec/QIJ_affine_pilot_spec.md 3.2); or `'gp'`, today's Gaussian-process
+pilot, bit-identical to before this option existed. `gptrend`/`gpwidth`
+pass straight to `fit_influence_model` (method_notes section 3) and are
+unused under `pilot='affine'`; `M_X` overrides the prototype-count rule
+when given (method_notes section 2); `survey` picks the prototype
+survey's receptive-field representation, `'points'` (one row per
+prototype) or `'moments'` (spec/method_notes.md section 2), passed to
+`run_xvq`. `ivqbins='joint'` with `pilot='affine'` raises `NotImplementedError`
+(spec/QIJ_affine_pilot_spec.md 3.3): the joint check's own pricing is
+not restructured for the bridge score in this build. `quantized_start`
+(spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
+`'multistart'` (ported) fits theta_Q from scratch on the survey rows;
+`'full-data'` runs theta_hat first (on `pool` when given) and continues
+it onto the survey rows via `start` (a no-op for an estimator without
+`takes_start`). After stage 1, the
 ABC interval's curvature ingredient (`core.abc.curvature`,
 spec/QIJ_mods_waves.md A10) is measured on the survey rows for every
 estimator, in its own `'curvature'` evaluation stage. With a `pool`:
@@ -74,6 +84,7 @@ import numpy as np
 from numpy.linalg import LinAlgError
 
 from .core import abc as core_abc
+from .core.affine_pilot import fit as fit_affine_pilot
 from .core.counter import Counter
 from .core.eta import measure_eta_full
 from .core.influence_model import fit_influence_model
@@ -138,9 +149,21 @@ def _theta_hat_task(T, case, X: np.ndarray, _task):
     return result, failed, time.perf_counter() - t0
 
 
+def _empty_pilot_products(q: int) -> dict:
+    """Empty `bridge`/`cells` array products (spec/QIJ_affine_pilot_spec.md
+    2.3, 4): under `pilot='gp'`, or a draw that never reached the affine
+    pilot's own fit, both are empty."""
+    return dict(
+        bridge_j=np.zeros(0, dtype=int), bridge_k=np.zeros(0, dtype=int),
+        bridge_m=np.zeros(0, dtype=float), bridge_delta=np.zeros((0, q), dtype=float),
+        cell_p=np.zeros(0, dtype=float), cell_mu=np.zeros((0, 0), dtype=float),
+        cell_g=np.zeros((0, 0, q), dtype=float),
+    )
+
+
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
-                  sv, quantized_start, refine_schedule) -> QIJResult:
+                  sv, quantized_start, refine_schedule, pilot) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -181,7 +204,8 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        **_marginal_defaults(N, q), **_joint_defaults(N, q),
+        pilot=pilot,
+        **_marginal_defaults(N, q), **_joint_defaults(N, q), **_empty_pilot_products(q),
     )
 
 
@@ -192,7 +216,9 @@ class QIJ:
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
-                 refine_schedule: str = 'queue') -> None:
+                 refine_schedule: str = 'queue', pilot: str = 'affine') -> None:
+        if pilot not in ('affine', 'gp'):
+            raise ValueError(f"unknown pilot {pilot!r}")
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -203,12 +229,20 @@ class QIJ:
         self.survey = survey
         self.refine_schedule = refine_schedule
         self.quantized_start = quantized_start
+        self.pilot = pilot
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
         influences), the shared full-data base evaluation, the ABC
         curvature stage, then per-output refinement, on `pool` per the
         module docstring."""
+        if self.ivqbins == 'joint' and self.pilot == 'affine':
+            # The joint check's own pricing (`core.joint`) is not
+            # restructured for the bridge score in this build (spec/
+            # QIJ_affine_pilot_spec.md 3.3); the marginal path is what
+            # the study runs under `pilot='affine'`.
+            raise NotImplementedError(
+                "ivqbins='joint' with pilot='affine' is not built; use ivqbins='marginal'")
         t_start = time.perf_counter()
         X = np.asarray(X)
         N = len(X)
@@ -293,27 +327,47 @@ class QIJ:
         # result's diagnostics -- the same `inverse(xvq.centers)`
         # `run_xvq` already applied, recovered rather than re-derived.
         W_X = np.asarray(inverse(xvq.centers), dtype=float)
-        try:
-            # Fit only the MEASURED outputs' GPs (spec/QIJ_mods_waves.md
-            # A11): `model` (and, below, `psi0_all`/`sigma_all`) are then
-            # indexed by LOCAL position (0..q-1, `measured`'s own order),
-            # never by the absolute index into `theta_hat`/`I_proto`,
-            # which stay full width for T's own continuation and for the
-            # bin measurements that reuse one shared evaluation across
-            # every output. Identity `measured` reproduces today's
-            # full-width model bit for bit.
-            model, model_busy = fit_influence_model(
-                Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
-                gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool)
-        except (RuntimeError, LinAlgError):
-            # A failed stage 1 is recorded as failed, never retried; a
-            # submitted `theta_future` is left uncollected and uncounted,
-            # as the serial code never reaches its own call here either.
-            return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
-                                 self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
-                                 self.survey, sv, self.quantized_start, self.refine_schedule)
-        psi0_all = _psi0(model, Z)
-        sigma_all = _uncertainty(model, Z)
+        pilot_result = None
+        if self.pilot == 'gp':
+            try:
+                # Fit only the MEASURED outputs' GPs (spec/QIJ_mods_waves.md
+                # A11): `model` (and, below, `psi0_all`/`sigma_all`) are then
+                # indexed by LOCAL position (0..q-1, `measured`'s own order),
+                # never by the absolute index into `theta_hat`/`I_proto`,
+                # which stay full width for T's own continuation and for the
+                # bin measurements that reuse one shared evaluation across
+                # every output. Identity `measured` reproduces today's
+                # full-width model bit for bit.
+                model, model_busy = fit_influence_model(
+                    Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
+                    gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool)
+            except (RuntimeError, LinAlgError):
+                # A failed stage 1 is recorded as failed, never retried; a
+                # submitted `theta_future` is left uncollected and uncounted,
+                # as the serial code never reaches its own call here either.
+                return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
+                                     self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
+                                     self.survey, sv, self.quantized_start, self.refine_schedule,
+                                     self.pilot)
+            psi0_all = _psi0(model, Z)
+            sigma_all = _uncertainty(model, Z)
+            offset = np.asarray(model.offset, dtype=float)
+            constant_path_arr = np.asarray(model.constant_path, dtype=bool)
+        else:
+            # The affine pilot (spec/QIJ_affine_pilot_spec.md 2): no
+            # posterior variance (`sigma_all` all NaN), no width search
+            # (`model_busy` 0), `I_proto` at FULL width (section 6, cheap
+            # for every output at once) then sliced to `measured` here,
+            # where `qij.fit` slices every other stage-1 product.
+            # `constant_path` is never raised for this pilot: a genuinely
+            # flat output is still caught downstream by the initial I-VQ's
+            # own `M_used <= 1` (`refine.prepare_coordinate`).
+            model, model_busy = None, 0.0
+            pilot_result = fit_affine_pilot(Z, xvq, I_proto)
+            psi0_all = pilot_result.psi0[:, measured]
+            sigma_all = np.full((N, q), np.nan)
+            offset = psi0_all.mean(axis=0)
+            constant_path_arr = np.zeros(q, dtype=bool)
         wall_time_prototype = time.perf_counter() - t0
         ev1, rows1 = counter.snapshot()
 
@@ -431,23 +485,40 @@ class QIJ:
             # scheduled: `'queue'` runs each output's own queue in turn,
             # serial evaluations only; `'rounds'` runs them together,
             # batching every round's evaluations across outputs onto `pool`.
+            # Under `pilot='affine'` the bridge pair geometry (`pair_id`/
+            # `pair_n`) is shared across every output; only each output's
+            # own m_jk*Delta_jk^2 (`bridge_value_c`, spec/QIJ_affine_pilot_
+            # spec.md 3.2) differs, at output c's ABSOLUTE index -- the
+            # pilot's own tables are full width (section 6).
+            if self.pilot == 'affine':
+                bridge_pair_id = pilot_result.pair_id
+                bridge_pair_n = pilot_result.pair_n
+                bridge_value_cols = [
+                    pilot_result.pair_mass * pilot_result.pair_delta[:, c] ** 2 for c in measured
+                ]
+            else:
+                bridge_pair_id = bridge_pair_n = bridge_value_cols = None
             if self.refine_schedule == 'rounds':
                 coordinates, n_rounds = run_refinement_rounds(
                     X, counter, theta_hat, list(measured), list(outputs),
-                    [psi0_all[:, j] for j in range(q)], [float(model.offset[j]) for j in range(q)],
+                    [psi0_all[:, j] for j in range(q)], [float(offset[j]) for j in range(q)],
                     [sigma_all[:, j] for j in range(q)], [I_proto[:, c] for c in measured],
                     xvq.bmu, xvq.bmu2, eta_full, self.eps, xvq.M_used,
-                    [bool(model.constant_path[j]) for j in range(q)], Z, model, list(range(q)),
+                    [bool(constant_path_arr[j]) for j in range(q)], Z, model, list(range(q)),
                     pool, start=start_second_stage,
+                    pilot=self.pilot, bridge_pair_id=bridge_pair_id, bridge_pair_n=bridge_pair_n,
+                    bridge_value_cols=bridge_value_cols,
                 )
             else:
                 coordinates = [
                     run_refinement(
                         X, counter, theta_hat, c, name,
-                        psi0_all[:, j], float(model.offset[j]), sigma_all[:, j],
+                        psi0_all[:, j], float(offset[j]), sigma_all[:, j],
                         I_proto[:, c], xvq.bmu, xvq.bmu2,
-                        eta_full, self.eps, xvq.M_used, bool(model.constant_path[j]), Z, model, pool,
+                        eta_full, self.eps, xvq.M_used, bool(constant_path_arr[j]), Z, model, pool,
                         start=start_second_stage, model_index=j,
+                        pilot=self.pilot, bridge_pair_id=bridge_pair_id, bridge_pair_n=bridge_pair_n,
+                        bridge_value_c=(bridge_value_cols[j] if bridge_value_cols is not None else None),
                     )
                     for j, (c, name) in enumerate(zip(measured, outputs))
                 ]
@@ -522,33 +593,54 @@ class QIJ:
         busy_time_total = (wall_time_total + xvq_busy + model_busy + full_data_busy
                             + second_stage_busy + curvature_busy)
 
-        # at_bound[:, 0] is whichever width parameter gpwidth fits
-        # (method_notes section 3); `model` is already the measured
-        # subset (spec/QIJ_mods_waves.md A11), so every model-derived
-        # field below is used as-is, at `model`'s own (measured) width --
-        # only the T-output arrays (`theta_hat`, `I_proto`, `c_q`,
-        # `survey_step_ratio`) still need `[measured]`.
-        local = self.gpwidth == 'local'
-        ell_bound = np.zeros(q, dtype=bool) if local else model.at_bound[:, 0].copy()
-        c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
+        if self.pilot == 'gp':
+            # at_bound[:, 0] is whichever width parameter gpwidth fits
+            # (method_notes section 3); `model` is already the measured
+            # subset (spec/QIJ_mods_waves.md A11), so every model-derived
+            # field below is used as-is, at `model`'s own (measured)
+            # width -- only the T-output arrays (`theta_hat`, `I_proto`,
+            # `c_q`, `survey_step_ratio`) still need `[measured]`.
+            local = self.gpwidth == 'local'
+            ell_bound = np.zeros(q, dtype=bool) if local else model.at_bound[:, 0].copy()
+            c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
+            ell, lam = np.array(model.width), np.array(model.lam)
+            lam_bound, c_arr = model.at_bound[:, 1].copy(), np.array(model.c)
+            prototype_h = np.array(model.h)
+            pilot_products = _empty_pilot_products(q)
+        else:
+            # No width/lam/c of any kind under 'affine' (spec/QIJ_affine_
+            # pilot_spec.md 4), `prototype_h` NaN as under a failed GP fit
+            # today (module docstring); `bridge`/`cells` sliced to
+            # `measured` from the pilot's own full-width tables.
+            nan_q, false_q = np.full(q, np.nan), np.zeros(q, dtype=bool)
+            ell = lam = c_arr = nan_q
+            ell_bound = lam_bound = c_bound = false_q
+            prototype_h = np.full(xvq.M_used, np.nan)
+            pilot_products = dict(
+                bridge_j=pilot_result.pair_j, bridge_k=pilot_result.pair_k,
+                bridge_m=pilot_result.pair_mass,
+                bridge_delta=pilot_result.pair_delta[:, measured],
+                cell_p=xvq.p, cell_mu=pilot_result.cell_mu,
+                cell_g=pilot_result.cell_g[:, :, measured],
+            )
 
         return QIJResult(
             outputs=outputs, N=N, theta_hat=theta_hat[measured], theta_hat_full=theta_hat,
-            ell=np.array(model.width), lam=np.array(model.lam),
-            ell_bound=ell_bound, lam_bound=model.at_bound[:, 1].copy(),
+            ell=ell, lam=lam, ell_bound=ell_bound, lam_bound=lam_bound,
             gptrend=self.gptrend, gpwidth=self.gpwidth,
-            c=np.array(model.c), c_bound=c_bound,
+            c=c_arr, c_bound=c_bound,
             M_X=xvq.M_used, M_X_source=M_X_source, n_failed=counter.failed,
             evals_by_stage=evals_by_stage, rows_by_stage=rows_by_stage,
             wall_time_by_stage=wall_time_by_stage,
             busy_time_total=busy_time_total, workers=workers,
             psi0=psi0_all, sigma=sigma_all,
-            bmu=xvq.bmu, prototype_p=xvq.p, prototype_w=W_X, prototype_h=np.array(model.h),
+            bmu=xvq.bmu, prototype_p=xvq.p, prototype_w=W_X, prototype_h=prototype_h,
             prototype_I=np.asarray(I_proto, dtype=float)[:, measured],
             ivqbins=self.ivqbins, survey=self.survey,
             c_q=c_q, c_q_one_sided=c_q_one_sided, eta_Q=sv.eta_Q, eta_full=float(eta_full),
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
-            **second_stage_fields, **joint_fields,
+            pilot=self.pilot,
+            **second_stage_fields, **joint_fields, **pilot_products,
         )

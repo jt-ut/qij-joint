@@ -163,7 +163,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     measured trigger's own scale factor, B4's formula reused at one
     output)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
-           's': s, 'seed': seed, 'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
+           's': s, 'seed': seed, 'pilot': res.pilot,
+           'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
            'quantized_start': res.quantized_start, 'eta_Q': float(res.eta_Q),
@@ -292,12 +293,37 @@ def _qij_prototypes(res) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _qij_bridge(res) -> pd.DataFrame:
+    """`bridge` for every `qij` draw under `pilot='affine'`: j, k, m_jk,
+    Delta_<o> per measured output (spec/QIJ_affine_pilot_spec.md 2.2, 4)."""
+    data = {'j': res.bridge_j, 'k': res.bridge_k, 'm_jk': res.bridge_m}
+    for j, o in enumerate(res.outputs):
+        data[f'Delta_{o}'] = res.bridge_delta[:, j]
+    return pd.DataFrame(data)
+
+
+def _qij_cells(res) -> pd.DataFrame:
+    """`cells` for every `qij` draw under `pilot='affine'`: j, p_j, mu_j
+    (one column per Z dimension), g_j per measured output (one column
+    per Z dimension) (spec/QIJ_affine_pilot_spec.md 2.1, 2.3, 4)."""
+    M = res.cell_p.shape[0]
+    mu = np.atleast_2d(np.asarray(res.cell_mu, dtype=float).reshape(M, -1))
+    data = {'j': np.arange(M), 'p_j': res.cell_p}
+    for d in range(mu.shape[1]):
+        data[f'mu_{d}'] = mu[:, d]
+    for j, o in enumerate(res.outputs):
+        g = res.cell_g[:, :, j]
+        for d in range(g.shape[1]):
+            data[f'g_{o}_{d}'] = g[:, d]
+    return pd.DataFrame(data)
+
+
 def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
             out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
             workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
             M_X: Optional[int] = None, ivqbins: str = 'marginal',
             survey: str = 'points', quantized_start: str = 'multistart',
-            refine_schedule: str = 'queue') -> Tuple[int, int]:
+            refine_schedule: str = 'queue', pilot: str = 'affine') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -310,7 +336,10 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     Every draw also writes a
     `step_ratio` array (A9 item 4) and, under `ivqbins='marginal'`, a
     `bin_U` array (spec/QIJ_mods_waves.md A14), neither gated behind
-    `--diag-draws` like `points`/`prototypes`/`bins` are."""
+    `--diag-draws` like `points`/`prototypes`/`bins` are. `pilot`
+    (spec/QIJ_affine_pilot_spec.md) picks stage 1's initial influence
+    estimate; under `'affine'`, every draw also writes the `bridge` and
+    `cells` array products (section 4)."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -326,7 +355,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
-                  refine_schedule=refine_schedule).fit(
+                  refine_schedule=refine_schedule, pilot=pilot).fit(
                       X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
@@ -338,6 +367,9 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         # `--diag-draws` one.
         if ivqbins == 'marginal':
             arrays['bin_U'] = _qij_bin_U(res)
+        if pilot == 'affine':
+            arrays['bridge'] = _qij_bridge(res)
+            arrays['cells'] = _qij_cells(res)
         if s in diag:
             arrays['points'] = _qij_points(res)
             arrays['prototypes'] = _qij_prototypes(res)

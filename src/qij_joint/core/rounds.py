@@ -111,6 +111,10 @@ def run_refinement_rounds(
     model_indices: Sequence[int],
     pool=None,
     start: np.ndarray = None,
+    pilot: str = 'gp',
+    bridge_pair_id: np.ndarray = None,
+    bridge_pair_n: np.ndarray = None,
+    bridge_value_cols: Sequence[np.ndarray] = None,
 ) -> Tuple[List[CoordinateResult], int]:
     """
     Refine every measured output together, in synchronized rounds
@@ -122,7 +126,11 @@ def run_refinement_rounds(
     result is applied with `refine.apply_split` before the next round's
     selection is made. Every other argument mirrors
     `refine.run_refinement`'s own, one entry per measured output in the
-    per-output sequences, same as `eta`/`eps`/`M_X_used`. Returns (this
+    per-output sequences, same as `eta`/`eps`/`M_X_used`. `pilot` and
+    `bridge_pair_id`/`bridge_pair_n` (shared across outputs) and
+    `bridge_value_cols` (one entry per measured output) select and feed
+    each coordinate's pricing functions exactly as `refine.run_
+    refinement` does (spec/QIJ_affine_pilot_spec.md 3.2). Returns (this
     call's `CoordinateResult` per output, in `coordinates`' order, and
     the number of rounds run).
     """
@@ -130,10 +138,12 @@ def run_refinement_rounds(
     results: List[Optional[CoordinateResult]] = [None] * n
     states = {}
     for i in range(n):
+        bridge_value_c = bridge_value_cols[i] if bridge_value_cols is not None else None
         setup = prepare_coordinate(
             X, counter, theta_hat, coordinates[i], names[i], psi0_cols[i], m_vals[i],
             sigma_cols[i], I_proto_cols[i], bmu, bmu2, eta, eps, M_X_used,
             constant_paths[i], Z, model, pool, start, model_indices[i],
+            pilot, bridge_pair_id, bridge_pair_n, bridge_value_c,
         )
         if isinstance(setup, CoordinateResult):
             results[i] = setup
