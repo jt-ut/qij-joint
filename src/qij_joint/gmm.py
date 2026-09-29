@@ -1095,8 +1095,8 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     information could not be formed, or formed but is not PD at a point
     the finish calls converged -- a saddle wearing a small gradient);
     every other status returns a dict(theta, pis, mus, Ss, A, ll, resid,
-    status, n_iter_em, n_iter_newton, label_order), and only 'converged'
-    additionally carries `psi` (the raw mixture score plus the
+    status, n_iter_em, n_iter_newton, label_order, n_finish_retry), and
+    only 'converged' additionally carries `psi` (the raw mixture score plus the
     per-point sensitivity of the penalty to that point's own weight --
     the influence's own numerator, not worth forming for a fit `GMM2D`
     is about to NaN anyway). `ll` is ell_p/W; `A` is the penalized
@@ -1128,7 +1128,14 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     stall it detects itself once the accepted step is smaller than the
     fit's own reproducibility (5.5, `newton_stalled`); either ending
     returns EM's endpoint, never the finish's own last (possibly worse)
-    iterate."""
+    iterate. A first attempt ending `newton_cap` or `newton_stalled` (not
+    'linalg', not `em_cap`) gets one retry from the same starting point,
+    same stopping tests, and same iteration cap and trust radii, with
+    `scipy`'s trust-region-Newton-Krylov subproblem solver in place of
+    its exact one, since a near-singular or indefinite penalized
+    information can send the exact solver's own Cholesky-failure branch
+    a NaN step; `n_finish_retry` (0 or 1) in the returned dict records
+    whether that retry ran."""
     W, a_pen, Scov, d = _weighted_cov(X, w)
 
     if start is None:
@@ -1194,11 +1201,12 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
 
     n_iter_em = best['n_iter']
 
-    def _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton):
+    def _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton, n_finish_retry=0):
         theta = _pack(cfg.K, pis, mus, Ss)
         return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, A=A, ll=ll, resid=resid,
                     status=status, n_iter_em=n_iter_em, n_iter_newton=n_iter_newton,
-                    label_order=label_order, search=best.get('search')), status
+                    label_order=label_order, search=best.get('search'),
+                    n_finish_retry=n_finish_retry), status
 
     if best['status'] != 'converged':
         # EM never reached its own stopping rule (2.1): the finish's
@@ -1252,61 +1260,86 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     radius0 = max(float(np.linalg.norm(last_step_u / s)), math.sqrt(eta))
     n_cap = 2 * p
 
-    stall = {'v': v0.copy(), 'n': 0, 'converged': False, 'stalled': False}
+    def _finish_attempt(method, n_finish_retry):
+        """One trust-region finish (2.2, 5) from `v0` by `method`: the
+        exact stopping tests of 2.3/5.5 on a fresh stall state, then the
+        converged branch's Cholesky check and penalty-influence extra, or
+        the failed branch's status. `n_finish_retry` (0 or 1) is stamped
+        onto a returned fit dict, recording whether this call is the
+        unconditional retry after a first attempt's own 'newton_cap' or
+        'newton_stalled'."""
+        stall = {'v': v0.copy(), 'n': 0, 'converged': False, 'stalled': False}
 
-    def _callback(intermediate_result):
-        # scipy halts a trust-region minimize only on a raised
-        # StopIteration from the callback it was given (its return value
-        # is not consulted), so the two exact stopping tests of 2.3/5.5
-        # both raise rather than return.
-        v = np.asarray(intermediate_result.x, dtype=float)
-        if _score_v(v) <= eta:
-            stall['converged'] = True
-            raise StopIteration
-        step = float(np.linalg.norm(v - stall['v']))
-        if step == 0.0:
-            # A rejected step: the point did not move and the trust
-            # region shrinks and tries again. Not evidence of a stall.
-            return
-        stall['v'] = v
-        stall['n'] = stall['n'] + 1 if step < eta else 0
-        # A step below the fit's own reproducibility, twice in a row (so
-        # one small-but-real step near convergence is never mistaken for
-        # a stall), cannot improve it further (5.5): give up here rather
-        # than let the cap (5.4) spend the rest of its budget on nothing.
-        if stall['n'] >= 2:
-            stall['stalled'] = True
-            raise StopIteration
+        def _callback(intermediate_result):
+            # scipy halts a trust-region minimize only on a raised
+            # StopIteration from the callback it was given (its return
+            # value is not consulted), so the two exact stopping tests of
+            # 2.3/5.5 both raise rather than return.
+            v = np.asarray(intermediate_result.x, dtype=float)
+            if _score_v(v) <= eta:
+                stall['converged'] = True
+                raise StopIteration
+            step = float(np.linalg.norm(v - stall['v']))
+            if step == 0.0:
+                # A rejected step: the point did not move and the trust
+                # region shrinks and tries again. Not evidence of a stall.
+                return
+            stall['v'] = v
+            stall['n'] = stall['n'] + 1 if step < eta else 0
+            # A step below the fit's own reproducibility, twice in a row
+            # (so one small-but-real step near convergence is never
+            # mistaken for a stall), cannot improve it further (5.5): give
+            # up here rather than let the cap (5.4) spend the rest of its
+            # budget on nothing.
+            if stall['n'] >= 2:
+                stall['stalled'] = True
+                raise StopIteration
 
-    result = minimize(fun, v0, jac=jac, hess=hess, method='trust-exact',
-                       callback=_callback,
-                       options=dict(initial_trust_radius=radius0,
-                                    max_trust_radius=max(1e3, 10.0 * radius0),
-                                    gtol=0.0, maxiter=n_cap))
-    n_iter_newton = int(result.nit)
-    final = _eval(np.asarray(result.x, dtype=float))
-    resid = scaled_gradient_norm(final['g_u'], s, final['ll'])
+        result = minimize(fun, v0, jac=jac, hess=hess, method=method,
+                           callback=_callback,
+                           options=dict(initial_trust_radius=radius0,
+                                        max_trust_radius=max(1e3, 10.0 * radius0),
+                                        gtol=0.0, maxiter=n_cap))
+        n_iter_newton = int(result.nit)
+        final = _eval(np.asarray(result.x, dtype=float))
+        resid = scaled_gradient_norm(final['g_u'], s, final['ll'])
 
-    # A finish that stalls has reached the precision floor: its steps are
-    # below the fit's own reproducibility and cannot lower the gradient
-    # further. It counts as converged when the gradient there is within
-    # sqrt(eta), the level EM's own stop test accepts; a stall farther
-    # from a maximum than that is still a failure.
-    # scipy's own status 2 (its model can no longer predict an
-    # improvement: the trust region has collapsed) is the same floor.
-    stalled = stall['stalled'] or result.status == 2
-    at_floor = stalled and resid <= math.sqrt(eta)
-    if stall['converged'] or resid <= eta or at_floor:
-        if not _cholesky_ok(final['A']):
-            return None, 'linalg'
-        extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
-        fit, _ = _stopped('converged', final['pis'], final['mus'], final['Ss'],
-                           final['A'], final['ll'], resid, n_iter_newton)
-        fit['psi'] = final['psi'] + extra
-        return fit, 'converged'
+        # A finish that stalls has reached the precision floor: its steps
+        # are below the fit's own reproducibility and cannot lower the
+        # gradient further. It counts as converged when the gradient
+        # there is within sqrt(eta), the level EM's own stop test
+        # accepts; a stall farther from a maximum than that is still a
+        # failure. scipy's own status 2 (its model can no longer predict
+        # an improvement: the trust region has collapsed) is the same
+        # floor.
+        stalled = stall['stalled'] or result.status == 2
+        at_floor = stalled and resid <= math.sqrt(eta)
+        if stall['converged'] or resid <= eta or at_floor:
+            if not _cholesky_ok(final['A']):
+                return None, 'linalg'
+            extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
+            fit, _ = _stopped('converged', final['pis'], final['mus'], final['Ss'],
+                               final['A'], final['ll'], resid, n_iter_newton,
+                               n_finish_retry=n_finish_retry)
+            fit['psi'] = final['psi'] + extra
+            return fit, 'converged'
 
-    status = 'newton_cap' if (result.status == 1 and not stall['stalled']) else 'newton_stalled'
-    return _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton)
+        status = 'newton_cap' if (result.status == 1 and not stall['stalled']) else 'newton_stalled'
+        return _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton,
+                         n_finish_retry=n_finish_retry)
+
+    fit, status = _finish_attempt('trust-exact', 0)
+    if status in ('newton_cap', 'newton_stalled'):
+        # scipy's trust-exact subproblem can return a NaN step on a
+        # near-singular or indefinite Hessian (its unsuccessful-Cholesky
+        # branch takes the sqrt of a slightly negative product), which
+        # then poisons every later iterate and ends the finish here
+        # rather than at its own floor. trust-krylov's Lanczos subproblem
+        # solver handles an indefinite Hessian without that bracketing,
+        # so one retry from the same v0, with the same stopping tests,
+        # recovers such a fit.
+        fit, status = _finish_attempt('trust-krylov', 1)
+    return fit, status
 
 
 def _center_start(start, K: int, xmean: np.ndarray):
@@ -1326,7 +1359,7 @@ def _center_start(start, K: int, xmean: np.ndarray):
 
 
 FitInfo = namedtuple('FitInfo', ['status', 'score', 'n_iter_em', 'n_iter_newton',
-                                  'label_order', 'search'])
+                                  'label_order', 'search', 'n_finish_retry'])
 
 
 def _fit_info(fit, status) -> FitInfo:
@@ -1334,13 +1367,16 @@ def _fit_info(fit, status) -> FitInfo:
     (spec/QIJ_estimator_fit_spec.md 2.4): `score` is the final scaled
     gradient norm of 2.3 whatever `status` is; `n_iter_em`/`n_iter_newton`
     /`label_order` are 0/0/None on 'infeasible' or 'linalg', since those
-    two statuses have no dict (`_fit`'s docstring)."""
+    two statuses have no dict (`_fit`'s docstring). `n_finish_retry` is 0
+    there too: a retry that itself ends 'linalg' leaves no dict to record
+    having run one."""
     if fit is None:
         return FitInfo(status=status, score=float('nan'), n_iter_em=0,
-                        n_iter_newton=0, label_order=None, search=None)
+                        n_iter_newton=0, label_order=None, search=None,
+                        n_finish_retry=0)
     return FitInfo(status=status, score=fit['resid'], n_iter_em=fit['n_iter_em'],
                    n_iter_newton=fit['n_iter_newton'], label_order=fit['label_order'],
-                   search=fit.get('search'))
+                   search=fit.get('search'), n_finish_retry=fit['n_finish_retry'])
 
 
 def _merge_scores(R: np.ndarray) -> np.ndarray:
