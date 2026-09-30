@@ -71,11 +71,11 @@ def _ij_task(T, case, X, task):
 
 
 def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
-               out_dir: str, workers: int, force: bool) -> Tuple[int, int]:
+               out_dir: str, workers: int, force: bool, tag: str = '') -> Tuple[int, int]:
     """`oracle`: theta_true (the registry) and theta_hat = T(X, ones),
     parallel across draws."""
     draws = list(draws)
-    md = products.method_dir(out_dir, dataset, estimator, N, 'oracle')
+    md = products.method_dir(out_dir, dataset, estimator, N, 'oracle', tag)
     theta_true = registry.truth(dataset, estimator)
     outputs = registry.case(dataset, estimator).make_T().outputs
     pending = [s for s in draws if force or not products.is_done(md, s)]
@@ -95,13 +95,13 @@ def run_oracle(dataset: str, estimator: str, N: int, draws: Iterable[int], seed:
 
 
 def run_ij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
-           out_dir: str, workers: int, force: bool) -> Tuple[int, int]:
+           out_dir: str, workers: int, force: bool, tag: str = '') -> Tuple[int, int]:
     """`ij`: analytic influence and V_ij, parallel across draws; the
     `psi` array is stored for every draw written; `ijfd` stores its own
     under the same kind, mass-centred, so a comparison against it centres
     this one first."""
     draws = list(draws)
-    md = products.method_dir(out_dir, dataset, estimator, N, 'ij')
+    md = products.method_dir(out_dir, dataset, estimator, N, 'ij', tag)
     outputs = registry.case(dataset, estimator).make_T().outputs
     pending = [s for s in draws if force or not products.is_done(md, s)]
     if pending:
@@ -120,11 +120,11 @@ def run_ij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int
 
 
 def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
-             out_dir: str, workers: int, B: int, force: bool) -> Tuple[int, int]:
+             out_dir: str, workers: int, B: int, force: bool, tag: str = '') -> Tuple[int, int]:
     """`boot`: a sequential draw loop, each draw's B replicates spread
     across one persistent pool for the whole run."""
     draws = list(draws)
-    md = products.method_dir(out_dir, dataset, estimator, N, 'boot')
+    md = products.method_dir(out_dir, dataset, estimator, N, 'boot', tag)
     case = registry.case(dataset, estimator)
     T = case.make_T()
     pool = Pool(workers, T=T)
@@ -357,7 +357,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             M_X: Optional[int] = None, ivqbins: str = 'marginal',
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
-            sigma_points: bool = False) -> Tuple[int, int]:
+            sigma_points: bool = False, tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -378,7 +378,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     sigma-points interval stage after refinement; when True, every draw
     also writes the `sigma_points` array product."""
     draws = list(draws)
-    md = products.method_dir(out_dir, dataset, estimator, N, 'qij')
+    md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
     case = registry.case(dataset, estimator)
     T = case.make_T()
@@ -476,12 +476,13 @@ def _ijfd_points(res) -> pd.DataFrame:
 
 
 def run_ijfd(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
-             out_dir: str, workers: int, point_curvature: bool, force: bool) -> Tuple[int, int]:
+             out_dir: str, workers: int, point_curvature: bool, force: bool,
+             tag: str = '') -> Tuple[int, int]:
     """`ijfd` (spec A13): a sequential draw loop, one pool shared across
     the run (mirrors `run_qij`'s pattern) for each draw's N (or 2N under
     `point_curvature`) point-perturbed fits."""
     draws = list(draws)
-    md = products.method_dir(out_dir, dataset, estimator, N, 'ijfd')
+    md = products.method_dir(out_dir, dataset, estimator, N, 'ijfd', tag)
     case = registry.case(dataset, estimator)
     T = case.make_T()
     pool = Pool(workers, T=T) if workers > 1 else None
@@ -573,14 +574,15 @@ def _qijt_points(res) -> pd.DataFrame:
 
 def run_qijt(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
              out_dir: str, M_X: int, budget: int, budget_win: int, budget_quad: int,
-             diag_draws: Optional[Iterable[int]], force: bool, workers: int = 1) -> Tuple[int, int]:
+             diag_draws: Optional[Iterable[int]], force: bool, workers: int = 1,
+             tag: str = '') -> Tuple[int, int]:
     """`qijt` (spec/QIJ_qijt_spec.md): a sequential draw loop, one pool
     shared across the run when `workers > 1` (mirrors `run_qij`'s
     pattern). Every draw writes `nodes`, `leaves`, `curve`, `anchors`
     (sections 11.2-11.5, `QIJTResult`'s own DataFrames) and, on
     `--diag-draws`, `points` (section 11.6)."""
     draws = list(draws)
-    md = products.method_dir(out_dir, dataset, estimator, N, 'qijt')
+    md = products.method_dir(out_dir, dataset, estimator, N, 'qijt', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
     case = registry.case(dataset, estimator)
     T = case.make_T()
@@ -664,14 +666,14 @@ def _qijdt_points(res) -> pd.DataFrame:
 
 def run_qijdt(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
               out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
-              workers: int = 1) -> Tuple[int, int]:
+              workers: int = 1, tag: str = '') -> Tuple[int, int]:
     """`qijdt` (spec/QIJ_qijdt_spec.md): a sequential draw loop, one pool
     shared across the run when `workers > 1` (mirrors `run_qijt`'s
     pattern). Every draw writes `nodes`, `leaves`, `pairs`, `curve`
     (sections 11.2-11.5) and, on `--diag-draws`, `points` (section
     11.6)."""
     draws = list(draws)
-    md = products.method_dir(out_dir, dataset, estimator, N, 'qijdt')
+    md = products.method_dir(out_dir, dataset, estimator, N, 'qijdt', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
     case = registry.case(dataset, estimator)
     T = case.make_T()

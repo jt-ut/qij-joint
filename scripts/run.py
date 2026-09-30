@@ -1,8 +1,10 @@
 #!/usr/bin/env python3.9
 """CLI: one (dataset, estimator, method) over a range of draws (Section
-6.2).
+6.2). `--out` is the study root; the method folder's name is derived
+from the run's configuration (e.g. `qij_gp_eps0.02`) and recorded, then
+checked on every later run, in that folder's `config.json`.
 
-    python scripts/run.py pareto tail qij --N 2000 --draws 0:1000 --out RUNS
+    python scripts/run.py pareto tail qij --N 2000 --draws 0:1000 --out runs/cloudfil_s1000
 """
 import os
 
@@ -67,23 +69,43 @@ def main(argv=None) -> None:
         if missing:
             p.error(f"qijt requires {', '.join(missing)}")
 
-    md = products.method_dir(args.out, args.dataset, args.estimator, args.N, args.method)
+    config = dict(method=args.method, dataset=args.dataset, estimator=args.estimator,
+                  N=args.N, seed=args.seed)
+    if args.method == 'qij':
+        config.update(eps=args.eps, pilot=args.pilot, gptrend=args.gptrend,
+                      gpwidth=args.gpwidth, M_X=args.M_X, ivqbins=args.ivqbins,
+                      survey=args.survey, quantized_start=args.quantized_start,
+                      refine_schedule=args.refine_schedule, sigma_points=args.sigma_points)
+    elif args.method == 'boot':
+        config['B'] = args.B
+    elif args.method == 'ijfd':
+        config['point_curvature'] = args.point_curvature
+    elif args.method == 'qijdt':
+        config['eps'] = args.eps
+    elif args.method == 'qijt':
+        config.update(M_X=args.M_X, budget=args.budget,
+                      budget_win=args.budget_win, budget_quad=args.budget_quad)
+
+    tag = products.dir_tag(args.method, config)
+    md = products.method_dir(args.out, args.dataset, args.estimator, args.N, args.method, tag)
+    products.ensure_config(md, config)
+
     params = dict(N=args.N, draws=[args.draws.start, args.draws.stop],
                   seed=args.seed, workers=args.workers, force=args.force)
 
     if args.method == 'oracle':
         written, skipped = pipeline.run_oracle(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
-            args.out, args.workers, args.force)
+            args.out, args.workers, args.force, tag=tag)
     elif args.method == 'ij':
         written, skipped = pipeline.run_ij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
-            args.out, args.workers, args.force)
+            args.out, args.workers, args.force, tag=tag)
     elif args.method == 'boot':
         params['B'] = args.B
         written, skipped = pipeline.run_boot(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
-            args.out, args.workers, args.B, args.force)
+            args.out, args.workers, args.B, args.force, tag=tag)
     elif args.method == 'qij':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
@@ -99,14 +121,14 @@ def main(argv=None) -> None:
             workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
             ivqbins=args.ivqbins, survey=args.survey, quantized_start=args.quantized_start,
             refine_schedule=args.refine_schedule, pilot=args.pilot,
-            sigma_points=args.sigma_points)
+            sigma_points=args.sigma_points, tag=tag)
     elif args.method == 'qijdt':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
             if args.diag_draws else []
         written, skipped = pipeline.run_qijdt(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
-            args.out, args.eps, args.diag_draws, args.force, workers=args.workers)
+            args.out, args.eps, args.diag_draws, args.force, workers=args.workers, tag=tag)
     elif args.method == 'qijt':
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
             if args.diag_draws else []
@@ -115,12 +137,12 @@ def main(argv=None) -> None:
         written, skipped = pipeline.run_qijt(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.M_X, args.budget, args.budget_win, args.budget_quad,
-            args.diag_draws, args.force, workers=args.workers)
+            args.diag_draws, args.force, workers=args.workers, tag=tag)
     else:
         params['point_curvature'] = args.point_curvature
         written, skipped = pipeline.run_ijfd(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
-            args.out, args.workers, args.point_curvature, args.force)
+            args.out, args.workers, args.point_curvature, args.force, tag=tag)
 
     products.append_log(md, sys.argv, params, written, skipped)
 
