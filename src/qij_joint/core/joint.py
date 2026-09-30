@@ -31,6 +31,12 @@ continuation rule once, at the same setup point as `pilot`: `'predicted'`
 measurement only closes (spec section 2.4): a child is open only if the
 pilot's own flag holds for it AND its parent's split paid against a
 noise-aware floor; no second chance once a split fails to pay.
+
+`growth` (spec/QIJ_growth_lbg_spec.md), passed straight to `grow`, picks
+the shared partition's own build rule: `'tree'` (today's rule, every
+product byte-identical) or `'lbg'` (a Lloyd pass after every growth
+round instead of only the last, spec section 2, Linde-Buzo-Gray); a
+ValueError from `grow` on any other value.
 """
 
 from __future__ import annotations
@@ -44,11 +50,12 @@ import numpy as np
 from ..parallel import call_T
 from .differences import forward_step, perturbed_weights, step_parameter
 from .influence_model import bin_posterior_variance
-from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences
+from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences, quantile_assign
 from .refine import (
     _try_adjacency_split, adjacency_gain_value, adjacency_split_gain, bridge_gain_value,
     compute_rho2, level_gain_value,
 )
+from .xvq import m_ref
 
 __all__ = ["Growth", "JointResult", "grow", "joint_psi_hat", "run_joint", "two_means_split"]
 
@@ -61,7 +68,15 @@ class Growth:
     labels (N,) bin index per point, contiguous 0..L0-1; L0 the bin
     count after growth and its Lloyd pass; std (q,) = sqrt(V_hat), so
     that Ψ̃ = psi0_all/std throughout; S_pred, S_pred_pre_lloyd (q,) the
-    predicted within share after / before the Lloyd pass."""
+    predicted within share after / before the Lloyd pass. growth_wall
+    is the seconds spent in `grow`; n_lloyd_skipped, under
+    growth='lbg', counts the rounds whose own Lloyd pass (step 3) was
+    skipped by the termination guard (spec/QIJ_growth_lbg_spec.md 2);
+    0 under 'tree', where the guard cannot trigger. L_init is the bin
+    count the growth loop itself started from: 1 under 'tree'; under
+    'lbg', the seeded count that survived its own Lloyd pass (spec
+    section 2), which can be below M_ref = `xvq.m_ref(eps)` if a seed's
+    cell emptied."""
 
     labels: np.ndarray
     L0: int
@@ -70,6 +85,9 @@ class Growth:
     S_pred: np.ndarray
     S_pred_pre_lloyd: np.ndarray
     std: np.ndarray
+    growth_wall: float
+    n_lloyd_skipped: int
+    L_init: int
 
 
 @dataclass
@@ -90,7 +108,11 @@ class JointResult:
     measurement before any check ran, voids every output). Bin
     constituents: bin_mass (L,), bin_U (L,q), bin_m (L,q, predicted
     means), bin_flagged (L,); bin_label (N,); busy_delta as the other
-    pool stages report it."""
+    pool stages report it. growth_wall (seconds spent in `grow`),
+    n_lloyd_skipped (growth='lbg' only, spec/QIJ_growth_lbg_spec.md 2
+    termination guard; 0 under 'tree') and L_init (the count growth's
+    loop started from, spec section 2; 1 under 'tree') are `Growth`'s
+    own fields, carried through unchanged."""
 
     V_btw: np.ndarray
     V_win_hat: np.ndarray
@@ -105,6 +127,9 @@ class JointResult:
     n_growth_rounds: int
     growth_capped: bool
     S_pred_pre_lloyd: np.ndarray
+    growth_wall: float
+    n_lloyd_skipped: int
+    L_init: int
     n_flagged: int
     n_check_rounds: int
     n_check_evals: int
@@ -286,7 +311,28 @@ def _lloyd_all(psi_tilde: np.ndarray, labels: np.ndarray, L: int):
     return labels, L
 
 
-def grow(psi0_all: np.ndarray, eps: float, M_X_used: int) -> Growth:
+def _seed_lbg(psi_tilde: np.ndarray, eps: float) -> Tuple[np.ndarray, int]:
+    """`growth='lbg'`'s own start (spec/QIJ_growth_lbg_spec.md 2):
+    L_init = `xvq.m_ref(eps)` mid-quantile seeds on Ψ̃'s own first
+    principal axis (eigh of its q x q covariance, sign fixed by the
+    largest-magnitude loading positive), one nearest-seed-in-projection
+    assignment (`ivq.quantile_assign`, `kmeans_1d`'s own per-iteration
+    step, reused for a single pass -- an emptied seed dropped), then
+    one full `_lloyd_all` pass in the full Ψ̃ space. Returns (labels,
+    L), L the count that survived (spec section 5)."""
+    centered = psi_tilde - psi_tilde.mean(axis=0)
+    _, eigvecs = np.linalg.eigh(centered.T @ centered)
+    axis = eigvecs[:, -1]
+    if axis[np.argmax(np.abs(axis))] < 0.0:
+        axis = -axis
+    proj = centered @ axis
+    L_target = m_ref(eps)
+    prototypes = np.quantile(np.unique(proj), (np.arange(L_target) + 0.5) / L_target)
+    labels, prototypes, _counts = quantile_assign(proj, prototypes)
+    return _lloyd_all(psi_tilde, labels, prototypes.size)
+
+
+def grow(psi0_all: np.ndarray, eps: float, M_X_used: int, growth: str = 'tree') -> Growth:
     """
     Grow one shared partition of the N points from a single bin to the
     tolerance (spec/method_notes.md section 6), no evaluations. A round splits,
@@ -294,19 +340,42 @@ def grow(psi0_all: np.ndarray, eps: float, M_X_used: int) -> Growth:
     max_c w_kc > eps/L; stops when every output's predicted within
     share S_c <= eps, or when L reaches M_X_used (`growth_capped`,
     checked only once tolerance is confirmed unmet, so a round that
-    both converges and reaches the cap counts as converged). Then one
-    Lloyd pass of all L centroids over every row, which lowers the
-    predicted within share at no evaluation cost; S_pred is taken after
-    that pass, S_pred_pre_lloyd before.
+    both converges and reaches the cap counts as converged).
+
+    `growth='tree'` (default) starts from one bin and then runs one
+    Lloyd pass of all L centroids over every row, after the last round
+    only -- bit-identical to before this argument existed.
+    `growth='lbg'` (spec/QIJ_growth_lbg_spec.md 2, Linde-Buzo-Gray)
+    starts instead from `_seed_lbg`'s own M_ref-quantile seeding
+    (`L_init`, at least a lower bound on the count the joint partition
+    needs), and runs the Lloyd pass at the end of EVERY round instead of
+    only the last, at no evaluation cost. A round's own Lloyd pass can
+    empty centroids that round's splits just created, so L can fall
+    back to or below the round's starting count; when it does, the NEXT
+    round's Lloyd pass is skipped (a plain tree round, whose splits are
+    never undone within it) and `n_lloyd_skipped` counts it -- Lloyd
+    resumes the round after, so L strictly grows at least every other
+    round and growth still terminates. S_pred is taken after the last
+    round's own Lloyd pass (or, if that pass was skipped, after the
+    tree round it was); S_pred_pre_lloyd before that.
     """
+    if growth not in ('tree', 'lbg'):
+        raise ValueError(f"unknown growth {growth!r}")
+    t0 = time.perf_counter()
     N, q = psi0_all.shape
     std = np.std(psi0_all, axis=0)
     V_hat = std ** 2
     psi_tilde = psi0_all / std
-    labels = np.zeros(N, dtype=int)
-    L = 1
+    if growth == 'lbg':
+        labels, L = _seed_lbg(psi_tilde, eps)
+    else:
+        labels = np.zeros(N, dtype=int)
+        L = 1
+    L_init = L
     n_rounds = 0
     growth_capped = False
+    n_lloyd_skipped = 0
+    skip_lloyd = False
 
     while True:
         w, S = _predicted_share(psi0_all, V_hat, labels, L)
@@ -326,17 +395,31 @@ def grow(psi0_all: np.ndarray, eps: float, M_X_used: int) -> Growth:
             order = np.argsort(-w[to_split].max(axis=1), kind='stable')
             to_split = to_split[order[:room]]
             growth_capped = True
+        L_round_start = L
         labels, L = _split_growth_bins(psi_tilde, labels, to_split, L)
         n_rounds += 1
+        if growth == 'lbg':
+            if skip_lloyd:
+                # The termination guard (spec section 2): last round's
+                # Lloyd pass undid its own net growth, so this round is
+                # tree-only; Lloyd resumes next round.
+                n_lloyd_skipped += 1
+                skip_lloyd = False
+            else:
+                labels, L = _lloyd_all(psi_tilde, labels, L)
+                skip_lloyd = L <= L_round_start
         if growth_capped:
             break
 
     S_pre = S
-    labels, L = _lloyd_all(psi_tilde, labels, L)
+    if growth == 'tree':
+        labels, L = _lloyd_all(psi_tilde, labels, L)
     _, S = _predicted_share(psi0_all, V_hat, labels, L)
+    growth_wall = time.perf_counter() - t0
 
     return Growth(labels=labels, L0=L, n_growth_rounds=n_rounds, growth_capped=growth_capped,
-                  S_pred=S, S_pred_pre_lloyd=S_pre, std=std)
+                  S_pred=S, S_pred_pre_lloyd=S_pre, std=std,
+                  growth_wall=growth_wall, n_lloyd_skipped=n_lloyd_skipped, L_init=L_init)
 
 
 def _posterior_vu(model, Z: np.ndarray, sigma_all: np.ndarray, groups: Sequence[np.ndarray]):
@@ -389,26 +472,31 @@ def _split_task(T, case, X: np.ndarray, task):
     return sid, result, failed, time.perf_counter() - t0
 
 
-def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: float = 0.0) -> JointResult:
+def _failed_result(N: int, q: int, grown: Optional[Growth] = None, busy_delta: float = 0.0) -> JointResult:
     """A failed draw: either the influence model's shared constant-path
     rule fails an output before growth ever runs, or the bin stencil's
     initial full-data measurement fails after a valid growth. Every
     variance and check quantity is void; growth's own products (needing
-    no evaluation) are kept when growth ran."""
+    no evaluation), including growth_wall/n_lloyd_skipped, are kept when
+    growth ran (`grown` given), else 0.0/0."""
     nan_q = np.full(q, np.nan)
-    if growth is None:
+    if grown is None:
         L0, labels = 0, np.full(N, -1, dtype=int)
         n_rounds, capped, S_pred, S_pre = 0, False, nan_q, nan_q
         mass = np.zeros(0)
+        growth_wall, n_lloyd_skipped, L_init = 0.0, 0, 0
     else:
-        L0, labels = growth.L0, growth.labels
-        n_rounds, capped = growth.n_growth_rounds, growth.growth_capped
-        S_pred, S_pre = growth.S_pred, growth.S_pred_pre_lloyd
+        L0, labels = grown.L0, grown.labels
+        n_rounds, capped = grown.n_growth_rounds, grown.growth_capped
+        S_pred, S_pre = grown.S_pred, grown.S_pred_pre_lloyd
         mass = np.bincount(labels, minlength=L0).astype(float) / N
+        growth_wall, n_lloyd_skipped = grown.growth_wall, grown.n_lloyd_skipped
+        L_init = grown.L_init
     return JointResult(
         V_btw=nan_q, V_win_hat=nan_q, V_tot_hat=nan_q, S_pred=S_pred, a=nan_q, gain_ratio=nan_q,
         B_hat=nan_q, a_bca=nan_q,
         L0=L0, L=L0, n_growth_rounds=n_rounds, growth_capped=capped, S_pred_pre_lloyd=S_pre,
+        growth_wall=growth_wall, n_lloyd_skipped=n_lloyd_skipped, L_init=L_init,
         n_flagged=0, n_check_rounds=0, n_check_evals=0, n_level_splits=0, n_adjacency_splits=0,
         check_capped=False, n_closed_unpaid=0, n_closed_unflagged=0, n_noise_floored=0,
         sum_b_delta=nan_q, failed=True,
@@ -424,7 +512,7 @@ def run_joint(
     start: np.ndarray = None, measured: Optional[Sequence[int]] = None,
     pilot: str = 'gp', bridge_pair_id: Optional[np.ndarray] = None,
     bridge_pair_n: Optional[np.ndarray] = None, bridge_value: Optional[np.ndarray] = None,
-    check_rule: str = 'predicted',
+    check_rule: str = 'predicted', growth: str = 'tree',
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -472,6 +560,11 @@ def run_joint(
     own flag holds for it AND its parent's split paid against a
     finite-difference-aware floor; both gates read no posterior
     variance beyond the flag's own `u`, and there is no second chance).
+
+    `growth` (spec/QIJ_growth_lbg_spec.md) is passed straight to `grow`,
+    the only place it is read: `'tree'` (today's rule, bit-identical) or
+    `'lbg'` (a Lloyd pass after every growth round instead of only the
+    last); a ValueError from `grow` on any other value.
     """
     if check_rule not in ('predicted', 'measured'):
         raise ValueError(f"unknown check_rule {check_rule!r}")
@@ -490,19 +583,19 @@ def run_joint(
     if pilot == 'gp' and np.any(model.constant_path):
         return _failed_result(N, q)
 
-    growth = grow(psi0_all, eps, M_X_used)
-    L0 = growth.L0
-    binset0 = BinSet(labels=growth.labels, n=np.bincount(growth.labels, minlength=L0),
+    grown = grow(psi0_all, eps, M_X_used, growth=growth)
+    L0 = grown.L0
+    binset0 = BinSet(labels=grown.labels, n=np.bincount(grown.labels, minlength=L0),
                       U=np.zeros((L0, 0)), centering_residual=np.zeros(0), D2=np.zeros((L0, 0)),
                       M_init=L0, M_used=L0, within_share=0.0, failed=False)
     bins, busy_delta = bin_differences(X, counter, theta_hat, binset0, eta, pool, start=start)
     if bins.failed:
-        return _failed_result(N, q, growth=growth, busy_delta=busy_delta)
+        return _failed_result(N, q, grown=grown, busy_delta=busy_delta)
 
     B_hat, a_bca = bias_and_acceleration(bins, N)
     V_btw = np.array([between_terms(bins, c) for c in measured])
-    V_hat = growth.std ** 2
-    psi_tilde = psi0_all / growth.std
+    V_hat = grown.std ** 2
+    psi_tilde = psi0_all / grown.std
     U0 = bins.U[:, measured]
     centering_residual = bins.centering_residual[measured]
     _, m0, var0 = _bin_stats(psi0_all, bins.labels, L0)
@@ -890,10 +983,12 @@ def run_joint(
 
     return JointResult(
         V_btw=V_btw, V_win_hat=V_win_hat, V_tot_hat=V_tot_hat,
-        S_pred=growth.S_pred, a=a, gain_ratio=gain_ratio,
+        S_pred=grown.S_pred, a=a, gain_ratio=gain_ratio,
         B_hat=B_hat, a_bca=a_bca,
-        L0=L0, L=L_final, n_growth_rounds=growth.n_growth_rounds,
-        growth_capped=growth.growth_capped, S_pred_pre_lloyd=growth.S_pred_pre_lloyd,
+        L0=L0, L=L_final, n_growth_rounds=grown.n_growth_rounds,
+        growth_capped=grown.growth_capped, S_pred_pre_lloyd=grown.S_pred_pre_lloyd,
+        growth_wall=grown.growth_wall, n_lloyd_skipped=grown.n_lloyd_skipped,
+        L_init=grown.L_init,
         n_flagged=n_flagged, n_check_rounds=n_check_rounds, n_check_evals=n_check_evals,
         n_level_splits=n_level_splits, n_adjacency_splits=n_adjacency_splits,
         check_capped=check_capped, n_closed_unpaid=n_closed_unpaid,

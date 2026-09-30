@@ -34,8 +34,8 @@ from ..parallel import call_T
 from .differences import central_step, difference, perturbed_weights, step_parameter
 
 __all__ = [
-    "BinSet", "kmeans_1d", "within_share", "build_bins", "bin_differences",
-    "between_terms", "bias_and_acceleration",
+    "BinSet", "kmeans_1d", "quantile_assign", "within_share", "build_bins",
+    "bin_differences", "between_terms", "bias_and_acceleration",
 ]
 
 
@@ -84,6 +84,31 @@ class BinSet:
         return self.n / self.labels.size
 
 
+def quantile_assign(v: np.ndarray, prototypes: np.ndarray):
+    """One nearest-prototype assignment pass of the 1-D array `v`
+    against the (increasing) `prototypes`: `searchsorted` against the
+    midpoints between consecutive prototypes (a boundary value goes to
+    the lower prototype; with one prototype the midpoint array is empty
+    and every point gets label 0), then any prototype left empty by
+    this assignment is dropped and the rest relabelled contiguously.
+    `kmeans_1d`'s own per-iteration step, factored out so a caller that
+    wants only the single pass (growth's own seeding,
+    spec/QIJ_growth_lbg_spec.md 2) can reuse it without `kmeans_1d`'s
+    own convergence loop. Returns (labels, prototypes, counts) at the
+    surviving count."""
+    mids = (prototypes[:-1] + prototypes[1:]) / 2.0
+    labels = np.searchsorted(mids, v, side="left")
+    counts = np.bincount(labels, minlength=prototypes.size)
+    if not counts.all():
+        present = np.flatnonzero(counts)
+        remap = np.full(prototypes.size, -1, dtype=int)
+        remap[present] = np.arange(present.size)
+        labels = remap[labels]
+        prototypes = prototypes[present]
+        counts = counts[present]
+    return labels, prototypes, counts
+
+
 def kmeans_1d(values: np.ndarray, M: int):
     """
     Lloyd's iteration on the sorted 1-D array `values`, M target
@@ -91,13 +116,11 @@ def kmeans_1d(values: np.ndarray, M: int):
     level split, at M=2).
 
     Init: the M quantiles at levels (k+1/2)/M of the distinct sorted
-    values. Assignment: `searchsorted` against the midpoints between
-    consecutive prototypes (a boundary value goes to the lower
-    prototype; with one prototype the midpoint array is empty and
-    every point gets label 0). Update: each prototype becomes the mean
-    of its bin, via two `bincount`s (counts, sums); a prototype whose
-    bin is empty after an assignment is dropped and the rest
-    relabelled contiguously. Converges when the assignment is unchanged
+    values. Assignment: `quantile_assign` (searchsorted against the
+    midpoints between consecutive prototypes, an emptied prototype
+    dropped and the rest relabelled). Update: each prototype becomes
+    the mean of its bin, via one `bincount` (sums; `quantile_assign`
+    already gives counts). Converges when the assignment is unchanged
     from the previous iteration, or after 100 iterations.
 
     Returns (labels, prototypes): labels (N,) int, contiguous
@@ -113,17 +136,7 @@ def kmeans_1d(values: np.ndarray, M: int):
     prev_labels = None
     labels = None
     for _ in range(100):
-        mids = (prototypes[:-1] + prototypes[1:]) / 2.0
-        labels = np.searchsorted(mids, v, side="left")
-
-        counts = np.bincount(labels, minlength=prototypes.size)
-        if not counts.all():
-            present = np.flatnonzero(counts)
-            remap = np.full(prototypes.size, -1, dtype=int)
-            remap[present] = np.arange(present.size)
-            labels = remap[labels]
-            prototypes = prototypes[present]
-            counts = counts[present]
+        labels, prototypes, counts = quantile_assign(v, prototypes)
 
         converged = (
             prev_labels is not None

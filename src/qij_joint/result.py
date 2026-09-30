@@ -53,6 +53,14 @@ populates `joint_n_closed_unpaid`/`joint_n_closed_unflagged`/
 `joint_n_noise_floored`/`joint_sum_b_delta` and changes `V_win_hat`/
 `V_tot_hat`'s own definition (no posterior variance).
 
+`growth` (spec/QIJ_growth_lbg_spec.md), inert (but recorded) under
+`ivqbins='marginal'`, picks `core.joint.grow`'s own partition rule:
+`'tree'` (the default, today's rule, every product byte-identical,
+`joint_L_init` 1) or `'lbg'` (growth starts from an M_ref-quantile
+seeding instead of one bin, `joint_L_init` its surviving count, and a
+Lloyd pass runs after every round instead of only the last), which also
+populates `joint_growth_wall`/`joint_n_lloyd_skipped`.
+
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
 the full data: `.sigma_interval(level)` from the stored `sigma_mean`/
@@ -134,6 +142,9 @@ class QIJResult:
     joint_S_pred_pre_lloyd: np.ndarray  # (q,); NaN under 'marginal' or when the Lloyd pass did not run
     joint_L0: int                  # bins after growth; 0 under 'marginal'
     joint_L: int                   # final joint bin count after the check; 0 under 'marginal'
+    joint_L_init: int              # bins the growth loop itself started from (spec/QIJ_
+                                    # growth_lbg_spec.md 2); 1 under growth='tree', 0 under
+                                    # 'marginal'
     joint_n_growth_rounds: int
     joint_growth_capped: bool
     joint_n_flagged: int
@@ -161,6 +172,10 @@ class QIJResult:
     joint_bin_flagged: np.ndarray  # (L,) bool; empty under 'marginal'
     joint_bin_label: np.ndarray    # (N,) int; -1 under 'marginal'
     joint_busy_delta: float        # 0.0 under 'marginal'
+    joint_growth_wall: float       # seconds spent in core.joint.grow; 0.0 under 'marginal'
+    joint_n_lloyd_skipped: int     # growth='lbg' only, 0 under 'tree' (spec/QIJ_growth_lbg_
+                                    # spec.md 2 termination guard): rounds whose Lloyd pass
+                                    # (step 3) was skipped
     a: np.ndarray                  # (q,) ABC acceleration (spec/QIJ_mods_waves.md A10)
     b_hat: np.ndarray              # (q,) ABC second-order bias (A10)
     c_q: np.ndarray                # (q,) ABC curvature-along-influence, survey-row evaluated (A10)
@@ -173,6 +188,8 @@ class QIJResult:
     pilot: str                     # 'affine' or 'gp' (spec/QIJ_affine_pilot_spec.md 1)
     check_rule: str                # 'predicted' or 'measured' (spec/QIJ_joint_check_measured_
                                     # spec.md); inert under ivqbins='marginal'
+    growth: str                    # 'tree' or 'lbg' (spec/QIJ_growth_lbg_spec.md); inert
+                                    # under ivqbins='marginal'
     bridge_j: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_k: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_m: np.ndarray           # (P,) m_jk; empty under pilot='gp'

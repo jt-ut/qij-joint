@@ -167,9 +167,12 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     distinct from A10's `a_<o>` (the ABC acceleration, populated under
     both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
     measured trigger's own scale factor, B4's formula reused at one
-    output)."""
+    output). `growth` (spec/QIJ_growth_lbg_spec.md) is recorded the
+    same way `check_rule` is; `n_lloyd_skipped`/`growth_wall`/`L_init`
+    are its own products, 0/0.0/1 under `growth='tree'`."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
+           'growth': res.growth,
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
@@ -185,8 +188,14 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['workers'] = int(res.workers)
     row['L0'] = int(res.joint_L0)
     row['L'] = int(res.joint_L)
+    row['L_init'] = int(res.joint_L_init)
     row['n_growth_rounds'] = int(res.joint_n_growth_rounds)
     row['growth_capped'] = bool(res.joint_growth_capped)
+    # growth='lbg' only (spec/QIJ_growth_lbg_spec.md 2-3); 0/0.0 under
+    # 'tree' (L_init is 1, not 0, under 'tree': the loop always starts
+    # from one bin there).
+    row['n_lloyd_skipped'] = int(res.joint_n_lloyd_skipped)
+    row['growth_wall'] = float(res.joint_growth_wall)
     row['n_flagged'] = int(res.joint_n_flagged)
     row['n_check_rounds'] = int(res.joint_n_check_rounds)
     row['n_check_evals'] = int(res.joint_n_check_evals)
@@ -368,7 +377,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
             sigma_points: bool = False, check_rule: str = 'predicted',
-            tag: str = '') -> Tuple[int, int]:
+            growth: str = 'tree', tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -389,7 +398,9 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     sigma-points interval stage after refinement; when True, every draw
     also writes the `sigma_points` array product. `check_rule`
     (spec/QIJ_joint_check_measured_spec.md) picks the joint check's
-    continuation rule, inert under `ivqbins='marginal'`."""
+    continuation rule, inert under `ivqbins='marginal'`. `growth`
+    (spec/QIJ_growth_lbg_spec.md) picks `core.joint.grow`'s own
+    partition rule, also inert under `ivqbins='marginal'`."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -406,7 +417,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
                   refine_schedule=refine_schedule, pilot=pilot,
-                  sigma_points=sigma_points, check_rule=check_rule).fit(X, T, pool=pool)
+                  sigma_points=sigma_points, check_rule=check_rule,
+                  growth=growth).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}

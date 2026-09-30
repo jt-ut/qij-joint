@@ -57,11 +57,19 @@ class SurveyRows:
     eta_rows: Optional[float] = None  # polish tolerance of every evaluation on `rows`; None = T's own
 
 
+def m_ref(eps: float) -> int:
+    """M_ref = ceil(sqrt(kappa_ref/eps)), kappa_ref=2.7: the scalar
+    quantizer's own count at tolerance eps (spec/method_notes.md
+    section 2), shared by `cost_rule_M` and, under `growth='lbg'`,
+    `core.joint.grow`'s own initial bin count (spec/QIJ_growth_lbg_
+    spec.md 2)."""
+    return math.ceil(math.sqrt(_KAPPA_REF / eps))
+
+
 def cost_rule_M(N: int, q: int, eps: float) -> int:
     """M_X = ceil(sqrt((1 + 2*q*M_ref)*N/2)), M_ref = ceil(sqrt(2.7/eps)),
     floored at 20 and capped at N // 2 (spec/method_notes.md section 2)."""
-    M_ref = math.ceil(math.sqrt(_KAPPA_REF / eps))
-    M_X = math.ceil(math.sqrt((1.0 + 2.0 * q * M_ref) * N / 2.0))
+    M_X = math.ceil(math.sqrt((1.0 + 2.0 * q * m_ref(eps)) * N / 2.0))
     return min(max(M_X, 20), N // 2)
 
 
