@@ -13,8 +13,9 @@ estimate: `'affine'` (the default), the mean-preserving per-cell affine
 field of `core.affine_pilot`, with no posterior variance and the
 refinement's adjacency proposals priced by the bridge score
 (spec/QIJ_affine_pilot_spec.md 3.2); or `'gp'`, today's Gaussian-process
-pilot, bit-identical to before this option existed. `gptrend`/`gpwidth`
-pass straight to `fit_influence_model` (method_notes section 3) and are
+pilot, bit-identical to before this option existed. `gptrend`/`gpwidth`/
+`fit_weights` pass straight to `fit_influence_model` (method_notes
+section 3; `fit_weights`, spec/QIJ_mass_weighted_fit_spec.md) and are
 unused under `pilot='affine'`; `M_X` overrides the prototype-count rule
 when given (method_notes section 2); `survey` picks the prototype
 survey's receptive-field representation, `'points'` (one row per
@@ -203,7 +204,7 @@ def _empty_pilot_products(q: int) -> dict:
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
                   sv, quantized_start, refine_schedule, pilot, sigma_points,
-                  check_rule) -> QIJResult:
+                  check_rule, fit_weights) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -246,7 +247,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        pilot=pilot, check_rule=check_rule, sigma_points=sigma_points,
+        pilot=pilot, check_rule=check_rule, fit_weights=fit_weights, sigma_points=sigma_points,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_empty_pilot_products(q),
         **_sigma_defaults(q),
     )
@@ -260,7 +261,8 @@ class QIJ:
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
                  refine_schedule: str = 'queue', pilot: str = 'affine',
-                 sigma_points: bool = False, check_rule: str = 'predicted') -> None:
+                 sigma_points: bool = False, check_rule: str = 'predicted',
+                 fit_weights: str = 'none') -> None:
         if pilot not in ('affine', 'gp'):
             raise ValueError(f"unknown pilot {pilot!r}")
         self.eps = eps
@@ -276,6 +278,7 @@ class QIJ:
         self.pilot = pilot
         self.sigma_points = sigma_points
         self.check_rule = check_rule
+        self.fit_weights = fit_weights
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -381,7 +384,8 @@ class QIJ:
                 # full-width model bit for bit.
                 model, model_busy = fit_influence_model(
                     Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
-                    gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool)
+                    gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool,
+                    fit_weights=self.fit_weights)
             except (RuntimeError, LinAlgError):
                 # A failed stage 1 is recorded as failed, never retried; a
                 # submitted `theta_future` is left uncollected and uncounted,
@@ -389,7 +393,8 @@ class QIJ:
                 return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                      self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                      self.survey, sv, self.quantized_start, self.refine_schedule,
-                                     self.pilot, self.sigma_points, self.check_rule)
+                                     self.pilot, self.sigma_points, self.check_rule,
+                                     self.fit_weights)
             psi0_all = _psi0(model, Z)
             sigma_all = _uncertainty(model, Z)
             offset = np.asarray(model.offset, dtype=float)
@@ -736,6 +741,6 @@ class QIJ:
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
-            pilot=self.pilot, check_rule=self.check_rule,
+            pilot=self.pilot, check_rule=self.check_rule, fit_weights=self.fit_weights,
             **second_stage_fields, **joint_fields, **pilot_products, **sigma_fields,
         )

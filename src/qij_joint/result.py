@@ -53,6 +53,13 @@ populates `joint_n_closed_unpaid`/`joint_n_closed_unflagged`/
 `joint_n_noise_floored`/`joint_sum_b_delta` and changes `V_win_hat`/
 `V_tot_hat`'s own definition (no posterior variance).
 
+`fit_weights` (spec/QIJ_mass_weighted_fit_spec.md), unused under
+`pilot='affine'` the way `gptrend`/`gpwidth` are, picks the pilot's own
+kernel-regression noise: `'none'` (the default, every product
+byte-identical) or `'mass'` (a per-observation noise diagonal
+1/m_tilde_j in place of the identity, in both the profiled marginal
+likelihood and the posterior).
+
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
 the full data: `.sigma_interval(level)` from the stored `sigma_mean`/
@@ -173,6 +180,8 @@ class QIJResult:
     pilot: str                     # 'affine' or 'gp' (spec/QIJ_affine_pilot_spec.md 1)
     check_rule: str                # 'predicted' or 'measured' (spec/QIJ_joint_check_measured_
                                     # spec.md); inert under ivqbins='marginal'
+    fit_weights: str               # 'none' or 'mass' (spec/QIJ_mass_weighted_fit_spec.md);
+                                    # unused under pilot='affine'
     bridge_j: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_k: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_m: np.ndarray           # (P,) m_jk; empty under pilot='gp'

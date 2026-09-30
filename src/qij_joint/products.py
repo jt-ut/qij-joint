@@ -44,7 +44,11 @@ def dir_tag(method: str, config: dict) -> str:
     from `config` rather than letting `--out` be used to separate them.
     `qij` -> `<pilot>_eps<eps>`, e.g. `gp_eps0.02`, then one suffix per
     setting that differs from `QIJ_CANONICAL`, in a fixed order:
-    `survey`, `quantized_start`, `gptrend`, `gpwidth`, `ivqbins`,
+    `survey`, `quantized_start`, `gptrend`, `gpwidth`, then `fit_weights`
+    (spec/QIJ_mass_weighted_fit_spec.md 3) as a non-canonical suffix
+    right after `gpwidth`'s own, named only when `'mass'`, as
+    `_massfit` -- so a `fit_weights='none'` run keeps today's folder
+    name -- then `ivqbins`,
     `refine_schedule`, `sigma_points` (named only when False, as
     `_nosigma`), `M_X` (named only when not None, as `_MX<int>`), then
     `check_rule` (spec/QIJ_joint_check_measured_spec.md 3) as a
@@ -66,6 +70,8 @@ def dir_tag(method: str, config: dict) -> str:
             tag += f"_trend{config['gptrend']}"
         if config['gpwidth'] != QIJ_CANONICAL['gpwidth']:
             tag += f"_width{config['gpwidth']}"
+        if config['fit_weights'] == 'mass':
+            tag += '_massfit'
         if config['ivqbins'] != QIJ_CANONICAL['ivqbins']:
             tag += f"_bins{config['ivqbins']}"
         if config['refine_schedule'] != QIJ_CANONICAL['refine_schedule']:
@@ -118,6 +124,11 @@ def ensure_config(md: str, config: dict) -> None:
         # so today's `check_rule='predicted'` runs still match it. Only a
         # configuration that carries the key (qij) gets the default.
         stored = dict(stored, check_rule='predicted')
+    if 'fit_weights' in requested and 'fit_weights' not in stored:
+        # A qij folder from before this build recorded no `fit_weights`
+        # (spec/QIJ_mass_weighted_fit_spec.md 3): read as 'none', so
+        # today's `fit_weights='none'` runs still match it.
+        stored = dict(stored, fit_weights='none')
     if stored != requested:
         keys = sorted(set(stored) | set(requested))
         diffs = '; '.join(

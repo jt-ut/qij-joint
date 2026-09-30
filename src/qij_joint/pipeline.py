@@ -167,9 +167,11 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     distinct from A10's `a_<o>` (the ABC acceleration, populated under
     both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
     measured trigger's own scale factor, B4's formula reused at one
-    output)."""
+    output). `fit_weights` (spec/QIJ_mass_weighted_fit_spec.md) is
+    recorded whether or not it is inert (`pilot='affine'`)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
+           'fit_weights': res.fit_weights,
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
@@ -368,7 +370,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
             sigma_points: bool = False, check_rule: str = 'predicted',
-            tag: str = '') -> Tuple[int, int]:
+            fit_weights: str = 'none', tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -389,7 +391,9 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     sigma-points interval stage after refinement; when True, every draw
     also writes the `sigma_points` array product. `check_rule`
     (spec/QIJ_joint_check_measured_spec.md) picks the joint check's
-    continuation rule, inert under `ivqbins='marginal'`."""
+    continuation rule, inert under `ivqbins='marginal'`. `fit_weights`
+    (spec/QIJ_mass_weighted_fit_spec.md) picks the pilot's own
+    kernel-regression noise, unused under `pilot='affine'`."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -406,7 +410,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
                   refine_schedule=refine_schedule, pilot=pilot,
-                  sigma_points=sigma_points, check_rule=check_rule).fit(X, T, pool=pool)
+                  sigma_points=sigma_points, check_rule=check_rule,
+                  fit_weights=fit_weights).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}
