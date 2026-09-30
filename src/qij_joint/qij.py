@@ -30,13 +30,6 @@ today's re-flagging rule, byte-identical) or `'measured'` (`pilot='gp'`
 only -- a ValueError from `run_joint` otherwise -- the pilot proposes,
 measurement only closes: a child opens only if the pilot's own flag
 holds for it and its parent's split paid, spec section 2.4).
-`growth` (spec/QIJ_growth_lbg_spec.md), inert under `ivqbins='marginal'`,
-picks `core.joint.grow`'s own partition-building rule: `'tree'` (the
-default, today's rule, byte-identical, `L_init` 1) or `'lbg'` (growth
-starts from an M_ref-quantile seeding instead of one bin, `L_init` its
-surviving count, and runs a Lloyd pass after every round instead of
-only the last, Linde-Buzo-Gray), which also populates
-`joint_growth_wall` and `joint_n_lloyd_skipped`.
 `quantized_start`
 (spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
 `'multistart'` (ported) fits theta_Q from scratch on the survey rows;
@@ -130,7 +123,7 @@ def _joint_defaults(N: int, q: int) -> dict:
     return dict(
         joint_S_pred=np.full(q, np.nan), joint_a=np.full(q, np.nan),
         joint_S_pred_pre_lloyd=np.full(q, np.nan),
-        joint_L0=0, joint_L=0, joint_L_init=0, joint_n_growth_rounds=0, joint_growth_capped=False,
+        joint_L0=0, joint_L=0, joint_n_growth_rounds=0, joint_growth_capped=False,
         joint_n_flagged=0, joint_n_check_rounds=0, joint_n_check_evals=0,
         joint_n_level_splits=0, joint_n_adjacency_splits=0, joint_check_capped=False,
         joint_n_closed_unpaid=0, joint_n_closed_unflagged=0, joint_n_noise_floored=0,
@@ -138,7 +131,6 @@ def _joint_defaults(N: int, q: int) -> dict:
         joint_failed=False, joint_bin_mass=np.zeros(0), joint_bin_U=np.zeros((0, q)),
         joint_bin_m=np.zeros((0, q)), joint_bin_flagged=np.zeros(0, dtype=bool),
         joint_bin_label=np.full(N, -1, dtype=int), joint_busy_delta=0.0,
-        joint_growth_wall=0.0, joint_n_lloyd_skipped=0,
     )
 
 
@@ -211,7 +203,7 @@ def _empty_pilot_products(q: int) -> dict:
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
                   sv, quantized_start, refine_schedule, pilot, sigma_points,
-                  check_rule, growth) -> QIJResult:
+                  check_rule) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -254,7 +246,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        pilot=pilot, check_rule=check_rule, growth=growth, sigma_points=sigma_points,
+        pilot=pilot, check_rule=check_rule, sigma_points=sigma_points,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_empty_pilot_products(q),
         **_sigma_defaults(q),
     )
@@ -268,8 +260,7 @@ class QIJ:
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
                  refine_schedule: str = 'queue', pilot: str = 'affine',
-                 sigma_points: bool = False, check_rule: str = 'predicted',
-                 growth: str = 'tree') -> None:
+                 sigma_points: bool = False, check_rule: str = 'predicted') -> None:
         if pilot not in ('affine', 'gp'):
             raise ValueError(f"unknown pilot {pilot!r}")
         self.eps = eps
@@ -285,7 +276,6 @@ class QIJ:
         self.pilot = pilot
         self.sigma_points = sigma_points
         self.check_rule = check_rule
-        self.growth = growth
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -399,7 +389,7 @@ class QIJ:
                 return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                      self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                      self.survey, sv, self.quantized_start, self.refine_schedule,
-                                     self.pilot, self.sigma_points, self.check_rule, self.growth)
+                                     self.pilot, self.sigma_points, self.check_rule)
             psi0_all = _psi0(model, Z)
             sigma_all = _uncertainty(model, Z)
             offset = np.asarray(model.offset, dtype=float)
@@ -510,8 +500,7 @@ class QIJ:
                            self.eps, offset, pool=pool, I_proto=I_proto[:, measured],
                            start=start_second_stage, measured=measured, pilot=self.pilot,
                            bridge_pair_id=bridge_pair_id, bridge_pair_n=bridge_pair_n,
-                           bridge_value=bridge_value, check_rule=self.check_rule,
-                           growth=self.growth)
+                           bridge_value=bridge_value, check_rule=self.check_rule)
             # A failed output, or a failed initial bin measurement before
             # any check ran, voids every output's variance quantities, as
             # the marginal path voids them on any one coordinate's failure.
@@ -539,11 +528,8 @@ class QIJ:
             joint_fields = dict(
                 joint_S_pred=jr.S_pred, joint_a=jr.a,
                 joint_S_pred_pre_lloyd=jr.S_pred_pre_lloyd,
-                joint_L0=jr.L0, joint_L=jr.L, joint_L_init=jr.L_init,
-                joint_n_growth_rounds=jr.n_growth_rounds,
-                joint_growth_capped=jr.growth_capped,
-                joint_growth_wall=jr.growth_wall, joint_n_lloyd_skipped=jr.n_lloyd_skipped,
-                joint_n_flagged=jr.n_flagged,
+                joint_L0=jr.L0, joint_L=jr.L, joint_n_growth_rounds=jr.n_growth_rounds,
+                joint_growth_capped=jr.growth_capped, joint_n_flagged=jr.n_flagged,
                 joint_n_check_rounds=jr.n_check_rounds, joint_n_check_evals=jr.n_check_evals,
                 joint_n_level_splits=jr.n_level_splits, joint_n_adjacency_splits=jr.n_adjacency_splits,
                 joint_check_capped=jr.check_capped, joint_n_closed_unpaid=jr.n_closed_unpaid,
@@ -750,6 +736,6 @@ class QIJ:
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
-            pilot=self.pilot, check_rule=self.check_rule, growth=self.growth,
+            pilot=self.pilot, check_rule=self.check_rule,
             **second_stage_fields, **joint_fields, **pilot_products, **sigma_fields,
         )
