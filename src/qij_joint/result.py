@@ -45,6 +45,13 @@ cell) and `cell_p`/`cell_mu`/`cell_g` (the affine field's own per-cell
 mass, mean and gradient) are populated; both are empty under `'gp'`,
 whose every other field stays exactly as before this option existed.
 
+`check_rule` (spec/QIJ_joint_check_measured_spec.md), inert (but
+recorded) under `ivqbins='marginal'`, picks the joint check's
+continuation rule: `'predicted'` (the default, today's rule, every
+product byte-identical) or `'measured'` (`pilot='gp'` only), which also
+populates `joint_n_strike_closes`/`joint_n_noise_floored` and changes
+`V_win_hat`/`V_tot_hat`'s own definition (no posterior variance).
+
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
 the full data: `.sigma_interval(level)` from the stored `sigma_mean`/
@@ -77,8 +84,12 @@ class QIJResult:
     theta_hat: np.ndarray          # (q,)
     theta_hat_full: np.ndarray     # (q_full,) every T output; the search audit's input
     V_btw: np.ndarray              # (q,)
-    V_win_hat: np.ndarray          # (q,)
-    V_tot_hat: np.ndarray          # (q,)
+    V_win_hat: np.ndarray          # (q,) model quantity: under ivqbins='joint', the pilot's
+                                    # within-bin spread including the posterior variance v
+                                    # (check_rule='predicted') or plain psi0 variance with no v
+                                    # (check_rule='measured'; spec/QIJ_joint_check_measured_
+                                    # spec.md 2.5); unaffected under ivqbins='marginal'
+    V_tot_hat: np.ndarray          # (q,) model quantity: V_btw + V_win_hat
     L: np.ndarray                  # (q,) int; 0 under ivqbins='joint'
     n_level_splits: np.ndarray     # (q,) int; 0 under ivqbins='joint'
     n_adjacency_splits: np.ndarray  # (q,) int; 0 under ivqbins='joint'
@@ -130,6 +141,11 @@ class QIJResult:
     joint_n_level_splits: int
     joint_n_adjacency_splits: int
     joint_check_capped: bool
+    joint_n_strike_closes: int     # check_rule='measured' only, 0 under 'predicted' (spec/
+                                    # QIJ_joint_check_measured_spec.md 2.4): splits whose
+                                    # children the second strike closed
+    joint_n_noise_floored: int     # check_rule='measured' only, 0 under 'predicted' (spec
+                                    # 2.4): splits whose deciding tau' was the noise floor
     joint_failed: bool             # a failed output, or a failed initial bin measurement before any check ran
     joint_bin_mass: np.ndarray     # (L,); empty under 'marginal'
     joint_bin_U: np.ndarray        # (L, q); empty under 'marginal'
@@ -147,6 +163,8 @@ class QIJResult:
     survey_step_ratio: np.ndarray  # (5, q) A9 item 4; NaN rows/columns as eta_Q is
     quantized_start: str           # 'multistart' or 'full-data' (A9 item 5)
     pilot: str                     # 'affine' or 'gp' (spec/QIJ_affine_pilot_spec.md 1)
+    check_rule: str                # 'predicted' or 'measured' (spec/QIJ_joint_check_measured_
+                                    # spec.md); inert under ivqbins='marginal'
     bridge_j: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_k: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_m: np.ndarray           # (P,) m_jk; empty under pilot='gp'

@@ -23,7 +23,12 @@ prototype) or `'moments'` (spec/method_notes.md section 2), passed to
 (spec/QIJ_affine_pilot_spec.md 3.3): `core.joint.run_joint`'s own flag
 and kind pricing follows `pilot` the same way the marginal path's
 `core.refine.prepare_coordinate` does, choosing once, at setup, between
-the GP posterior's rule and the bridge score's. `quantized_start`
+the GP posterior's rule and the bridge score's. `check_rule`
+(spec/QIJ_joint_check_measured_spec.md), inert under `ivqbins='marginal'`,
+picks the joint check's continuation rule: `'predicted'` (the default,
+today's re-flagging rule, byte-identical) or `'measured'` (`pilot='gp'`
+only -- a ValueError from `run_joint` otherwise -- the measured
+two-strike rule). `quantized_start`
 (spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
 `'multistart'` (ported) fits theta_Q from scratch on the survey rows;
 `'full-data'` runs theta_hat first (on `pool` when given) and continues
@@ -119,6 +124,7 @@ def _joint_defaults(N: int, q: int) -> dict:
         joint_L0=0, joint_L=0, joint_n_growth_rounds=0, joint_growth_capped=False,
         joint_n_flagged=0, joint_n_check_rounds=0, joint_n_check_evals=0,
         joint_n_level_splits=0, joint_n_adjacency_splits=0, joint_check_capped=False,
+        joint_n_strike_closes=0, joint_n_noise_floored=0,
         joint_failed=False, joint_bin_mass=np.zeros(0), joint_bin_U=np.zeros((0, q)),
         joint_bin_m=np.zeros((0, q)), joint_bin_flagged=np.zeros(0, dtype=bool),
         joint_bin_label=np.full(N, -1, dtype=int), joint_busy_delta=0.0,
@@ -193,7 +199,8 @@ def _empty_pilot_products(q: int) -> dict:
 
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
-                  sv, quantized_start, refine_schedule, pilot, sigma_points) -> QIJResult:
+                  sv, quantized_start, refine_schedule, pilot, sigma_points,
+                  check_rule) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -236,7 +243,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        pilot=pilot, sigma_points=sigma_points,
+        pilot=pilot, check_rule=check_rule, sigma_points=sigma_points,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_empty_pilot_products(q),
         **_sigma_defaults(q),
     )
@@ -250,7 +257,7 @@ class QIJ:
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
                  refine_schedule: str = 'queue', pilot: str = 'affine',
-                 sigma_points: bool = False) -> None:
+                 sigma_points: bool = False, check_rule: str = 'predicted') -> None:
         if pilot not in ('affine', 'gp'):
             raise ValueError(f"unknown pilot {pilot!r}")
         self.eps = eps
@@ -265,6 +272,7 @@ class QIJ:
         self.quantized_start = quantized_start
         self.pilot = pilot
         self.sigma_points = sigma_points
+        self.check_rule = check_rule
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -378,7 +386,7 @@ class QIJ:
                 return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                      self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                      self.survey, sv, self.quantized_start, self.refine_schedule,
-                                     self.pilot, self.sigma_points)
+                                     self.pilot, self.sigma_points, self.check_rule)
             psi0_all = _psi0(model, Z)
             sigma_all = _uncertainty(model, Z)
             offset = np.asarray(model.offset, dtype=float)
@@ -489,7 +497,7 @@ class QIJ:
                            self.eps, offset, pool=pool, I_proto=I_proto[:, measured],
                            start=start_second_stage, measured=measured, pilot=self.pilot,
                            bridge_pair_id=bridge_pair_id, bridge_pair_n=bridge_pair_n,
-                           bridge_value=bridge_value)
+                           bridge_value=bridge_value, check_rule=self.check_rule)
             # A failed output, or a failed initial bin measurement before
             # any check ran, voids every output's variance quantities, as
             # the marginal path voids them on any one coordinate's failure.
@@ -521,7 +529,8 @@ class QIJ:
                 joint_growth_capped=jr.growth_capped, joint_n_flagged=jr.n_flagged,
                 joint_n_check_rounds=jr.n_check_rounds, joint_n_check_evals=jr.n_check_evals,
                 joint_n_level_splits=jr.n_level_splits, joint_n_adjacency_splits=jr.n_adjacency_splits,
-                joint_check_capped=jr.check_capped, joint_failed=jr.failed,
+                joint_check_capped=jr.check_capped, joint_n_strike_closes=jr.n_strike_closes,
+                joint_n_noise_floored=jr.n_noise_floored, joint_failed=jr.failed,
                 joint_bin_mass=jr.bin_mass, joint_bin_U=jr.bin_U, joint_bin_m=jr.bin_m,
                 joint_bin_flagged=jr.bin_flagged, joint_bin_label=jr.bin_label,
                 joint_busy_delta=jr.busy_delta,
@@ -722,6 +731,6 @@ class QIJ:
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
-            pilot=self.pilot,
+            pilot=self.pilot, check_rule=self.check_rule,
             **second_stage_fields, **joint_fields, **pilot_products, **sigma_fields,
         )

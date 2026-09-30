@@ -46,7 +46,10 @@ def dir_tag(method: str, config: dict) -> str:
     setting that differs from `QIJ_CANONICAL`, in a fixed order:
     `survey`, `quantized_start`, `gptrend`, `gpwidth`, `ivqbins`,
     `refine_schedule`, `sigma_points` (named only when False, as
-    `_nosigma`), `M_X` (named only when not None, as `_MX<int>`). `boot`
+    `_nosigma`), `M_X` (named only when not None, as `_MX<int>`), then
+    `check_rule` (spec/QIJ_joint_check_measured_spec.md 3) as a
+    non-canonical suffix, named only when `'measured'`, as `_measured`
+    -- so a `check_rule='predicted'` run keeps today's folder name. `boot`
     -> `''` (`B` is not in the name -- replicates are a deterministic
     prefix, so a smaller B is read from a larger run's folder; `B` is
     still recorded in config.json and so still guarded). `ijfd` -> `''`,
@@ -71,6 +74,8 @@ def dir_tag(method: str, config: dict) -> str:
             tag += '_nosigma'
         if config['M_X'] != QIJ_CANONICAL['M_X']:
             tag += f"_MX{int(config['M_X'])}"
+        if config['check_rule'] == 'measured':
+            tag += '_measured'
         return tag
     if method == 'boot':
         return ''
@@ -107,6 +112,11 @@ def ensure_config(md: str, config: dict) -> None:
         return
     with open(path) as f:
         stored = json.load(f)
+    if 'check_rule' not in stored:
+        # A folder from before this build recorded no `check_rule`
+        # (spec/QIJ_joint_check_measured_spec.md 3): read as 'predicted',
+        # so today's `check_rule='predicted'` runs still match it.
+        stored = dict(stored, check_rule='predicted')
     if stored != requested:
         keys = sorted(set(stored) | set(requested))
         diffs = '; '.join(

@@ -158,14 +158,17 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`, `eta_Q`,
     spec/QIJ_mods_waves.md A10) and the joint scalars from the joint
     second stage (spec/method_notes.md section 6) -- the joint scalars
-    inert under `ivqbins='marginal'`. The joint check's own scale factor
+    inert under `ivqbins='marginal'`. `check_rule` (spec/QIJ_joint_
+    check_measured_spec.md) is recorded whether or not it is inert, and
+    `n_strike_closes`/`n_noise_floored` are its own products, 0 under
+    `check_rule='predicted'`. The joint check's own scale factor
     (B6, also lettered `a` in the spec) is `joint_a_<o>` here, kept
     distinct from A10's `a_<o>` (the ABC acceleration, populated under
     both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
     measured trigger's own scale factor, B4's formula reused at one
     output)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
-           's': s, 'seed': seed, 'pilot': res.pilot,
+           's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
@@ -187,6 +190,10 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['n_check_rounds'] = int(res.joint_n_check_rounds)
     row['n_check_evals'] = int(res.joint_n_check_evals)
     row['check_capped'] = bool(res.joint_check_capped)
+    # check_rule='measured' only (spec/QIJ_joint_check_measured_spec.md
+    # 2.5); 0 under 'predicted'.
+    row['n_strike_closes'] = int(res.joint_n_strike_closes)
+    row['n_noise_floored'] = int(res.joint_n_noise_floored)
     # The sigma-points stage (spec/QIJ_sigma_points_spec.md 3): its own
     # 'sigma' stage entry (outside the loop above, whose own product
     # names -- 'wall_sigma', not 'wall_time_sigma' -- differ from the
@@ -357,7 +364,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             M_X: Optional[int] = None, ivqbins: str = 'marginal',
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
-            sigma_points: bool = False, tag: str = '') -> Tuple[int, int]:
+            sigma_points: bool = False, check_rule: str = 'predicted',
+            tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -376,7 +384,9 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     `cells` array products (section 4). `sigma_points`
     (spec/QIJ_sigma_points_spec.md), off by default, runs the optional
     sigma-points interval stage after refinement; when True, every draw
-    also writes the `sigma_points` array product."""
+    also writes the `sigma_points` array product. `check_rule`
+    (spec/QIJ_joint_check_measured_spec.md) picks the joint check's
+    continuation rule, inert under `ivqbins='marginal'`."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -393,7 +403,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
                   refine_schedule=refine_schedule, pilot=pilot,
-                  sigma_points=sigma_points).fit(X, T, pool=pool)
+                  sigma_points=sigma_points, check_rule=check_rule).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}

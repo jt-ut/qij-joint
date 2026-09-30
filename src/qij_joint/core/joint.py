@@ -23,6 +23,13 @@ the check's flag and kind pricing once, at setup, the same way
 (today's rule, bit-identical) or `'affine'` (no posterior variance
 anywhere; the adjacency proposal is priced from the bridge score
 instead).
+
+`check_rule` (spec/QIJ_joint_check_measured_spec.md) picks the check's
+continuation rule once, at the same setup point as `pilot`: `'predicted'`
+(today's re-flagging rule, byte-identical products) or `'measured'`
+(`pilot='gp'` only; a ValueError otherwise) -- the measured two-strike
+rule of spec section 2.4, with no posterior variance read by any split
+decision.
 """
 
 from __future__ import annotations
@@ -75,7 +82,9 @@ class JointResult:
     Shared: L0, L (final), n_growth_rounds, growth_capped,
     S_pred_pre_lloyd (q,), n_flagged (bins flagged in the first check),
     n_check_rounds, n_check_evals, n_level_splits, n_adjacency_splits,
-    check_capped, failed (a failed output, or a failed initial
+    check_capped, n_strike_closes, n_noise_floored (check_rule='measured'
+    only, spec/QIJ_joint_check_measured_spec.md 2.5; 0 under 'predicted'),
+    failed (a failed output, or a failed initial
     measurement before any check ran, voids every output). Bin
     constituents: bin_mass (L,), bin_U (L,q), bin_m (L,q, predicted
     means), bin_flagged (L,); bin_label (N,); busy_delta as the other
@@ -100,6 +109,8 @@ class JointResult:
     n_level_splits: int
     n_adjacency_splits: int
     check_capped: bool
+    n_strike_closes: int
+    n_noise_floored: int
     failed: bool
     bin_mass: np.ndarray
     bin_U: np.ndarray
@@ -395,7 +406,7 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
         B_hat=nan_q, a_bca=nan_q,
         L0=L0, L=L0, n_growth_rounds=n_rounds, growth_capped=capped, S_pred_pre_lloyd=S_pre,
         n_flagged=0, n_check_rounds=0, n_check_evals=0, n_level_splits=0, n_adjacency_splits=0,
-        check_capped=False, failed=True,
+        check_capped=False, n_strike_closes=0, n_noise_floored=0, failed=True,
         bin_mass=mass, bin_U=np.full((L0, q), np.nan), bin_m=np.full((L0, q), np.nan),
         bin_flagged=np.zeros(L0, dtype=bool), bin_label=labels, busy_delta=busy_delta,
     )
@@ -408,6 +419,7 @@ def run_joint(
     start: np.ndarray = None, measured: Optional[Sequence[int]] = None,
     pilot: str = 'gp', bridge_pair_id: Optional[np.ndarray] = None,
     bridge_pair_n: Optional[np.ndarray] = None, bridge_value: Optional[np.ndarray] = None,
+    check_rule: str = 'predicted',
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -446,7 +458,19 @@ def run_joint(
     `bridge_value` (`bridge_value` = pair_mass[:, None] *
     pair_delta[:, measured]^2, built once by `qij.py`) feeding
     `_bridge_vectors`.
+
+    `check_rule` (spec/QIJ_joint_check_measured_spec.md, R2) picks the
+    check's continuation rule once, at the same setup point as `pilot`:
+    `'predicted'` (today's `_flag_mask` re-flagging rule, every product
+    byte-identical) or `'measured'` (`pilot='gp'` only -- a ValueError
+    otherwise -- the two-strike rule of spec section 2.4, reading no
+    posterior variance anywhere in the check).
     """
+    if check_rule not in ('predicted', 'measured'):
+        raise ValueError(f"unknown check_rule {check_rule!r}")
+    if check_rule == 'measured' and pilot != 'gp':
+        raise ValueError("check_rule='measured' requires pilot='gp'")
+
     N, q = psi0_all.shape
     if measured is None:
         measured = list(range(q))
@@ -494,7 +518,8 @@ def run_joint(
 
     leaves: Dict[int, dict] = {
         k: dict(indices=groups0[k], n=int(bins.n[k]), U=U0[k].copy(), m=m0[k].copy(),
-                var=var0[k].copy(), v=v0[k].copy(), ubar=psi_centered[groups0[k]].mean(axis=0))
+                var=var0[k].copy(), v=v0[k].copy(), ubar=psi_centered[groups0[k]].mean(axis=0),
+                strike=False)  # the seeds' clear flag (spec/QIJ_joint_check_measured_spec.md 2.4)
         for k in range(L0)
     }
     if bridge0 is not None:
@@ -506,6 +531,7 @@ def run_joint(
     current_flagged = set(np.where(flagged_mask)[0].tolist())
 
     n_check_rounds = n_check_evals = n_level_splits = n_adjacency_splits = 0
+    n_strike_closes = n_noise_floored = 0  # check_rule='measured' only (spec 2.4/2.5)
     sum_delta, sum_g = np.zeros(q), np.zeros(q)
     evals_cap = 1 + M_X_used
     check_capped = False
@@ -579,14 +605,144 @@ def run_joint(
                     break
         return adjacency_result if adjacency_result is not None else level_result
 
+    def decide_split_measured(leaf):
+        """`check_rule='measured'`'s split-kind rule for a flagged bin
+        (spec/QIJ_joint_check_measured_spec.md 2.2): both kinds are
+        priced per output at rho2=1 from the pilot's mean only, no v --
+        level from `two_means_split` on the bin's own Ψ̃ rows, priced by
+        `level_gain_value`; adjacency from whichever output's own
+        `_try_adjacency_split` geometry gives the largest
+        level_gain_value/V_btw,c among the feasible outputs, its price
+        the SAME level_gain_value formula applied to that geometry's own
+        two children, for every output. The larger summed normalized
+        gain wins, level at a tie (as `decide_split_affine` does); an
+        infeasible chosen kind falls back to the other, both infeasible
+        closes the bin. `adjacency_gain_value` (v-based) is never
+        called here."""
+        idx = leaf['indices']
+        p_k = leaf['n'] / N
+
+        level_result = None
+        s_level = -np.inf
+        level_split = two_means_split(psi_tilde[idx])
+        if level_split is not None:
+            idx_a, idx_b = idx[level_split[0]], idx[level_split[1]]
+            ubar_a = psi_centered[idx_a].mean(axis=0)
+            ubar_b = psi_centered[idx_b].mean(axis=0)
+            g_level = level_gain_value(idx_a.size / N, ubar_a, idx_b.size / N, ubar_b,
+                                        p_k, leaf['ubar'], N, 1.0)
+            s_level = float(np.sum(g_level / V_btw))
+            level_result = ('level', idx_a, idx_b)
+
+        adjacency_result = None
+        s_adj = -np.inf
+        if I_proto is not None:
+            best_split, best_c_score = None, -np.inf
+            for c in range(q):
+                split_c = _try_adjacency_split(idx, I_proto[:, c], xvq.bmu, xvq.bmu2)
+                if split_c is None:
+                    continue
+                idx_a_c, idx_b_c = split_c
+                ubar_a_c = float(psi_centered[idx_a_c, c].mean())
+                ubar_b_c = float(psi_centered[idx_b_c, c].mean())
+                c_score = level_gain_value(idx_a_c.size / N, ubar_a_c, idx_b_c.size / N,
+                                            ubar_b_c, p_k, float(leaf['ubar'][c]), N, 1.0) / V_btw[c]
+                if c_score > best_c_score:
+                    best_split, best_c_score = split_c, c_score
+            if best_split is not None:
+                idx_a, idx_b = best_split
+                ubar_a = psi_centered[idx_a].mean(axis=0)
+                ubar_b = psi_centered[idx_b].mean(axis=0)
+                g_adj = level_gain_value(idx_a.size / N, ubar_a, idx_b.size / N, ubar_b,
+                                          p_k, leaf['ubar'], N, 1.0)
+                s_adj = float(np.sum(g_adj / V_btw))
+                adjacency_result = ('adjacency', idx_a, idx_b)
+
+        if level_result is not None and s_level >= s_adj:
+            return level_result
+        return adjacency_result if adjacency_result is not None else level_result
+
     # Chosen once (R2), never re-chosen inside the check loop below.
-    decide_split = decide_split_gp if pilot == 'gp' else decide_split_affine
+    if check_rule == 'measured':
+        decide_split = decide_split_measured
+    else:
+        decide_split = decide_split_gp if pilot == 'gp' else decide_split_affine
+
+    def _continue_predicted(ids, idxs, Us, means_new, var_new, v_new, u_new, bridge_new,
+                             p_new, L_current, split_records):
+        """`check_rule='predicted'`'s continuation rule (today's,
+        unchanged): re-flag every new child against `_flag_mask`, the
+        same pilot means that were already wrong for the parent."""
+        flagged_new = _flag_mask(p_new, Us, means_new, a, V_hat, u_new, L_current, eps)
+        for i, nid in enumerate(ids):
+            leaves[nid] = dict(indices=idxs[i], n=idxs[i].size, U=Us[i], m=means_new[i],
+                                var=var_new[i], v=v_new[i], ubar=psi_centered[idxs[i]].mean(axis=0))
+            if bridge_new is not None:
+                leaves[nid]['bridge'] = bridge_new[i]
+            if flagged_new[i]:
+                current_flagged.add(nid)
+
+    def _continue_measured(ids, idxs, Us, means_new, var_new, v_new, u_new, bridge_new,
+                            p_new, L_current, split_records):
+        """`check_rule='measured'`'s two-strike continuation rule
+        (spec/QIJ_joint_check_measured_spec.md 2.4): per split, Delta_c
+        (already added to V_btw above) is tested against tau'_c =
+        max(tau_c, n_Delta,c), tau_c = eps*V_btw_c/L taken once at this
+        round's start (`tau_round`, the same for every split of the
+        round); n_Delta,c is the finite-difference floor carried through
+        mass balance. A gain (Delta_c >= tau'_c for some output c)
+        clears both children's strike and reopens them; a first miss
+        (parent's own flag clear) flags them and reopens them; a second
+        consecutive miss (parent already flagged) closes them, final, no
+        further evaluation -- `n_strike_closes` counts the SPLIT, not
+        the two children. `n_noise_floored` counts the split's own
+        deciding output (argmax_c(Delta_c - tau'_c)) when the floor
+        n_Delta, not tau, set that output's tau'."""
+        nonlocal n_strike_closes, n_noise_floored
+        decisions = {}
+        for rec in split_records:
+            delta_U = eta * theta_floor / rec['t_small']
+            n_delta = ((2.0 * rec['p_small'] / N) * (np.abs(rec['U_small']) + np.abs(rec['U_large']))
+                       * delta_U)
+            tau_prime = np.maximum(tau_round, n_delta)
+            margin = rec['Delta'] - tau_prime
+            c_star = int(np.argmax(margin))
+            gain = bool(margin[c_star] >= 0.0)
+            if n_delta[c_star] >= tau_round[c_star]:
+                n_noise_floored += 1
+            if gain:
+                strike, is_open = False, True
+            elif not rec['leaf_strike']:
+                strike, is_open = True, True
+            else:
+                strike, is_open = True, False
+                n_strike_closes += 1
+            decisions[rec['child_small_id']] = (strike, is_open)
+            decisions[rec['child_large_id']] = (strike, is_open)
+        for i, nid in enumerate(ids):
+            strike_i, open_i = decisions[nid]
+            leaves[nid] = dict(indices=idxs[i], n=idxs[i].size, U=Us[i], m=means_new[i],
+                                var=var_new[i], v=v_new[i], ubar=psi_centered[idxs[i]].mean(axis=0),
+                                strike=strike_i)
+            if open_i:
+                current_flagged.add(nid)
+
+    # Chosen once (R2), never re-tested inside the loop below.
+    continue_round = _continue_measured if check_rule == 'measured' else _continue_predicted
+    # theta_hat at the measured columns, floored at machine epsilon only
+    # (spec section 2.4): fixed for the whole check, computed once.
+    theta_floor = (np.maximum(np.abs(theta_hat[measured]), np.finfo(float).eps)
+                   if check_rule == 'measured' else None)
 
     while current_flagged:
         if n_check_evals >= evals_cap:
             check_capped = True
             break
         n_check_rounds += 1
+        # tau_c = eps*V_btw_c/L at the START of the round, before any of
+        # its own splits (spec section 2.4/6, as `core.rounds` does);
+        # the same array serves every split of this round.
+        tau_round = (eps * V_btw / len(leaves)) if check_rule == 'measured' else None
         proposals = {}
         for k in sorted(current_flagged):
             decided = decide_split(leaves[k])
@@ -594,10 +750,14 @@ def run_joint(
                 continue  # both kinds infeasible: the bin stays and is closed
             kind, idx_a, idx_b = decided
             p_k = leaves[k]['n'] / N
-            if kind == 'adjacency':
+            if kind == 'adjacency' and check_rule != 'measured':
                 g = (adjacency_gain_value(p_k, leaves[k]['v'], N, 1.0) if pilot == 'gp'
                      else bridge_gain_value(leaves[k]['bridge'], 1.0))
             else:
+                # Under `check_rule='measured'` an adjacency proposal is
+                # priced by this SAME formula, on its own geometry's two
+                # children (spec section 2.2) -- the branch above is
+                # never taken there.
                 ubar_a, ubar_b = psi_centered[idx_a].mean(axis=0), psi_centered[idx_b].mean(axis=0)
                 g = level_gain_value(idx_a.size / N, ubar_a, idx_b.size / N, ubar_b,
                                       p_k, leaves[k]['ubar'], N, 1.0)
@@ -630,6 +790,7 @@ def run_joint(
         n_check_evals += len(tasks)
 
         new_leaves = []
+        split_records = []
         for k, val, failed in evaluated:
             if failed:
                 continue  # cancelled: parent stays as a final bin, closed, counted above
@@ -648,6 +809,14 @@ def run_joint(
                 n_level_splits += 1
             else:
                 n_adjacency_splits += 1
+            if check_rule == 'measured':
+                # Recorded for `_continue_measured`'s strike test below;
+                # never read under `check_rule='predicted'`.
+                split_records.append(dict(
+                    child_small_id=next_id, child_large_id=next_id + 1,
+                    leaf_strike=leaf['strike'], t_small=meta['t_small'],
+                    p_small=meta['p_small'], Delta=Delta, U_small=U_small, U_large=U_large,
+                ))
             new_leaves.append((next_id, meta['idx_small'], U_small))
             new_leaves.append((next_id + 1, meta['idx_large'], U_large))
             next_id += 2
@@ -658,8 +827,16 @@ def run_joint(
         idxs = [nl[1] for nl in new_leaves]
         Us = np.array([nl[2] for nl in new_leaves])
         means_new, var_new = _group_stats(psi0_all, idxs)
-        if pilot == 'gp':
+        if pilot == 'gp' and check_rule != 'measured':
             v_new, u_new = _posterior_vu(model, Z, sigma_all, idxs)
+            bridge_new = None
+        elif pilot == 'gp':
+            # `check_rule='measured'` reads no posterior variance
+            # anywhere (spec section 1): the round's own new leaves skip
+            # `bin_posterior_variance` entirely rather than compute a
+            # value nothing downstream reads.
+            v_new = np.zeros((len(idxs), q))
+            u_new = np.zeros((len(idxs), q))
             bridge_new = None
         else:
             v_new = np.zeros((len(idxs), q))
@@ -667,14 +844,8 @@ def run_joint(
             bridge_new = _bridge_vectors(idxs, bridge_pair_id, bridge_pair_n, bridge_value)
         p_new = np.array([idx.size for idx in idxs], dtype=float) / N
         L_current = len(leaves) + len(new_leaves)
-        flagged_new = _flag_mask(p_new, Us, means_new, a, V_hat, u_new, L_current, eps)
-        for i, nid in enumerate(ids):
-            leaves[nid] = dict(indices=idxs[i], n=idxs[i].size, U=Us[i], m=means_new[i],
-                                var=var_new[i], v=v_new[i], ubar=psi_centered[idxs[i]].mean(axis=0))
-            if bridge_new is not None:
-                leaves[nid]['bridge'] = bridge_new[i]
-            if flagged_new[i]:
-                current_flagged.add(nid)
+        continue_round(ids, idxs, Us, means_new, var_new, v_new, u_new, bridge_new,
+                       p_new, L_current, split_records)
 
     ordered_ids = sorted(leaves.keys())
     L_final = len(ordered_ids)
@@ -686,12 +857,17 @@ def run_joint(
     for new_id, old_id in enumerate(ordered_ids):
         bin_label[leaves[old_id]['indices']] = new_id
 
+    # check_rule='measured': the pilot's own within-bin spread, no v
+    # (spec/QIJ_joint_check_measured_spec.md 2.5); 'predicted' keeps
+    # today's Var_k + v_k for byte identity.
+    win_includes_v = check_rule != 'measured'
     V_win_hat = np.zeros(q)
     for i in ordered_ids:
         leaf = leaves[i]
         if leaf['n'] > 1:
-            V_win_hat += (leaf['n'] / N) * (leaf['var'] + leaf['v'])
-    V_win_hat /= N  # (1/N) sum_k p_k (Var_k + v_k), on V_btw's scale (method_notes section 6)
+            spread = leaf['var'] + leaf['v'] if win_includes_v else leaf['var']
+            V_win_hat += (leaf['n'] / N) * spread
+    V_win_hat /= N  # (1/N) sum_k p_k (Var_k [+ v_k]), on V_btw's scale (method_notes section 6)
     V_tot_hat = V_btw + V_win_hat
 
     gain_ratio = np.full(q, np.nan)
@@ -706,7 +882,8 @@ def run_joint(
         growth_capped=growth.growth_capped, S_pred_pre_lloyd=growth.S_pred_pre_lloyd,
         n_flagged=n_flagged, n_check_rounds=n_check_rounds, n_check_evals=n_check_evals,
         n_level_splits=n_level_splits, n_adjacency_splits=n_adjacency_splits,
-        check_capped=check_capped, failed=False,
+        check_capped=check_capped, n_strike_closes=n_strike_closes,
+        n_noise_floored=n_noise_floored, failed=False,
         bin_mass=bin_mass, bin_U=bin_U, bin_m=bin_m, bin_flagged=bin_flagged,
         bin_label=bin_label, busy_delta=busy_delta,
     )
