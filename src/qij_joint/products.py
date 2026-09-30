@@ -93,13 +93,14 @@ def ensure_config(md: str, config: dict) -> None:
     side -- as `key: stored=<v> requested=<v>` if they differ, and
     telling the caller to choose a different --out study root or fix the
     arguments. Many single-draw processes may start against a new folder
-    at once; if two race to create it they write identical content, so
-    the atomic replace is harmless."""
+    at once; each writes its own `config.json.<pid>.tmp`, so racing
+    creators never share a temp file, and they write identical content,
+    so whichever `os.replace` lands last is harmless."""
     os.makedirs(md, exist_ok=True)
     path = os.path.join(md, 'config.json')
     requested = json.loads(json.dumps(config))
     if not os.path.exists(path):
-        tmp = path + '.tmp'
+        tmp = f'{path}.{os.getpid()}.tmp'
         with open(tmp, 'w') as f:
             f.write(json.dumps(config, indent=1, sort_keys=True))
         os.replace(tmp, path)
