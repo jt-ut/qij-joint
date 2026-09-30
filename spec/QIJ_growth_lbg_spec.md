@@ -1,5 +1,34 @@
 # LBG in the joint growth: a Lloyd run after every round (planner, 30 September 2026; one build; validated AFTER the measured check, QIJ_joint_check_measured_spec.md)
 
+**NOT ADOPTED (30 September 2026; reverted on main at 17363f0, code
+identical to 79d98c5; record Research/QIJ_joint/analysis/
+growth_lbg_validation.txt).** Built as specified (skip-Lloyd guard,
+M_ref seeded start) and validated on the author's machine under
+`check_rule='measured'`, tree → lbg: ε 0.01 draw 1 L0 312 → 393, net
+cost 828 → 1006 fit-equivalents; draw 7 375 → 356, 870 → 913; ε 0.141
+draw 1 55 → 40, 193 → 145 but the position angle's realized shortfall
+15% > ε; draw 7 54 → 39, 207 → 155. Lloyd time was 1–4.5 s, not the
+issue. Why: Lloyd equalizes the bins' shares, the split rule "every
+bin over ε/L" then flags nearly every bin, and L doubles per round —
+an overshoot in COUNT at the same predicted share; Lloyd minimizes the
+SUM of shares while the tolerance is on the MAX, and the tree's
+selective, unequal splits are the better optimizer for that
+criterion. The section-1 measurement (one draw of the older P2 pilot,
+473 → 339) did not carry to P1 — one draw of a stale pilot, against
+the author's three questions. The finding that decides it: at ε 0.141
+the realized shortfall on the position angle was ~1.3× the pilot's
+predicted worst share; the tree lands at ~½ ε in predicted share, and
+that margin is what makes the realized tolerance hold on every draw
+so far. Under the measured check an under-predicted bin is never
+flagged and never repaired, so any growth that lands nearer the
+tolerance spends the margin. The greedy schedule (split only as many
+of the largest-share bins as the predicted shares need) is NOT
+pursued; if ever revisited it is measured offline first, growth alone
+on the current pilot of draws 1 and 7 at both ε against the tree, and
+built only if it wins there. The `'tree'` removal once written into
+section 5 is withdrawn; growth stays as coded. The rest of this
+document is the record of what was built.
+
 Scope. One change to `core/joint.py grow` behind a new argument
 `growth`: `'tree'` = today's growth, byte-identical products; `'lbg'` =
 this document. Nothing else in the joint stage, the check, the sigma
@@ -140,11 +169,9 @@ two draw ids, commit, wall time per stage.
   which cannot happen: every output's own within share must meet ε.
   If a seed's cell is empty after the projection assignment, Lloyd
   drops it and L_init is recorded as what survived.
-* After acceptance (the author's simplification, 30 September): the
-  `'tree'` mode is removed together with its `room` rule and the
-  `S_pred_pre_lloyd` product, and `grow` becomes the seeded loop of
-  section 2 with the cap and the guard — one build, byte identity then
-  against this build's `'lbg'` products.
+* (Withdrawn, 30 September: the post-acceptance removal of `'tree'`
+  and its `room` rule and `S_pred_pre_lloyd` product is void, since
+  `'lbg'` was not adopted; growth stays as coded.)
 * Can Lloyd undo a split? It can empty a centroid, which is dropped;
   L then falls and the next round's flags decide. That is the
   optimizer working; `growth_capped` logic is unchanged since the cap
