@@ -112,10 +112,11 @@ def ensure_config(md: str, config: dict) -> None:
         return
     with open(path) as f:
         stored = json.load(f)
-    if 'check_rule' not in stored:
-        # A folder from before this build recorded no `check_rule`
+    if 'check_rule' in requested and 'check_rule' not in stored:
+        # A qij folder from before this build recorded no `check_rule`
         # (spec/QIJ_joint_check_measured_spec.md 3): read as 'predicted',
-        # so today's `check_rule='predicted'` runs still match it.
+        # so today's `check_rule='predicted'` runs still match it. Only a
+        # configuration that carries the key (qij) gets the default.
         stored = dict(stored, check_rule='predicted')
     if stored != requested:
         keys = sorted(set(stored) | set(requested))
