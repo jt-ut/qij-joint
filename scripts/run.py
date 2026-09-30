@@ -61,9 +61,6 @@ def main(argv=None) -> None:
     p.add_argument('--check-rule', dest='check_rule', choices=['predicted', 'measured'],
                     default='predicted',
                     help='qij: the joint check continuation rule (ivqbins=joint)')
-    p.add_argument('--gp-update', dest='gp_update', action='store_true',
-                    help='qij: condition the pilot on measured bin means for the check\'s '
-                         'next-round proposals (check_rule=measured, pilot=gp only)')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
@@ -82,7 +79,7 @@ def main(argv=None) -> None:
                       gpwidth=args.gpwidth, M_X=args.M_X, ivqbins=args.ivqbins,
                       survey=args.survey, quantized_start=args.quantized_start,
                       refine_schedule=args.refine_schedule, sigma_points=args.sigma_points,
-                      check_rule=args.check_rule, gp_update=args.gp_update)
+                      check_rule=args.check_rule)
     elif args.method == 'boot':
         config['B'] = args.B
     elif args.method == 'ijfd':
@@ -121,16 +118,14 @@ def main(argv=None) -> None:
                       ivqbins=args.ivqbins, survey=args.survey,
                       quantized_start=args.quantized_start,
                       refine_schedule=args.refine_schedule, pilot=args.pilot,
-                      sigma_points=args.sigma_points, check_rule=args.check_rule,
-                      gp_update=args.gp_update)
+                      sigma_points=args.sigma_points, check_rule=args.check_rule)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
             workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
             ivqbins=args.ivqbins, survey=args.survey, quantized_start=args.quantized_start,
             refine_schedule=args.refine_schedule, pilot=args.pilot,
-            sigma_points=args.sigma_points, check_rule=args.check_rule,
-            gp_update=args.gp_update, tag=tag)
+            sigma_points=args.sigma_points, check_rule=args.check_rule, tag=tag)
     elif args.method == 'qijdt':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \

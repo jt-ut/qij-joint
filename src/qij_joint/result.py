@@ -53,17 +53,6 @@ populates `joint_n_closed_unpaid`/`joint_n_closed_unflagged`/
 `joint_n_noise_floored`/`joint_sum_b_delta` and changes `V_win_hat`/
 `V_tot_hat`'s own definition (no posterior variance).
 
-`gp_update` (spec section 7), inert (but recorded) unless
-`check_rule='measured'` and `pilot='gp'`, off by default: conditions the
-pilot's posterior on every current bin's own measured mean, using the
-result ONLY for the joint check's own next-round proposals (cutting,
-ranking, the recorded predicted gain) and for `V_win_hat`'s own
-within-bin spread; never the seeds, the gain test, V_btw, or any other
-reported variance. `joint_gp_update_wall`/`joint_n_gp_updates`/
-`joint_n_gp_update_skipped` are its own products, 0/0.0 when off.
-`gp_update=False` is byte-identical to `check_rule='measured'` without
-it.
-
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
 the full data: `.sigma_interval(level)` from the stored `sigma_mean`/
@@ -165,12 +154,6 @@ class QIJResult:
                                     # (spec 2.4-2.5): summed finite-difference noise-bias
                                     # floor over every split measured, the residual bias left
                                     # in V_btw (never subtracted from it)
-    joint_gp_update_wall: float    # gp_update=True only, 0.0 otherwise (spec section 7):
-                                    # summed wall time of every conditioning pass
-    joint_n_gp_updates: int        # gp_update=True only, 0 otherwise: conditioning passes run
-    joint_n_gp_update_skipped: int  # gp_update=True only, 0 otherwise: skipped (bin, output)
-                                    # pairs (constant path, a_c 0/non-finite, or no remaining
-                                    # design-mapped point, spec 7.5)
     joint_failed: bool             # a failed output, or a failed initial bin measurement before any check ran
     joint_bin_mass: np.ndarray     # (L,); empty under 'marginal'
     joint_bin_U: np.ndarray        # (L, q); empty under 'marginal'
@@ -190,8 +173,6 @@ class QIJResult:
     pilot: str                     # 'affine' or 'gp' (spec/QIJ_affine_pilot_spec.md 1)
     check_rule: str                # 'predicted' or 'measured' (spec/QIJ_joint_check_measured_
                                     # spec.md); inert under ivqbins='marginal'
-    gp_update: bool                # spec section 7; requires check_rule='measured' and
-                                    # pilot='gp' (False elsewhere); inert under ivqbins='marginal'
     bridge_j: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_k: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_m: np.ndarray           # (P,) m_jk; empty under pilot='gp'

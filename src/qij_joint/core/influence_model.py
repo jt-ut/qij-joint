@@ -104,7 +104,6 @@ class InfluenceModel:
     beta: List[np.ndarray]         # per coordinate, (m_c,) mean-basis coefficients; length 0 on the constant path
     centers: List[np.ndarray]      # per coordinate, (M_c, d_z) whitened positions of that coordinate's finite prototypes
     h_design: List[Optional[np.ndarray]]  # per coordinate, (M_c,) that group's own CONN spacing h[idx_g] (gpwidth='local' only); None under 'global' and on the constant path
-    design_idx: List[np.ndarray]   # per coordinate, (M_c,) int, the indices into the M_used live prototypes forming `centers[c]`'s rows, in that same row order (spec/QIJ_joint_check_measured_spec.md section 7.1); empty on the constant path
     whitening: Tuple[np.ndarray, np.ndarray]  # (mean, transform): raw Z -> whitened coordinates
     width: np.ndarray              # (q,) Matern-3/2 length scale ell_c under gpwidth='global'; NaN under 'local' and on the constant path
     c: np.ndarray                  # (q,) fitted width factor under gpwidth='local' (ell_j = c*h_j, shared per group); NaN under 'global' and on the constant path
@@ -489,7 +488,6 @@ def fit_influence_model(
 
     centers: List[np.ndarray] = [np.empty((0, d_z), dtype=float)] * q
     h_design: List[Optional[np.ndarray]] = [None] * q
-    design_idx: List[np.ndarray] = [np.empty(0, dtype=np.intp)] * q
     alpha: List[np.ndarray] = [np.empty(0, dtype=float)] * q
     beta: List[np.ndarray] = [np.empty(0, dtype=float)] * q
     width = np.full(q, np.nan, dtype=float)
@@ -703,7 +701,6 @@ def fit_influence_model(
 
             centers[c] = centers_g
             h_design[c] = h_design_g
-            design_idx[c] = idx_g
             m_arr[c] = m_g
             if gpwidth == 'global':
                 width[c] = param_val
@@ -738,7 +735,6 @@ def fit_influence_model(
         beta=beta,
         centers=centers,
         h_design=h_design,
-        design_idx=design_idx,
         whitening=(mean, transform),
         width=width,
         c=c_arr,
@@ -793,38 +789,6 @@ def _coordinate_groups(model: InfluenceModel) -> List[List[int]]:
     return list(groups.values())
 
 
-def _basis_kernel_chunks(model: InfluenceModel, c0: int, Zw: np.ndarray, batch: int):
-    """
-    Yields (sl, Hc, Kc) over one coordinate group's rows against `Zw`,
-    in chunks of at most `batch` (E4): Hc = h(chunk) at the group's
-    basis size, Kc = the chunk's kernel rows against the group's design
-    centers (`_matern32` under gpwidth='global', `_matern32_
-    nonstationary` at each row's own c*h[bmu] under 'local'). The one
-    place kernel rows are formed against Z; `_point_terms` (the model's
-    own alpha) and `psi_at` (a substituted alpha, spec/QIJ_joint_check_
-    measured_spec.md section 7.2) both read chunks from here rather
-    than each forming their own.
-    """
-    N, d_z = Zw.shape
-    centers_g = model.centers[c0]
-    m_g = int(model.m[c0])
-    if model.gpwidth == 'global':
-        ell_g = float(model.width[c0])
-    else:
-        c_val_g = float(model.c[c0])
-        h_col_g = c_val_g * model.h_design[c0]
-    for start in range(0, N, batch):
-        sl = slice(start, start + batch)
-        Zc = Zw[sl]
-        Hc = _basis(Zc, m_g)
-        if model.gpwidth == 'global':
-            Kc = _matern32(cdist(Zc, centers_g), ell_g)  # (nb, M_g)
-        else:
-            ell_row = c_val_g * model.h[model.bmu[sl]]
-            Kc = _matern32_nonstationary(cdist(Zc, centers_g), ell_row, h_col_g, d_z)
-        yield sl, Hc, Kc
-
-
 def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     """
     The one pass of the posterior over the N rows of Z, cached on the
@@ -849,6 +813,7 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     mean, transform = model.whitening
     Zw = (Za - mean) @ transform.T
     N = Zw.shape[0]
+    d_z = Zw.shape[1]
     q = len(model.centers)
 
     psi0_out = np.empty((N, q), dtype=float)
@@ -863,10 +828,16 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     batch = _UNCERTAINTY_BATCH_CAP
     for cols in groups:
         c0 = cols[0]
+        centers_g = model.centers[c0]
         m_g = int(model.m[c0])
         V_K = model.k_eigvec[c0]
         Lambda_K = model.k_eigval[c0]
         HbV_g = model.hb_eig[c0]
+        if model.gpwidth == 'global':
+            ell_g = float(model.width[c0])
+        else:
+            c_val_g = float(model.c[c0])
+            h_col_g = c_val_g * model.h_design[c0]
 
         # Per-coordinate constants of the eigen form: w_c = 1 /
         # (Lambda + lam_c + jit_c) is A_c^-1's spectrum, and B_c =
@@ -880,7 +851,16 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
             B_by_c[c] = HbV_g * w_c[:, None]
             R_out[c] = np.empty((N, m_g), dtype=float)
 
-        for sl, Hc, Kc in _basis_kernel_chunks(model, c0, Zw, batch):
+        for start in range(0, N, batch):
+            sl = slice(start, start + batch)
+            Zc = Zw[sl]
+            Hc = _basis(Zc, m_g)
+            if model.gpwidth == 'global':
+                Kc = _matern32(cdist(Zc, centers_g), ell_g)  # (nb, M_g)
+            else:
+                ell_row = c_val_g * model.h[model.bmu[sl]]
+                Kc = _matern32_nonstationary(cdist(Zc, centers_g), ell_row, h_col_g, d_z)
+
             for c in cols:
                 psi0_out[sl, c] = Hc @ model.beta[c] + Kc @ model.alpha[c]
 
@@ -1081,146 +1061,5 @@ def bin_posterior_variance(
 
     if with_mean:
         return out, out_mean
-
-    return out
-
-
-# Change B (spec/QIJ_joint_check_measured_spec.md section 7): conditioning
-# coordinate c's GP on the current bins' measured means, valid because
-# f(x) is independent of the survey and the bin observations given f(Z) --
-# the prototype-composition observation model of section 7.1 makes every
-# bin mean a linear functional of the same M_c-dimensional latent the
-# survey already conditions, so one more Gaussian update on that latent
-# is exact; no new kernel sum over N or over point pairs is needed.
-
-
-def _reconstruct_K(model: InfluenceModel, c: int) -> np.ndarray:
-    """K_c (M_c, M_c) at coordinate c's fitted width, rebuilt from the
-    group's shared eigendecomposition K = V Lambda V^T (the same
-    representation `_point_terms`/`bin_posterior_variance` already use)
-    rather than a fresh kernel evaluation -- agrees with the fitted K_c
-    to rounding, not bit for bit, since Lambda is clipped at 0."""
-    V = model.k_eigvec[c]
-    Lam = model.k_eigval[c]
-    return (V * Lam) @ V.T
-
-
-def _design_mean(model: InfluenceModel, c: int, alpha_c: np.ndarray) -> np.ndarray:
-    """h(w)^T beta_c + K_c @ alpha_c at coordinate c's own design
-    prototypes (M_c,), in `model.centers[c]`'s row order: the survey's
-    affine/quadratic mean plus the kernel term at whichever alpha is
-    passed in, shared by `condition_alpha`'s residual and by
-    `prototype_mean`."""
-    Hb_c = _basis(model.centers[c], int(model.m[c]))
-    K_c = _reconstruct_K(model, c)
-    return Hb_c @ model.beta[c] + K_c @ alpha_c
-
-
-def design_index(model: InfluenceModel, c: int) -> np.ndarray:
-    """
-    (M_used,) int (spec section 7.1): for every live prototype j, the
-    row of `model.centers[c]` -- coordinate c's own design -- that j
-    occupies, or -1 if j is not in c's design. All -1 on the constant
-    path, which has no GP design. The inverse of `model.design_idx[c]`.
-    """
-    M_used = model.h.shape[0]
-    out = np.full(M_used, -1, dtype=np.intp)
-    idx_g = model.design_idx[c]
-    if idx_g.size:
-        out[idx_g] = np.arange(idx_g.size, dtype=np.intp)
-    return out
-
-
-def condition_alpha(
-    model: InfluenceModel, c: int, W_c: np.ndarray, y_c: np.ndarray, noise_var_c: np.ndarray,
-) -> np.ndarray:
-    """
-    alpha'_c (M_c,), coordinate c's GP weights conditioned on L bin
-    observations (spec section 7.2): with A = K + (lam+jitter)I the
-    STORED `chol_A` and K the jitter-free kernel,
-
-        Sigma_f = s^2 (K - K A^-1 K)
-        r = y - W (H beta + K alpha)
-        S = W Sigma_f W^T + diag(noise_var)      (L x L, Cholesky)
-        alpha' = alpha + s^2 (I - A^-1 K) W^T S^-1 r
-
-    `W_c` is (L, M_c) dense in coordinate c's design column order
-    (`design_index`); `y_c`, `noise_var_c` are (L,), `noise_var_c` > 0.
-    Does not mutate `model`. Raises ValueError on a constant-path
-    coordinate (no GP design to condition).
-    """
-    if model.constant_path[c]:
-        raise ValueError(
-            f"influence_model.condition_alpha: coordinate {c} is on the constant path"
-        )
-    alpha_c = model.alpha[c]
-    W = np.asarray(W_c, dtype=float)
-    y = np.asarray(y_c, dtype=float)
-    D = np.asarray(noise_var_c, dtype=float)
-
-    K_c = _reconstruct_K(model, c)
-    chol_A = model.chol_A[c]
-
-    AinvK = cho_solve(chol_A, K_c)                      # A^-1 K, (M_c, M_c)
-    Sigma_f = float(model.s2[c]) * (K_c - K_c @ AinvK)  # (M_c, M_c)
-
-    r = y - W @ _design_mean(model, c, alpha_c)          # (L,)
-
-    S = W @ Sigma_f @ W.T
-    S[np.diag_indices_from(S)] += D
-    chol_S = cho_factor(S, lower=True)
-
-    u = W.T @ cho_solve(chol_S, r)                       # (M_c,)
-    AinvKu = cho_solve(chol_A, K_c @ u)                   # A^-1 K u
-    return alpha_c + float(model.s2[c]) * (u - AinvKu)
-
-
-def prototype_mean(model: InfluenceModel, c: int, alpha_c: np.ndarray) -> np.ndarray:
-    """
-    (M_used,) (spec section 7.2): H beta_c + K alpha_c at coordinate c's
-    own design prototypes, NaN at every live prototype outside that
-    design -- the same missing pattern as `I_proto[:, c]`. A
-    constant-path coordinate has no position-dependent design, so it
-    returns `const_value[c]` at every live prototype, matching how
-    `psi0` treats the constant path.
-    """
-    M_used = model.h.shape[0]
-    if model.constant_path[c]:
-        return np.full(M_used, float(model.const_value[c]), dtype=float)
-    out = np.full(M_used, np.nan, dtype=float)
-    out[model.design_idx[c]] = _design_mean(model, c, alpha_c)
-    return out
-
-
-def psi_at(model: InfluenceModel, Z: np.ndarray, alphas: Sequence[Optional[np.ndarray]]) -> np.ndarray:
-    """
-    (N, q) (spec section 7.3): h(x)^T beta_c + k(x)^T alphas[c] at every
-    coordinate, the same point-prediction pass `psi0` uses
-    (`_basis_kernel_chunks`, chunked in rows of at most
-    `_UNCERTAINTY_BATCH_CAP`, E4). `alphas[c] is None` reuses the
-    model's own `alpha[c]`, so `psi_at(model, Z, [None]*q)` reproduces
-    `psi0(model, Z)` exactly: same Zw, same chunks, same alpha, same
-    arithmetic order. Constant-path coordinates return `const_value[c]`
-    at every row, as `psi0` does.
-    """
-    Za = np.asarray(Z, dtype=float)
-    if Za.ndim == 1:
-        Za = Za.reshape(-1, 1)
-    mean, transform = model.whitening
-    Zw = (Za - mean) @ transform.T
-    N = Zw.shape[0]
-    q = len(model.centers)
-
-    out = np.empty((N, q), dtype=float)
-    for c in range(q):
-        if model.constant_path[c]:
-            out[:, c] = model.const_value[c]
-
-    for cols in _coordinate_groups(model):
-        c0 = cols[0]
-        for sl, Hc, Kc in _basis_kernel_chunks(model, c0, Zw, _UNCERTAINTY_BATCH_CAP):
-            for c in cols:
-                alpha_c = model.alpha[c] if alphas[c] is None else alphas[c]
-                out[sl, c] = Hc @ model.beta[c] + Kc @ alpha_c
 
     return out

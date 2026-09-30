@@ -295,6 +295,31 @@ two draw ids, commit, and wall time per stage.
 
 ## 7. Change B: conditioning the pilot on the measured bin means (separate flag, default off; built and tested after A)
 
+**NOT ADOPTED (author's ruling, 30 September 2026; reverted, section
+kept as the record).** Built as specified (bb53831 maths, 23c29dc
+wiring, main b786555 before the revert; identity with gp_update off:
+0 of 245 non-timing columns differ from A). Validated on the author's
+machine, A → A+B, draws 1 and 7: check fits 204 → 219 and 120 → 116 at
+ε 0.01, 83 → 79 and 99 → 105 at ε 0.141; the unpaid-split share
+unchanged (43 → 39%, 68 → 68%, 65 → 63%, 64 → 63%); update cost 484
+and 329 fit-equivalents at ε 0.01 (the push of the conditioned mean to
+all N points per update), 16 and 21 at ε 0.141; net cost 204 → 703,
+120 → 445, 83 → 95, 99 → 126. The shortfall test held everywhere; the
+failure is cost, and cut placement did not improve: the unpaid splits
+are within-bin structure that conditioning on bin means cannot see
+(the prototype-composition observation is a bin mean, orthogonal to
+the within-bin component — section 1's argument, now measured). Also
+ruled from the same validation: the QIJ variance is V_btw alone (the
+1/(1−ε) inflation overshoots V_ij by ~10% at ε 0.141; V_btw's median
+relative error is 0.5–0.9% at ε 0.01 and 5.5% at 0.141); V_btw +
+V_win_hat with no posterior term (2.5) is the candidate for adding the
+within part — best in every row of the validation, never overshooting,
+recovering part of the shortfall (3.7–5.6% at ε 0.141) — to be judged
+on the next TACC sweep under `check_rule='measured'`, carried beside
+V_btw as a second reported variance. Nothing on the same pilot
+recovers the rest: the remaining shortfall is the pilot's
+under-prediction in the spike bins.
+
 Requires `pilot='gp'` and `check_rule='measured'` (raise a clear error
 otherwise). `QIJ(..., gp_update=False)`; `--gp-update`; recorded in
 config.json and the products. Its only use is where to cut and how to
@@ -349,16 +374,40 @@ re-centred by the same offset.
 ### 7.3 Where the conditioned mean is used
 
 For the NEXT round's proposals (2.2) and nothing else:
-Ψ̃, psi_centered, each open bin's `ubar`/`m`/`var` are recomputed from
-psi0_all^(cond); `two_means_split` cuts on the conditioned Ψ̃; the
-adjacency geometry orders prototypes by the conditioned prototype-level
-mean in place of I_proto; `level_gain_value` prices from the
-conditioned means; the predicted gain g recorded for gain_ratio is the
-conditioned one. The seeds (2.1) are computed BEFORE the first update.
+Ψ̃_cond = psi0_all^(cond)/std (growth's per-output std, unchanged),
+psi_centered from the same offset, and each open bin's `ubar` and
+`var` are recomputed from psi0_all^(cond); `two_means_split` cuts on
+Ψ̃_cond; the adjacency geometry orders prototypes by the conditioned
+prototype-level mean in place of I_proto; `level_gain_value` prices
+from the conditioned means; the predicted gain g recorded for
+gain_ratio is the conditioned one. The bin's `m` (the predicted bin
+mean `_flag_mask` reads) and u are NOT recomputed: the flags — the
+seeds and 2.4 (a) for children — read the ORIGINAL pilot's means and
+posterior, always. (Resolved with the coder, 30 September: the earlier
+text listed `m` among the recomputed fields, which would have let the
+conditioning into the flag against the opening rule of this section.) The seeds (2.1) are computed BEFORE the first update.
 V_win_hat (2.5) under `gp_update=True` is the conditioned mean's
 within-bin spread, labelled as such.
 
 ### 7.4 Acceptance (after A has passed; the same two draws at the same two ε; the same machine as A's validation)
+
+V0 (the conditioning routine alone, offline, no estimator run; before
+V1): the interpolation identity. With W = I over coordinate c's own
+design, D = 0 (the stored jitter only) and y = the survey's own
+I_proto,c, the conditioned prototype-level mean Hβ + Kα' reproduces y
+at every prototype to rel 1e-8; and with D = 1e12·s²_c·I the update
+leaves α unchanged to rel 1e-10. (Not "re-condition on the survey
+values with their own noise": that tightens the posterior and is not
+a fixed point.) Settled with the coder (30 September): the observed
+latent is the noise-free h(z_j)ᵀβ_c + f_c(z_j) with β_c fixed;
+Σ_f = s²(K − K A⁻¹ K) with A as stored (jitter included), K without;
+α' = α + s²(I − A⁻¹K) Wᵀ S⁻¹ (y − W(Hβ + Kα)), S = W Σ_f Wᵀ + D; the
+initial bins' δU_kc = η_full·|θ̂_c|/t_k with t_k the central stencil's
+own step; W_c lives on coordinate c's own design, a bin's weights
+renormalised over its points whose prototype is in that design, bins
+with none skipped and counted; the conditioned prototype-level vector
+keeps NaN where I_proto is NaN; the first update runs after the seeds
+are flagged and before the first round's proposals.
 
 Per ε, per draw: check fits under A+B plus the update cost in
 fit-equivalents (Σ gp_update_wall divided by the draw's own measured

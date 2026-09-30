@@ -29,14 +29,7 @@ picks the joint check's continuation rule: `'predicted'` (the default,
 today's re-flagging rule, byte-identical) or `'measured'` (`pilot='gp'`
 only -- a ValueError from `run_joint` otherwise -- the pilot proposes,
 measurement only closes: a child opens only if the pilot's own flag
-holds for it and its parent's split paid, spec section 2.4). `gp_update`
-(spec section 7), off by default and requiring `check_rule='measured'`
-and `pilot='gp'` (a ValueError from `run_joint` otherwise), conditions
-the pilot's posterior on every current bin's own measured mean after the
-initial measurement and after every check round that measured a split,
-using the conditioned mean ONLY to cut and rank the next round's
-proposals; it never enters the seeds, the gain test, V_btw, or any
-reported variance, and `gp_update=False` is byte-identical to today.
+holds for it and its parent's split paid, spec section 2.4).
 `quantized_start`
 (spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
 `'multistart'` (ported) fits theta_Q from scratch on the survey rows;
@@ -135,7 +128,6 @@ def _joint_defaults(N: int, q: int) -> dict:
         joint_n_level_splits=0, joint_n_adjacency_splits=0, joint_check_capped=False,
         joint_n_closed_unpaid=0, joint_n_closed_unflagged=0, joint_n_noise_floored=0,
         joint_sum_b_delta=np.full(q, np.nan),
-        joint_gp_update_wall=0.0, joint_n_gp_updates=0, joint_n_gp_update_skipped=0,
         joint_failed=False, joint_bin_mass=np.zeros(0), joint_bin_U=np.zeros((0, q)),
         joint_bin_m=np.zeros((0, q)), joint_bin_flagged=np.zeros(0, dtype=bool),
         joint_bin_label=np.full(N, -1, dtype=int), joint_busy_delta=0.0,
@@ -211,7 +203,7 @@ def _empty_pilot_products(q: int) -> dict:
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
                   sv, quantized_start, refine_schedule, pilot, sigma_points,
-                  check_rule, gp_update) -> QIJResult:
+                  check_rule) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -254,7 +246,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        pilot=pilot, check_rule=check_rule, gp_update=gp_update, sigma_points=sigma_points,
+        pilot=pilot, check_rule=check_rule, sigma_points=sigma_points,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_empty_pilot_products(q),
         **_sigma_defaults(q),
     )
@@ -268,8 +260,7 @@ class QIJ:
                  ivqbins: str = 'marginal', survey: str = 'points',
                  quantized_start: str = 'multistart',
                  refine_schedule: str = 'queue', pilot: str = 'affine',
-                 sigma_points: bool = False, check_rule: str = 'predicted',
-                 gp_update: bool = False) -> None:
+                 sigma_points: bool = False, check_rule: str = 'predicted') -> None:
         if pilot not in ('affine', 'gp'):
             raise ValueError(f"unknown pilot {pilot!r}")
         self.eps = eps
@@ -285,7 +276,6 @@ class QIJ:
         self.pilot = pilot
         self.sigma_points = sigma_points
         self.check_rule = check_rule
-        self.gp_update = gp_update
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -399,7 +389,7 @@ class QIJ:
                 return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                      self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                      self.survey, sv, self.quantized_start, self.refine_schedule,
-                                     self.pilot, self.sigma_points, self.check_rule, self.gp_update)
+                                     self.pilot, self.sigma_points, self.check_rule)
             psi0_all = _psi0(model, Z)
             sigma_all = _uncertainty(model, Z)
             offset = np.asarray(model.offset, dtype=float)
@@ -510,8 +500,7 @@ class QIJ:
                            self.eps, offset, pool=pool, I_proto=I_proto[:, measured],
                            start=start_second_stage, measured=measured, pilot=self.pilot,
                            bridge_pair_id=bridge_pair_id, bridge_pair_n=bridge_pair_n,
-                           bridge_value=bridge_value, check_rule=self.check_rule,
-                           gp_update=self.gp_update)
+                           bridge_value=bridge_value, check_rule=self.check_rule)
             # A failed output, or a failed initial bin measurement before
             # any check ran, voids every output's variance quantities, as
             # the marginal path voids them on any one coordinate's failure.
@@ -546,8 +535,6 @@ class QIJ:
                 joint_check_capped=jr.check_capped, joint_n_closed_unpaid=jr.n_closed_unpaid,
                 joint_n_closed_unflagged=jr.n_closed_unflagged,
                 joint_n_noise_floored=jr.n_noise_floored, joint_sum_b_delta=jr.sum_b_delta,
-                joint_gp_update_wall=jr.gp_update_wall, joint_n_gp_updates=jr.n_gp_updates,
-                joint_n_gp_update_skipped=jr.n_gp_update_skipped,
                 joint_failed=jr.failed,
                 joint_bin_mass=jr.bin_mass, joint_bin_U=jr.bin_U, joint_bin_m=jr.bin_m,
                 joint_bin_flagged=jr.bin_flagged, joint_bin_label=jr.bin_label,
@@ -749,6 +736,6 @@ class QIJ:
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
-            pilot=self.pilot, check_rule=self.check_rule, gp_update=self.gp_update,
+            pilot=self.pilot, check_rule=self.check_rule,
             **second_stage_fields, **joint_fields, **pilot_products, **sigma_fields,
         )

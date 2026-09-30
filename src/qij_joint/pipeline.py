@@ -162,10 +162,7 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     check_measured_spec.md) is recorded whether or not it is inert, and
     `n_closed_unpaid`/`n_closed_unflagged`/`n_noise_floored`/
     `sum_b_delta_<o>` are its own products, 0/NaN under
-    `check_rule='predicted'`. `gp_update` (spec section 7) is likewise
-    recorded whether or not it is inert, with `gp_update_wall`/
-    `n_gp_updates`/`n_gp_update_skipped` its own products, 0/0.0 when
-    off. The joint check's own scale factor
+    `check_rule='predicted'`. The joint check's own scale factor
     (B6, also lettered `a` in the spec) is `joint_a_<o>` here, kept
     distinct from A10's `a_<o>` (the ABC acceleration, populated under
     both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
@@ -173,7 +170,6 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     output)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
-           'gp_update': bool(res.gp_update),
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
@@ -200,10 +196,6 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['n_closed_unpaid'] = int(res.joint_n_closed_unpaid)
     row['n_closed_unflagged'] = int(res.joint_n_closed_unflagged)
     row['n_noise_floored'] = int(res.joint_n_noise_floored)
-    # gp_update=True only (spec section 7); 0/0.0 otherwise.
-    row['gp_update_wall'] = float(res.joint_gp_update_wall)
-    row['n_gp_updates'] = int(res.joint_n_gp_updates)
-    row['n_gp_update_skipped'] = int(res.joint_n_gp_update_skipped)
     # The sigma-points stage (spec/QIJ_sigma_points_spec.md 3): its own
     # 'sigma' stage entry (outside the loop above, whose own product
     # names -- 'wall_sigma', not 'wall_time_sigma' -- differ from the
@@ -376,7 +368,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
             sigma_points: bool = False, check_rule: str = 'predicted',
-            gp_update: bool = False, tag: str = '') -> Tuple[int, int]:
+            tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -397,11 +389,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     sigma-points interval stage after refinement; when True, every draw
     also writes the `sigma_points` array product. `check_rule`
     (spec/QIJ_joint_check_measured_spec.md) picks the joint check's
-    continuation rule, inert under `ivqbins='marginal'`. `gp_update`
-    (spec section 7) conditions the pilot on every current bin's own
-    measured mean for the check's next-round proposals only; requires
-    `check_rule='measured'` and `pilot='gp'`, off by default, inert
-    under `ivqbins='marginal'`."""
+    continuation rule, inert under `ivqbins='marginal'`."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -418,8 +406,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
                   survey=survey, quantized_start=quantized_start,
                   refine_schedule=refine_schedule, pilot=pilot,
-                  sigma_points=sigma_points, check_rule=check_rule,
-                  gp_update=gp_update).fit(X, T, pool=pool)
+                  sigma_points=sigma_points, check_rule=check_rule).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}
