@@ -27,8 +27,10 @@ the GP posterior's rule and the bridge score's. `check_rule`
 (spec/QIJ_joint_check_measured_spec.md), inert under `ivqbins='marginal'`,
 picks the joint check's continuation rule: `'predicted'` (the default,
 today's re-flagging rule, byte-identical) or `'measured'` (`pilot='gp'`
-only -- a ValueError from `run_joint` otherwise -- the measured
-two-strike rule). `quantized_start`
+only -- a ValueError from `run_joint` otherwise -- the pilot proposes,
+measurement only closes: a child opens only if the pilot's own flag
+holds for it and its parent's split paid, spec section 2.4).
+`quantized_start`
 (spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
 `'multistart'` (ported) fits theta_Q from scratch on the survey rows;
 `'full-data'` runs theta_hat first (on `pool` when given) and continues
@@ -124,7 +126,8 @@ def _joint_defaults(N: int, q: int) -> dict:
         joint_L0=0, joint_L=0, joint_n_growth_rounds=0, joint_growth_capped=False,
         joint_n_flagged=0, joint_n_check_rounds=0, joint_n_check_evals=0,
         joint_n_level_splits=0, joint_n_adjacency_splits=0, joint_check_capped=False,
-        joint_n_strike_closes=0, joint_n_noise_floored=0,
+        joint_n_closed_unpaid=0, joint_n_closed_unflagged=0, joint_n_noise_floored=0,
+        joint_sum_b_delta=np.full(q, np.nan),
         joint_failed=False, joint_bin_mass=np.zeros(0), joint_bin_U=np.zeros((0, q)),
         joint_bin_m=np.zeros((0, q)), joint_bin_flagged=np.zeros(0, dtype=bool),
         joint_bin_label=np.full(N, -1, dtype=int), joint_busy_delta=0.0,
@@ -529,8 +532,10 @@ class QIJ:
                 joint_growth_capped=jr.growth_capped, joint_n_flagged=jr.n_flagged,
                 joint_n_check_rounds=jr.n_check_rounds, joint_n_check_evals=jr.n_check_evals,
                 joint_n_level_splits=jr.n_level_splits, joint_n_adjacency_splits=jr.n_adjacency_splits,
-                joint_check_capped=jr.check_capped, joint_n_strike_closes=jr.n_strike_closes,
-                joint_n_noise_floored=jr.n_noise_floored, joint_failed=jr.failed,
+                joint_check_capped=jr.check_capped, joint_n_closed_unpaid=jr.n_closed_unpaid,
+                joint_n_closed_unflagged=jr.n_closed_unflagged,
+                joint_n_noise_floored=jr.n_noise_floored, joint_sum_b_delta=jr.sum_b_delta,
+                joint_failed=jr.failed,
                 joint_bin_mass=jr.bin_mass, joint_bin_U=jr.bin_U, joint_bin_m=jr.bin_m,
                 joint_bin_flagged=jr.bin_flagged, joint_bin_label=jr.bin_label,
                 joint_busy_delta=jr.busy_delta,

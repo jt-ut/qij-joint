@@ -27,9 +27,10 @@ instead).
 `check_rule` (spec/QIJ_joint_check_measured_spec.md) picks the check's
 continuation rule once, at the same setup point as `pilot`: `'predicted'`
 (today's re-flagging rule, byte-identical products) or `'measured'`
-(`pilot='gp'` only; a ValueError otherwise) -- the measured two-strike
-rule of spec section 2.4, with no posterior variance read by any split
-decision.
+(`pilot='gp'` only; a ValueError otherwise) -- the pilot proposes,
+measurement only closes (spec section 2.4): a child is open only if the
+pilot's own flag holds for it AND its parent's split paid against a
+noise-aware floor; no second chance once a split fails to pay.
 """
 
 from __future__ import annotations
@@ -82,9 +83,10 @@ class JointResult:
     Shared: L0, L (final), n_growth_rounds, growth_capped,
     S_pred_pre_lloyd (q,), n_flagged (bins flagged in the first check),
     n_check_rounds, n_check_evals, n_level_splits, n_adjacency_splits,
-    check_capped, n_strike_closes, n_noise_floored (check_rule='measured'
-    only, spec/QIJ_joint_check_measured_spec.md 2.5; 0 under 'predicted'),
-    failed (a failed output, or a failed initial
+    check_capped, n_closed_unpaid, n_closed_unflagged, n_noise_floored,
+    sum_b_delta (q,) (check_rule='measured' only, spec/QIJ_joint_check_
+    measured_spec.md 2.4-2.5; 0/NaN under 'predicted'), failed (a failed
+    output, or a failed initial
     measurement before any check ran, voids every output). Bin
     constituents: bin_mass (L,), bin_U (L,q), bin_m (L,q, predicted
     means), bin_flagged (L,); bin_label (N,); busy_delta as the other
@@ -109,8 +111,10 @@ class JointResult:
     n_level_splits: int
     n_adjacency_splits: int
     check_capped: bool
-    n_strike_closes: int
+    n_closed_unpaid: int
+    n_closed_unflagged: int
     n_noise_floored: int
+    sum_b_delta: np.ndarray
     failed: bool
     bin_mass: np.ndarray
     bin_U: np.ndarray
@@ -406,7 +410,8 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
         B_hat=nan_q, a_bca=nan_q,
         L0=L0, L=L0, n_growth_rounds=n_rounds, growth_capped=capped, S_pred_pre_lloyd=S_pre,
         n_flagged=0, n_check_rounds=0, n_check_evals=0, n_level_splits=0, n_adjacency_splits=0,
-        check_capped=False, n_strike_closes=0, n_noise_floored=0, failed=True,
+        check_capped=False, n_closed_unpaid=0, n_closed_unflagged=0, n_noise_floored=0,
+        sum_b_delta=nan_q, failed=True,
         bin_mass=mass, bin_U=np.full((L0, q), np.nan), bin_m=np.full((L0, q), np.nan),
         bin_flagged=np.zeros(L0, dtype=bool), bin_label=labels, busy_delta=busy_delta,
     )
@@ -463,8 +468,10 @@ def run_joint(
     check's continuation rule once, at the same setup point as `pilot`:
     `'predicted'` (today's `_flag_mask` re-flagging rule, every product
     byte-identical) or `'measured'` (`pilot='gp'` only -- a ValueError
-    otherwise -- the two-strike rule of spec section 2.4, reading no
-    posterior variance anywhere in the check).
+    otherwise -- spec section 2.4: a child is open only if the pilot's
+    own flag holds for it AND its parent's split paid against a
+    finite-difference-aware floor; both gates read no posterior
+    variance beyond the flag's own `u`, and there is no second chance).
     """
     if check_rule not in ('predicted', 'measured'):
         raise ValueError(f"unknown check_rule {check_rule!r}")
@@ -518,8 +525,7 @@ def run_joint(
 
     leaves: Dict[int, dict] = {
         k: dict(indices=groups0[k], n=int(bins.n[k]), U=U0[k].copy(), m=m0[k].copy(),
-                var=var0[k].copy(), v=v0[k].copy(), ubar=psi_centered[groups0[k]].mean(axis=0),
-                strike=False)  # the seeds' clear flag (spec/QIJ_joint_check_measured_spec.md 2.4)
+                var=var0[k].copy(), v=v0[k].copy(), ubar=psi_centered[groups0[k]].mean(axis=0))
         for k in range(L0)
     }
     if bridge0 is not None:
@@ -531,7 +537,10 @@ def run_joint(
     current_flagged = set(np.where(flagged_mask)[0].tolist())
 
     n_check_rounds = n_check_evals = n_level_splits = n_adjacency_splits = 0
-    n_strike_closes = n_noise_floored = 0  # check_rule='measured' only (spec 2.4/2.5)
+    # check_rule='measured' only (spec 2.4/2.5); the ints stay 0 and
+    # sum_b_delta stays NaN under 'predicted', which never touches them.
+    n_closed_unpaid = n_closed_unflagged = n_noise_floored = 0
+    sum_b_delta = np.zeros(q) if check_rule == 'measured' else np.full(q, np.nan)
     sum_delta, sum_g = np.zeros(q), np.zeros(q)
     evals_cap = 1 + M_X_used
     check_capped = False
@@ -684,48 +693,57 @@ def run_joint(
 
     def _continue_measured(ids, idxs, Us, means_new, var_new, v_new, u_new, bridge_new,
                             p_new, L_current, split_records):
-        """`check_rule='measured'`'s two-strike continuation rule
-        (spec/QIJ_joint_check_measured_spec.md 2.4): per split, Delta_c
-        (already added to V_btw above) is tested against tau'_c =
-        max(tau_c, n_Delta,c), tau_c = eps*V_btw_c/L taken once at this
-        round's start (`tau_round`, the same for every split of the
-        round); n_Delta,c is the finite-difference floor carried through
-        mass balance. A gain (Delta_c >= tau'_c for some output c)
-        clears both children's strike and reopens them; a first miss
-        (parent's own flag clear) flags them and reopens them; a second
-        consecutive miss (parent already flagged) closes them, final, no
-        further evaluation -- `n_strike_closes` counts the SPLIT, not
-        the two children. `n_noise_floored` counts the split's own
-        deciding output (argmax_c(Delta_c - tau'_c)) when the floor
-        n_Delta, not tau, set that output's tau'."""
-        nonlocal n_strike_closes, n_noise_floored
-        decisions = {}
+        """`check_rule='measured'`'s continuation rule (spec/QIJ_joint_
+        check_measured_spec.md 2.4): a child is OPEN iff (a) the pilot's
+        own flag holds for it (`_flag_mask` at the current bin count,
+        the same call the seeds and the `'predicted'` rule use) AND (b)
+        its parent's split PAID (Delta_c >= tau'_c for some measured
+        output c, Delta the parent's realized gain, already added to
+        V_btw above). Both children of a split share (b); each has its
+        own (a). tau'_c = max(tau_round_c, n_Delta,c + b_Delta,c):
+        tau_round is this round's tau_c = eps*V_btw_c/L at its start,
+        the same for every split of the round; n_Delta,c is the
+        finite-difference scatter term, b_Delta,c the noise-bias floor
+        (both carried through mass balance). `n_closed_unpaid` counts
+        the SPLIT when (b) fails (both children close, no second
+        chance); `n_closed_unflagged` counts a CHILD of a paying split
+        closed by (a) alone. `n_noise_floored` counts a split whose
+        deciding output (argmax_c(Delta_c - tau'_c)) had the floor
+        n_Delta + b_Delta, not tau_round, set its tau'. `sum_b_delta`
+        accumulates b_Delta over every split measured this round (it is
+        never subtracted from V_btw, only reported against it)."""
+        nonlocal n_closed_unpaid, n_closed_unflagged, n_noise_floored, sum_b_delta
+        flagged_new = _flag_mask(p_new, Us, means_new, a, V_hat, u_new, L_current, eps)
+        paid = {}
         for rec in split_records:
             delta_U = eta * theta_floor / rec['t_small']
             n_delta = ((2.0 * rec['p_small'] / N) * (np.abs(rec['U_small']) + np.abs(rec['U_large']))
                        * delta_U)
-            tau_prime = np.maximum(tau_round, n_delta)
+            b_delta = ((rec['p_small'] / N) * (1.0 + rec['p_small'] / rec['p_large']) * delta_U ** 2)
+            sum_b_delta += b_delta
+            tau_prime = np.maximum(tau_round, n_delta + b_delta)
             margin = rec['Delta'] - tau_prime
             c_star = int(np.argmax(margin))
-            gain = bool(margin[c_star] >= 0.0)
-            if n_delta[c_star] >= tau_round[c_star]:
+            split_paid = bool(margin[c_star] >= 0.0)
+            if (n_delta[c_star] + b_delta[c_star]) >= tau_round[c_star]:
                 n_noise_floored += 1
-            if gain:
-                strike, is_open = False, True
-            elif not rec['leaf_strike']:
-                strike, is_open = True, True
-            else:
-                strike, is_open = True, False
-                n_strike_closes += 1
-            decisions[rec['child_small_id']] = (strike, is_open)
-            decisions[rec['child_large_id']] = (strike, is_open)
+            if not split_paid:
+                n_closed_unpaid += 1
+            paid[rec['child_small_id']] = split_paid
+            paid[rec['child_large_id']] = split_paid
         for i, nid in enumerate(ids):
-            strike_i, open_i = decisions[nid]
+            # `bridge_new` is always None here: `check_rule='measured'`
+            # requires `pilot='gp'` (raised above), which never builds a
+            # bridge vector -- unlike `_continue_predicted`, which also
+            # serves `pilot='affine'`.
             leaves[nid] = dict(indices=idxs[i], n=idxs[i].size, U=Us[i], m=means_new[i],
-                                var=var_new[i], v=v_new[i], ubar=psi_centered[idxs[i]].mean(axis=0),
-                                strike=strike_i)
-            if open_i:
+                                var=var_new[i], v=v_new[i], ubar=psi_centered[idxs[i]].mean(axis=0))
+            if not paid[nid]:
+                continue
+            if flagged_new[i]:
                 current_flagged.add(nid)
+            else:
+                n_closed_unflagged += 1
 
     # Chosen once (R2), never re-tested inside the loop below.
     continue_round = _continue_measured if check_rule == 'measured' else _continue_predicted
@@ -810,12 +828,12 @@ def run_joint(
             else:
                 n_adjacency_splits += 1
             if check_rule == 'measured':
-                # Recorded for `_continue_measured`'s strike test below;
+                # Recorded for `_continue_measured`'s pay test below;
                 # never read under `check_rule='predicted'`.
                 split_records.append(dict(
-                    child_small_id=next_id, child_large_id=next_id + 1,
-                    leaf_strike=leaf['strike'], t_small=meta['t_small'],
-                    p_small=meta['p_small'], Delta=Delta, U_small=U_small, U_large=U_large,
+                    child_small_id=next_id, child_large_id=next_id + 1, t_small=meta['t_small'],
+                    p_small=meta['p_small'], p_large=meta['p_large'],
+                    Delta=Delta, U_small=U_small, U_large=U_large,
                 ))
             new_leaves.append((next_id, meta['idx_small'], U_small))
             new_leaves.append((next_id + 1, meta['idx_large'], U_large))
@@ -827,16 +845,12 @@ def run_joint(
         idxs = [nl[1] for nl in new_leaves]
         Us = np.array([nl[2] for nl in new_leaves])
         means_new, var_new = _group_stats(psi0_all, idxs)
-        if pilot == 'gp' and check_rule != 'measured':
+        if pilot == 'gp':
+            # `'measured'` needs u_kc for its own flag test (a) at the
+            # new leaves, exactly like `'predicted'` (spec section 2.4);
+            # v_new comes back from the same call but no split decision
+            # reads it (spec section 1).
             v_new, u_new = _posterior_vu(model, Z, sigma_all, idxs)
-            bridge_new = None
-        elif pilot == 'gp':
-            # `check_rule='measured'` reads no posterior variance
-            # anywhere (spec section 1): the round's own new leaves skip
-            # `bin_posterior_variance` entirely rather than compute a
-            # value nothing downstream reads.
-            v_new = np.zeros((len(idxs), q))
-            u_new = np.zeros((len(idxs), q))
             bridge_new = None
         else:
             v_new = np.zeros((len(idxs), q))
@@ -882,8 +896,9 @@ def run_joint(
         growth_capped=growth.growth_capped, S_pred_pre_lloyd=growth.S_pred_pre_lloyd,
         n_flagged=n_flagged, n_check_rounds=n_check_rounds, n_check_evals=n_check_evals,
         n_level_splits=n_level_splits, n_adjacency_splits=n_adjacency_splits,
-        check_capped=check_capped, n_strike_closes=n_strike_closes,
-        n_noise_floored=n_noise_floored, failed=False,
+        check_capped=check_capped, n_closed_unpaid=n_closed_unpaid,
+        n_closed_unflagged=n_closed_unflagged, n_noise_floored=n_noise_floored,
+        sum_b_delta=sum_b_delta, failed=False,
         bin_mass=bin_mass, bin_U=bin_U, bin_m=bin_m, bin_flagged=bin_flagged,
         bin_label=bin_label, busy_delta=busy_delta,
     )

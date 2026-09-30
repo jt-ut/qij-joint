@@ -160,7 +160,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     second stage (spec/method_notes.md section 6) -- the joint scalars
     inert under `ivqbins='marginal'`. `check_rule` (spec/QIJ_joint_
     check_measured_spec.md) is recorded whether or not it is inert, and
-    `n_strike_closes`/`n_noise_floored` are its own products, 0 under
+    `n_closed_unpaid`/`n_closed_unflagged`/`n_noise_floored`/
+    `sum_b_delta_<o>` are its own products, 0/NaN under
     `check_rule='predicted'`. The joint check's own scale factor
     (B6, also lettered `a` in the spec) is `joint_a_<o>` here, kept
     distinct from A10's `a_<o>` (the ABC acceleration, populated under
@@ -191,8 +192,9 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['n_check_evals'] = int(res.joint_n_check_evals)
     row['check_capped'] = bool(res.joint_check_capped)
     # check_rule='measured' only (spec/QIJ_joint_check_measured_spec.md
-    # 2.5); 0 under 'predicted'.
-    row['n_strike_closes'] = int(res.joint_n_strike_closes)
+    # 2.4-2.5); 0 under 'predicted'.
+    row['n_closed_unpaid'] = int(res.joint_n_closed_unpaid)
+    row['n_closed_unflagged'] = int(res.joint_n_closed_unflagged)
     row['n_noise_floored'] = int(res.joint_n_noise_floored)
     # The sigma-points stage (spec/QIJ_sigma_points_spec.md 3): its own
     # 'sigma' stage entry (outside the loop above, whose own product
@@ -218,6 +220,7 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'n_adjacency_splits_{o}'] = int(res.n_adjacency_splits[j])
         row[f'rho_{o}'] = float(res.rho[j])
         row[f'gain_ratio_{o}'] = float(res.gain_ratio[j])
+        row[f'sum_b_delta_{o}'] = float(res.joint_sum_b_delta[j])
         row[f'n_refine_evals_{o}'] = int(res.n_refine_evals[j])
         row[f'ell_{o}'] = float(res.ell[j])
         row[f'lam_{o}'] = float(res.lam[j])

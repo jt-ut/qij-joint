@@ -49,8 +49,9 @@ whose every other field stays exactly as before this option existed.
 recorded) under `ivqbins='marginal'`, picks the joint check's
 continuation rule: `'predicted'` (the default, today's rule, every
 product byte-identical) or `'measured'` (`pilot='gp'` only), which also
-populates `joint_n_strike_closes`/`joint_n_noise_floored` and changes
-`V_win_hat`/`V_tot_hat`'s own definition (no posterior variance).
+populates `joint_n_closed_unpaid`/`joint_n_closed_unflagged`/
+`joint_n_noise_floored`/`joint_sum_b_delta` and changes `V_win_hat`/
+`V_tot_hat`'s own definition (no posterior variance).
 
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
@@ -141,11 +142,18 @@ class QIJResult:
     joint_n_level_splits: int
     joint_n_adjacency_splits: int
     joint_check_capped: bool
-    joint_n_strike_closes: int     # check_rule='measured' only, 0 under 'predicted' (spec/
-                                    # QIJ_joint_check_measured_spec.md 2.4): splits whose
-                                    # children the second strike closed
+    joint_n_closed_unpaid: int     # check_rule='measured' only, 0 under 'predicted' (spec/
+                                    # QIJ_joint_check_measured_spec.md 2.4): splits whose two
+                                    # children were closed because the split did not pay
+    joint_n_closed_unflagged: int  # check_rule='measured' only, 0 under 'predicted' (spec
+                                    # 2.4): children of a paying split closed by the pilot's
+                                    # own flag alone
     joint_n_noise_floored: int     # check_rule='measured' only, 0 under 'predicted' (spec
                                     # 2.4): splits whose deciding tau' was the noise floor
+    joint_sum_b_delta: np.ndarray  # (q,) check_rule='measured' only, NaN under 'predicted'
+                                    # (spec 2.4-2.5): summed finite-difference noise-bias
+                                    # floor over every split measured, the residual bias left
+                                    # in V_btw (never subtracted from it)
     joint_failed: bool             # a failed output, or a failed initial bin measurement before any check ran
     joint_bin_mass: np.ndarray     # (L,); empty under 'marginal'
     joint_bin_U: np.ndarray        # (L, q); empty under 'marginal'
