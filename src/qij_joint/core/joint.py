@@ -31,12 +31,28 @@ continuation rule once, at the same setup point as `pilot`: `'predicted'`
 measurement only closes (spec section 2.4): a child is open only if the
 pilot's own flag holds for it AND its parent's split paid against a
 noise-aware floor; no second chance once a split fails to pay.
+
+`tree_rule` picks the joint tree's own growth/share rule, chosen once
+at the same setup point as `pilot`/`check_rule`: `'perbin'` (today's
+rule, byte-identical throughout, every existing code path untouched)
+or `'total'` (`pilot='gp'` only; a ValueError otherwise). Under
+`'total'` growth (`grow_total`, beside `grow`) and the continuation
+that replaces the check both work against each measured output's own
+TOTAL within share S_c = V_win_hat_c/(V_btw_c+V_win_hat_c): the bin or
+leaf that does the most to bring the currently worst output's S_c
+back under `eps` is split, one at a time, rather than every bin
+independently against its own per-bin slice of the tolerance. There
+is no flag, no pay test, no adjacency split under `'total'` -- every
+split is a plain `two_means_split` on Ψ̃, and `check_rule` is accepted
+but unused. Both rules fill `JointResult.share_final` (the final
+V_win_hat/(V_btw+V_win_hat) per measured output, a cheap diagnostic
+that changes no other product under `'perbin'`).
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -50,7 +66,8 @@ from .refine import (
     compute_rho2, level_gain_value,
 )
 
-__all__ = ["Growth", "JointResult", "grow", "joint_psi_hat", "run_joint", "two_means_split"]
+__all__ = ["Growth", "JointResult", "grow", "grow_total", "joint_psi_hat", "run_joint",
+           "two_means_split"]
 
 _CHUNK = 2048  # row chunk for the full-partition Lloyd reassignment: bounds memory
 
@@ -90,7 +107,10 @@ class JointResult:
     measurement before any check ran, voids every output). Bin
     constituents: bin_mass (L,), bin_U (L,q), bin_m (L,q, predicted
     means), bin_flagged (L,); bin_label (N,); busy_delta as the other
-    pool stages report it."""
+    pool stages report it. share_final (q,) the final V_win_hat/
+    (V_btw+V_win_hat) per measured output -- a cheap diagnostic filled
+    under every tree_rule (NaN on a failed draw); it changes no other
+    field under tree_rule='perbin'."""
 
     V_btw: np.ndarray
     V_win_hat: np.ndarray
@@ -122,6 +142,7 @@ class JointResult:
     bin_flagged: np.ndarray
     bin_label: np.ndarray
     busy_delta: float
+    share_final: np.ndarray = field(default_factory=lambda: np.full(0, np.nan))
 
 
 def two_means_split(rows: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
@@ -339,6 +360,72 @@ def grow(psi0_all: np.ndarray, eps: float, M_X_used: int) -> Growth:
                   S_pred=S, S_pred_pre_lloyd=S_pre, std=std)
 
 
+def grow_total(psi0_all: np.ndarray, eps: float, M_X_used: int) -> Growth:
+    """
+    `grow`'s counterpart for `tree_rule='total'`: one bin is split per
+    round, the one that does the most for whichever output's predicted
+    TOTAL within share S_c = sum_k w_kc is currently worst against
+    `eps`, rather than every over-threshold bin at once against its own
+    per-bin slice of the tolerance (`grow`'s rule). A round: if every
+    S_c <= eps, stop; if L has reached `M_X_used`, stop (growth_capped);
+    otherwise c* = argmax_c S_c/eps (eps is one scalar across outputs,
+    so this is argmax_c S_c; written as the ratio to match the
+    tolerance it is tested against), and the bin with the largest
+    w_kc* is split by `two_means_split` on its own Ψ̃ rows (ties -> the
+    lowest bin id). A bin whose split comes back infeasible is skipped
+    rather than split, and never tried again (nothing about the data
+    changes by skipping it, so it would otherwise be picked again every
+    round); if every remaining bin is infeasible, growth stops there
+    (nothing splittable remains, not `growth_capped`). Each split adds
+    exactly one bin, counted into `n_growth_rounds`. Then, as in
+    `grow`, one `_lloyd_all` pass of all L centroids over every row;
+    S_pred is taken after that pass, S_pred_pre_lloyd before.
+    """
+    N, q = psi0_all.shape
+    std = np.std(psi0_all, axis=0)
+    V_hat = std ** 2
+    psi_tilde = psi0_all / std
+    labels = np.zeros(N, dtype=int)
+    L = 1
+    n_rounds = 0
+    growth_capped = False
+    infeasible: set = set()
+
+    while True:
+        w, S = _predicted_share(psi0_all, V_hat, labels, L)
+        if np.all(S <= eps):
+            break
+        if L >= M_X_used:
+            growth_capped = True
+            break
+        c_star = int(np.argmax(S / eps))
+        order = sorted((k for k in range(L) if k not in infeasible),
+                        key=lambda k: (-w[k, c_star], k))
+        chosen = None
+        for k in order:
+            idx = np.where(labels == k)[0]
+            split = two_means_split(psi_tilde[idx])
+            if split is None:
+                infeasible.add(k)
+                continue
+            chosen = (idx, split)
+            break
+        if chosen is None:
+            break  # every remaining bin is infeasible: nothing splittable remains
+        idx, (idx_a, idx_b) = chosen
+        labels = labels.copy()
+        labels[idx[idx_b]] = L
+        L += 1
+        n_rounds += 1
+
+    S_pre = S
+    labels, L = _lloyd_all(psi_tilde, labels, L)
+    _, S = _predicted_share(psi0_all, V_hat, labels, L)
+
+    return Growth(labels=labels, L0=L, n_growth_rounds=n_rounds, growth_capped=growth_capped,
+                  S_pred=S, S_pred_pre_lloyd=S_pre, std=std)
+
+
 def _posterior_vu(model, Z: np.ndarray, sigma_all: np.ndarray, groups: Sequence[np.ndarray]):
     """v_kc, u_kc for every (bin, output), one `bin_posterior_variance`
     call per coordinate over all of `groups` at once (spec section 3)."""
@@ -414,6 +501,191 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
         sum_b_delta=nan_q, failed=True,
         bin_mass=mass, bin_U=np.full((L0, q), np.nan), bin_m=np.full((L0, q), np.nan),
         bin_flagged=np.zeros(L0, dtype=bool), bin_label=labels, busy_delta=busy_delta,
+        share_final=nan_q,
+    )
+
+
+def _run_total(
+    N: int, q: int, X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
+    measured: Sequence[int], pool, start: Optional[np.ndarray], eta: float, eps: float,
+    M_X_used: int, growth: Growth, bins: BinSet, V_btw: np.ndarray,
+    groups0: Sequence[np.ndarray], U0: np.ndarray, m0: np.ndarray, var0: np.ndarray,
+    B_hat: np.ndarray, a_bca: np.ndarray, a: np.ndarray, busy_delta: float,
+) -> JointResult:
+    """
+    `run_joint`'s continuation under `tree_rule='total'`: there is no
+    flag, no pay test, no adjacency split and no posterior v -- every
+    round splits whichever open leaf (or group of leaves) does the
+    most to bring the currently worst measured output's own TOTAL
+    within share S_c = V_win_hat_c/(V_btw_c+V_win_hat_c) back under
+    `eps`, measured exactly as a `check_rule='predicted'` level split
+    is (one forward evaluation of the small child at its own step,
+    `U_large` by conservation, `Delta` on `V_btw`'s own scale), all of
+    a round's evaluations in one pool batch through `_split_task`.
+
+    A round: V_win_hat is the plain within-bin spread over the CURRENT
+    leaves, (1/N) sum_{k: n_k>1} p_k Var_k(psi0) (no v, the same form
+    `check_rule='measured'` reports); if every S_c <= eps, stop. If the
+    evaluation cap (`1 + M_X_used`) is spent, stop (`check_capped`).
+    Otherwise c* = argmax_c S_c/eps (eps is one scalar across outputs,
+    kept as the ratio to match what it is tested against) is the
+    binding output, and E = V_win_hat_c* - eps/(1-eps)*V_btw_c* is the
+    within that must come off it for S_c* to clear `eps`. Open leaves
+    (n_k > 1, Var_k(psi0)[c*] > 0; a leaf with neither is never
+    ranked, since it cannot change S_c* and cannot be split either)
+    are ranked by their own contribution (1/N)*p_k*Var_k(psi0)[c*],
+    descending, ties to the lowest id; the smallest prefix whose
+    summed contribution reaches E (at least one leaf, the whole ranked
+    list if E is never reached) is proposed for a plain
+    `two_means_split` on its own Ψ̃ rows. A leaf whose split comes back
+    infeasible is closed (kept, excluded from every later round's
+    ranking -- the data under it does not change, so it would
+    otherwise be picked again); a leaf whose evaluation fails is
+    closed the same way, with no second chance. If nothing is proposed
+    (every open leaf already closed, or ranking finds nothing with
+    positive contribution), the continuation stops there, same as
+    growth's own "nothing splittable remains".
+
+    `V_btw` is carried in from `run_joint`'s own full-data measurement
+    of the growth bins and updated by `+= Delta` each successful split,
+    exactly as the check does. `a` (`_fit_scale`), `B_hat`/`a_bca`
+    (`bias_and_acceleration`) are passed through unchanged, fitted once
+    against the growth bins before any continuation round, as today.
+    `gain_ratio` is NaN throughout: there is no predicted-gain geometry
+    to size a split under this rule (no flag, no v, no adjacency), so
+    there is nothing to compare a realized `Delta` against.
+    """
+    L0 = growth.L0
+    psi_tilde = psi0_all / growth.std
+    centering_residual = bins.centering_residual[measured]
+    delta_f = forward_step(eta)
+    evals_cap = 1 + M_X_used
+    n_check_rounds = n_check_evals = n_level_splits = 0
+    check_capped = False
+    next_id = L0
+    closed: set = set()
+
+    leaves: Dict[int, dict] = {
+        k: dict(indices=groups0[k], n=int(bins.n[k]), U=U0[k].copy(), m=m0[k].copy(),
+                var=var0[k].copy())
+        for k in range(L0)
+    }
+
+    def win_hat() -> np.ndarray:
+        out = np.zeros(q)
+        for leaf in leaves.values():
+            if leaf['n'] > 1:
+                out += (leaf['n'] / N) * leaf['var']
+        return out / N  # (1/N) sum_k p_k Var_k(psi0), no v (method_notes section 6)
+
+    while True:
+        V_win_hat = win_hat()
+        S = V_win_hat / (V_btw + V_win_hat)
+        if np.all(S <= eps):
+            break
+        if n_check_evals >= evals_cap:
+            check_capped = True
+            break
+        c_star = int(np.argmax(S / eps))
+        E = V_win_hat[c_star] - (eps / (1.0 - eps)) * V_btw[c_star]
+        candidates = [
+            (k, (leaf['n'] / N) * leaf['var'][c_star] / N)
+            for k, leaf in sorted(leaves.items())
+            if k not in closed and leaf['n'] > 1 and leaf['var'][c_star] > 0.0
+        ]
+        candidates.sort(key=lambda t: (-t[1], t[0]))
+        chosen = []
+        cum = 0.0
+        for k, contrib in candidates:
+            chosen.append(k)
+            cum += contrib
+            if cum >= E:
+                break
+        if not chosen:
+            break  # nothing left can move S_c*: nothing splittable remains
+
+        n_check_rounds += 1
+        proposals = {}
+        for k in chosen:
+            idx = leaves[k]['indices']
+            split = two_means_split(psi_tilde[idx])
+            if split is None:
+                closed.add(k)
+                continue
+            idx_a, idx_b = idx[split[0]], idx[split[1]]
+            idx_small, idx_large = (idx_a, idx_b) if idx_a.size <= idx_b.size else (idx_b, idx_a)
+            p_small = idx_small.size / N
+            p_large = idx_large.size / N
+            t_small = step_parameter(delta_f, p_small)
+            mask = np.zeros(N, dtype=bool)
+            mask[idx_small] = True
+            proposals[k] = dict(idx_small=idx_small, idx_large=idx_large,
+                                 p_small=p_small, p_large=p_large, t_small=t_small, mask=mask)
+        if not proposals:
+            continue
+
+        tasks = [(k, meta['t_small'], meta['mask'], start) for k, meta in proposals.items()]
+        if pool is None:
+            evaluated = []
+            for k, t, mask, _start in tasks:
+                val = np.asarray(counter(X, perturbed_weights(np.ones(N), mask, t), start=_start),
+                                  dtype=float)
+                evaluated.append((k, val, bool(np.any(np.isnan(val)))))
+        else:
+            t_map0 = time.perf_counter()
+            raw = pool.map(_split_task, tasks)
+            busy_delta += sum(r[3] for r in raw) - (time.perf_counter() - t_map0)
+            evaluated = [(k, val, failed) for k, val, failed, _ in raw]
+            for _, _, failed in evaluated:
+                counter.add(1, N, int(failed))
+        n_check_evals += len(tasks)
+
+        for k, val, failed in evaluated:
+            if failed:
+                closed.add(k)  # cancelled: the parent stays as a final bin, closed
+                continue
+            meta = proposals[k]
+            leaf = leaves.pop(k)
+            p_parent = leaf['n'] / N
+            U_small = (val[measured] - theta_hat[measured]) / meta['t_small'] - centering_residual
+            U_large = (p_parent * leaf['U'] - meta['p_small'] * U_small) / meta['p_large']
+            Delta = (meta['p_small'] * U_small ** 2 + meta['p_large'] * U_large ** 2
+                     - p_parent * leaf['U'] ** 2) / N
+            V_btw += Delta
+            n_level_splits += 1
+            means_c, var_c = _group_stats(psi0_all, [meta['idx_small'], meta['idx_large']])
+            leaves[next_id] = dict(indices=meta['idx_small'], n=meta['idx_small'].size,
+                                    U=U_small, m=means_c[0], var=var_c[0])
+            leaves[next_id + 1] = dict(indices=meta['idx_large'], n=meta['idx_large'].size,
+                                        U=U_large, m=means_c[1], var=var_c[1])
+            next_id += 2
+
+    ordered_ids = sorted(leaves.keys())
+    L_final = len(ordered_ids)
+    bin_mass = np.array([leaves[i]['n'] for i in ordered_ids], dtype=float) / N
+    bin_U = np.array([leaves[i]['U'] for i in ordered_ids])
+    bin_m = np.array([leaves[i]['m'] for i in ordered_ids])
+    bin_flagged = np.zeros(L_final, dtype=bool)  # no flag concept under tree_rule='total'
+    bin_label = np.empty(N, dtype=int)
+    for new_id, old_id in enumerate(ordered_ids):
+        bin_label[leaves[old_id]['indices']] = new_id
+
+    V_win_hat = win_hat()
+    V_tot_hat = V_btw + V_win_hat
+    share_final = V_win_hat / V_tot_hat
+
+    return JointResult(
+        V_btw=V_btw, V_win_hat=V_win_hat, V_tot_hat=V_tot_hat,
+        S_pred=growth.S_pred, a=a, gain_ratio=np.full(q, np.nan),
+        B_hat=B_hat, a_bca=a_bca,
+        L0=L0, L=L_final, n_growth_rounds=growth.n_growth_rounds,
+        growth_capped=growth.growth_capped, S_pred_pre_lloyd=growth.S_pred_pre_lloyd,
+        n_flagged=0, n_check_rounds=n_check_rounds, n_check_evals=n_check_evals,
+        n_level_splits=n_level_splits, n_adjacency_splits=0,
+        check_capped=check_capped, n_closed_unpaid=0, n_closed_unflagged=0, n_noise_floored=0,
+        sum_b_delta=np.full(q, np.nan), failed=False,
+        bin_mass=bin_mass, bin_U=bin_U, bin_m=bin_m, bin_flagged=bin_flagged,
+        bin_label=bin_label, busy_delta=busy_delta, share_final=share_final,
     )
 
 
@@ -424,7 +696,7 @@ def run_joint(
     start: np.ndarray = None, measured: Optional[Sequence[int]] = None,
     pilot: str = 'gp', bridge_pair_id: Optional[np.ndarray] = None,
     bridge_pair_n: Optional[np.ndarray] = None, bridge_value: Optional[np.ndarray] = None,
-    check_rule: str = 'predicted',
+    check_rule: str = 'predicted', tree_rule: str = 'perbin',
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -472,11 +744,31 @@ def run_joint(
     own flag holds for it AND its parent's split paid against a
     finite-difference-aware floor; both gates read no posterior
     variance beyond the flag's own `u`, and there is no second chance).
+
+    `tree_rule` picks the joint tree's own growth/share rule, chosen
+    once at the same setup point as `pilot`/`check_rule`: `'perbin'`
+    (today's rule; every line below this point, and everything grown
+    or checked, is byte-identical to today) or `'total'` (`pilot='gp'`
+    only -- a ValueError otherwise; `_run_total`, module docstring):
+    growth (`grow_total`) and the continuation that replaces the check
+    both work against each measured output's own TOTAL within share
+    S_c = V_win_hat_c/(V_btw_c+V_win_hat_c), splitting whichever single
+    bin or leaf does the most for the currently worst output, rather
+    than every bin independently against its own per-bin slice of the
+    tolerance; there is no flag, no pay test, no adjacency split, and
+    `check_rule` is accepted but unused. Both rules fill
+    `JointResult.share_final` (the final V_win_hat/(V_btw+V_win_hat)
+    per measured output), which changes no other product under
+    `tree_rule='perbin'`.
     """
     if check_rule not in ('predicted', 'measured'):
         raise ValueError(f"unknown check_rule {check_rule!r}")
     if check_rule == 'measured' and pilot != 'gp':
         raise ValueError("check_rule='measured' requires pilot='gp'")
+    if tree_rule not in ('perbin', 'total'):
+        raise ValueError(f"unknown tree_rule {tree_rule!r}")
+    if tree_rule == 'total' and pilot != 'gp':
+        raise ValueError("tree_rule='total' requires pilot='gp'")
 
     N, q = psi0_all.shape
     if measured is None:
@@ -490,7 +782,7 @@ def run_joint(
     if pilot == 'gp' and np.any(model.constant_path):
         return _failed_result(N, q)
 
-    growth = grow(psi0_all, eps, M_X_used)
+    growth = grow_total(psi0_all, eps, M_X_used) if tree_rule == 'total' else grow(psi0_all, eps, M_X_used)
     L0 = growth.L0
     binset0 = BinSet(labels=growth.labels, n=np.bincount(growth.labels, minlength=L0),
                       U=np.zeros((L0, 0)), centering_residual=np.zeros(0), D2=np.zeros((L0, 0)),
@@ -508,6 +800,16 @@ def run_joint(
     _, m0, var0 = _bin_stats(psi0_all, bins.labels, L0)
     a = _fit_scale(bins.p, U0, m0)
     groups0 = [np.where(bins.labels == k)[0] for k in range(L0)]
+
+    if tree_rule == 'total':
+        # No flag, no pay test, no adjacency split, no posterior v
+        # below this point (module docstring, `_run_total`'s own);
+        # everything from here to the end of this function is the
+        # `tree_rule='perbin'` path, untouched.
+        return _run_total(N, q, X, counter, theta_hat, psi0_all, measured, pool, start, eta,
+                           eps, M_X_used, growth, bins, V_btw, groups0, U0, m0, var0, B_hat,
+                           a_bca, a, busy_delta)
+
     # `pilot` selects the within-bin pricing input ONCE here (R2): 'gp'
     # reads the GP posterior (v0/u0) via `_posterior_vu`; 'affine' never
     # calls `bin_posterior_variance` (design (f)) and holds v0/u0 at 0.0
@@ -887,6 +1189,10 @@ def run_joint(
     gain_ratio = np.full(q, np.nan)
     nonzero = sum_g != 0.0
     gain_ratio[nonzero] = sum_delta[nonzero] / sum_g[nonzero]
+    # `share_final` (module docstring): a cheap diagnostic added to every
+    # rule's result; it reads V_win_hat/V_tot_hat already computed above
+    # and changes no other field here.
+    share_final = V_win_hat / V_tot_hat
 
     return JointResult(
         V_btw=V_btw, V_win_hat=V_win_hat, V_tot_hat=V_tot_hat,
@@ -898,7 +1204,7 @@ def run_joint(
         n_level_splits=n_level_splits, n_adjacency_splits=n_adjacency_splits,
         check_capped=check_capped, n_closed_unpaid=n_closed_unpaid,
         n_closed_unflagged=n_closed_unflagged, n_noise_floored=n_noise_floored,
-        sum_b_delta=sum_b_delta, failed=False,
+        sum_b_delta=sum_b_delta, failed=False, share_final=share_final,
         bin_mass=bin_mass, bin_U=bin_U, bin_m=bin_m, bin_flagged=bin_flagged,
         bin_label=bin_label, busy_delta=busy_delta,
     )
