@@ -13,7 +13,7 @@ reusing `core.seed`'s own seed-count/partition functions and
 once, offline, never by the package itself.
 
     PYTHONPATH=src python3.9 scripts/seeded_validate_v2_forward_bias.py \\
-        pareto tail --N 2000 --draw 1 --eps 0.01
+        cloudfil p1 --N 10000 --draw 1 --eps 0.01
 
 NOT RUN as part of this build (no estimator draw, per the build's own
 instructions); the author runs this once section 7's validation starts.
@@ -50,6 +50,8 @@ def main() -> None:
     p.add_argument('--draw', type=int, required=True)
     p.add_argument('--eps', type=float, required=True)
     p.add_argument('--seed-base', type=int, default=0)
+    p.add_argument('--gpwidth', choices=['global', 'local'], default='local')
+    p.add_argument('--fit-weights', dest='fit_weights', choices=['none', 'mass'], default='mass')
     args = p.parse_args()
 
     case = registry.case(args.dataset, args.estimator)
@@ -78,7 +80,7 @@ def main() -> None:
         eta_rows=eta_full if getattr(counter, 'takes_start', False) else None)
     model, _mbusy = fit_influence_model(
         Z, xvq, I_proto, theta_Q, eta, gptrend=QIJ_CANONICAL['gptrend'],
-        gpwidth=QIJ_CANONICAL['gpwidth'])
+        gpwidth=args.gpwidth, fit_weights=args.fit_weights)
     psi0_all = _psi0(model, Z)
     measured = list(range(q_full))
 
