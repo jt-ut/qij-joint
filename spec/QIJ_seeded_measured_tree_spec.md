@@ -15,6 +15,149 @@ verbatim in the build prompt. No check is added. Terms as the
 glossary: prototype cells, the pilot, points, bins; never "rows"/
 "field".
 
+## 0. Revision 2 (1 October 2026): the design fixes from the first validation
+
+The first build (branch qij-seeded, e43c844 + fd32dcc) passed V1,
+saved 16–28% of evaluations at ε 0.141 and 1–7% at ε 0.01, and failed
+the shortfall gate on draw 7 at ε 0.01 (1.2–3.4% against ε 1%). The
+coder's attribution (ij exact influence, by bin status) showed the
+partition did its job — within variance left 0.15–0.41% on both draws,
+half in bins closed unpaid and half in bins never proposed — and that
+the deficit was MEASUREMENT: the measured bin means under-state the
+exact between variance by 1–3% on six outputs. The discriminating
+diagnostic rejected truncation and a base offset (the zero-perturbation
+continuation is 2e-11–4e-9 per output) and found a multiplicative
+shrink at tiny steps: the final bins' measured U regress on their exact
+means with slope 0.976–0.994 in the smallest-mass tercile (single-point
+bins, step t ≈ 3e-7) and 1.000 in the largest. Mechanism: a
+continuation stops when its scaled gradient is within η_full, so its
+endpoint is resolved to about η_full·|θ̂|; a perturbation whose true
+displacement t·|U| is only a hundred times that is read short by a
+percent, in both directions alike (a central stencil at the same step
+shares it), and worse the smaller the step. The author ruled these
+design flaws, not method ones; they are fixed here, and the mode's
+adoption is the author's decision after the re-validation.
+
+The four rules of revision 2, which override any conflicting line
+below:
+
+R1 **Step floor (every forward and central measurement in this mode).**
+    The displacement must clear the fit's resolution by a measured
+    margin: for bin k, t_k = max( step_parameter(forward_step(η_full),
+    p_k), max_c √η_full · |θ̂_c| / |m_kc| ), the inner max over the
+    measured outputs whose predicted bin mean from the updated vector
+    satisfies |m_kc| > s_kc + δU_kc (outputs with a mean indistinguishable
+    from zero or from their own error are skipped; if none qualifies the
+    rule's step stands). The relative shrink is then ≤ √η_full (3e-4 at
+    η 1e-7) and the truncation at the raised step stays of order 1e-4.
+    Products: `n_step_floored`, and per split the step used.
+    **FORM AND CONSTANT PENDING MEASUREMENT (coder's objection, 1
+    October, accepted):** the √η_full form assumes the shrink is
+    η_full·|θ̂|/(t|U|); the draw-1 control contradicts it — draw 1's
+    η_full is 10× draw 7's and its small bins show no shrink
+    (0.9986–1.000), where the model predicts 3× more. Whatever governs
+    the shrink is not η_full as measured (the optimizer's real stopping
+    on draw 7 looser than η_full, or something draw-specific). Before
+    R1 is built: the step scan — on draws 1 and 7, ~20 single-point and
+    small bins of the final seeded partition, each measured forward at
+    t, 3t, 10t, 30t (start θ̂, eta η_full, as production) against the
+    exact mean (ij); ~160 evaluations per draw on the author's machine,
+    on the author's go. It gives whether the shrink falls as 1/t, the
+    multiple of t at which it drops below 1e-3, the truncation at the
+    raised steps, and why draw 1 is clean. R1's floor then takes its
+    form and constant from that table, not from this model.
+    **STEP SCAN DONE (coder, 1 October; arrays scratchpad
+    step_scan_d{1,7}.parquet).** The shrink is set by the ABSOLUTE step
+    t, not by η: tightening the continuation's η 100× leaves it
+    unchanged; it appears only below t ≈ 2e-7 (draw 7's single-point
+    bins at 6.3e-8: slope 0.981–1.003; at 3t = 1.9e-7: 0.9992–1.0000;
+    draw 1's smallest steps are already 2e-7 because its η_full is 10×
+    larger — hence the clean control). The upper edge is truncation:
+    from t ≈ 4e-6–1e-5 upward the error reaches 1e-3 and more,
+    sign-varying by output. The clean window is t ≈ 2e-7 to 2e-6 on
+    both draws, every output within ~3e-4. So R1 becomes
+
+        t_k = max( step_parameter(forward_step(η_full), p_k),  t_min ),
+
+    **WITHDRAWN as a method constant (author, 1 October): a t_min read
+    off this window would be a constant from two draws of one
+    estimator, and η does not drive it (the scan showed η/100 changes
+    nothing).** The rule this mode needs is the general one: a measured
+    step must RESOLVE — the fix belongs in the fitter's continuation
+    path (below), stated in machine epsilon and the fit's own
+    quantities, not in a number from this dataset. R1 is therefore: no
+    step floor in this spec; the fit-spec amendment, once the mechanism
+    is verified, makes every continuation resolve its perturbation, and
+    the step rule stays as it is.
+    The mechanism is not identified; η does not control it, so the
+    candidates were an absolute tolerance inside the fitter's finish or
+    float resolution. **Coder's read of gmm.py (1 October):** not
+    scipy's gtol (passed as 0; the stop is the package's own callback,
+    and every explicit stop scales with η). Hypothesis: float resolution
+    of ℓ in the trust-region ACCEPTANCE — a displacement δ gains about
+    ½δᵀHδ in ℓ, which for a single-point bin at t ≈ 6e-8 is far below
+    eps·|ℓ|, so trust-exact's actual/predicted ratio is float noise,
+    steps are rejected, the radius collapses, the stall rule accepts the
+    point (resid ≤ √η trivially, the perturbed gradient being ~t·|score_i|/N),
+    and the fit stays where EM's few linearly-convergent SQUAREM rounds
+    left it: a systematic partial response. This predicts an ABSOLUTE
+    floor on the DISPLACEMENT t·|U| in scaled θ, ≈ √(eps·|ℓ|/λ_H),
+    independent of η and of N — so t_min is a displacement floor and
+    transfers across N and estimators in those units. **REFUTED by the
+    4-evaluation check (1 October): the ℓ-gain is 770–1100× above
+    eps·|ℓ| even at 1t, so the acceptance test is informative. The
+    actual defect is a premature "converged" on the continuation path:
+    the finish takes ONE Newton iteration and stops at resid 3.7e-8 <
+    η = 1e-7 having covered 43% of the displacement (bin 355,
+    log_reff); a tiny perturbation's own starting gradient g0 is
+    already of order η, so a partial step passes the ABSOLUTE stop; at
+    10t the gradient is 10× larger and the fit completes (response
+    1.001). The scan's bins are bimodal (4 of 20 shrunk 10–19%, the
+    rest within 0.2%): a pass/fail stop event. The fix lives in the
+    fit spec (the finish), η-driven and constant-free: on a
+    continuation the stop and the stall acceptance are RELATIVE to the
+    problem posed, resid ≤ √η·g0 (the same √η the EM stop and stall
+    rule already use; η·g0 would ask for a gradient below float noise),
+    floored at the gradient's own float resolution; whether the initial
+    trust radius on continuations must also follow the perturbation
+    (why one Newton step covered only 43%) awaits two instrumented
+    evaluations (bins 355 and 381 at 1t) on the author's go. This spec's
+    step rule stays as written.** The same shrink
+    reaches today's pipeline: its check's small one-sided children sit
+    at t ∝ √η·p, below 2e-7 at η_full 1e-7 (TACC's usual value) for
+    single-point children at tight ε; an audit of the sweep's child
+    steps against 2e-7 is warranted before any further tightening of ε.
+    [The same shrink affects the current check's small one-sided
+    children at tight ε; that is reported to the author separately and
+    is not changed by this spec.]
+
+R2 **Central seed.** The seed bins are measured by the central stencil
+    (2 per bin) at the R1 step: V2 found the forward seed's effect on
+    V_btw at 1.2–2.0%, over the 1% rule.
+
+R3 **Close on evidence, not on noise.** A split's gain is debiased by
+    the squared-noise term and compared with its share MINUS the
+    first-order noise: the lineage CLOSES only when, for every measured
+    output, Δ_c − b_Δ,c < τ_c − n_Δ,c; otherwise both children stay
+    candidates for the open test. (The first build's τ' = max(τ, n_Δ +
+    b_Δ) raised the bar where the noise was large and closed splits
+    within the noise of paying — the premature closing the author
+    named.)
+
+R4 **The identity as the noise.** With R1 removing the step dependence
+    of the shrink, the parent-versus-children identity δ (section 4) is
+    a same-footing comparison; δU_c for a split = max(|δ_kc|, η_full·
+    |θ̂_c|/t) feeds n_Δ and b_Δ in R3, the reproducibility floor as the
+    fallback. (Revision 1 had made δ information-only; R1 is what makes
+    it usable.)
+
+Everything else (the state, the seed count, the minimax k-means, the
+open test with /N, the re-centring, the scale/shift update with its
+measurability condition, the cap, the products, bit identity) stands
+as written. Validation (section 7) is rerun on the same draws and ε
+against today's pipeline (growth → central stencils → measured check),
+with the first build's numbers as the record of what R1–R4 changed.
+
 ## 1. Why (the measured record)
 
 * The separation of growth from measurement is inherited from the
@@ -173,9 +316,25 @@ L = current bin count; V_btw,c measured as above; V_win,c = (1/N) Σ_k
 p_k Var_k(psi_hat_c) (the vector's within-bin variance); V̂_tot,c =
 V_btw,c + V_win,c; τ_c = ε·V_btw,c/L.
 
-**Open bins.** A bin is open when it is not closed (below) and
-max_c p_k Var_k(psi_hat_c)/V̂_tot,c > ε/L — growth's own rule, on the
-updated vector. (After the seed, every bin is tested by this; there is
+**Termination (added 1 October after the first validation; a design
+flaw of this spec, not of the build).** The loop STOPS when every
+measured output's total predicted within share on the updated vector
+is under the tolerance, max_c Σ_k (p_k Var_k(psi_hat_c)/N) / V̂_tot,c ≤
+ε — growth's own stop. The first text terminated only when no bin was
+over its share ε/L, which ends only when gains fall below ε·V/L
+EVERYWHERE and so splits on long after the total is met: on draw 7 at
+ε 0.01 the tree ran to 524 bins (today's pipeline 435) and landed at a
+realized within of 0.2–0.4 ε, overshooting the tolerance exactly as the
+per-bin schedule does, with 1243 evaluations against 1237 and no
+saving at tight ε. The per-bin share selects WHICH bins to split; the
+total share says WHEN to stop.
+
+**Open bins.** While the loop runs, a bin is open when it is not closed
+(below) and max_c (p_k Var_k(psi_hat_c)/N) / V̂_tot,c > ε/L — bin k's
+own contribution to V_win,c (the /N as in V_win,c's definition above)
+against its share of the predicted total; growth's own selection rule
+on the updated vector. (Corrected 1 October: the first text omitted
+the /N, which would open every bin; the coder built it as corrected.) (After the seed, every bin is tested by this; there is
 no flag against the pilot: the pilot inside a measured bin IS the
 measurement.)
 

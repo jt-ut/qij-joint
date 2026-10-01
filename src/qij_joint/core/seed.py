@@ -280,6 +280,11 @@ def _round_candidates(leaves: Dict[int, dict], closed: set, psi_hat: np.ndarray,
     tau_round = eps * v_btw / L_current
     own_share = (p[:, None] * var) / (N * v_tot[None, :])
     open_mask = np.any(own_share > (eps / L_current), axis=1)
+    # Termination (spec section 4): the loop stops once every output's
+    # TOTAL predicted within share is under eps -- growth's own stop; the
+    # per-bin share above only chooses which bins split while it runs.
+    if np.max(v_win / v_tot) <= eps:
+        open_mask[:] = False
     candidates = [ids[i] for i in range(L_current)
                   if open_mask[i] and ids[i] not in closed]
     return ids, ubar, v_btw, tau_round, L_current, candidates, p, var, v_tot
