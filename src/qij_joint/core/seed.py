@@ -346,8 +346,10 @@ def _process_split(cid: int, meta: dict, leaf: dict, results: dict, theta_hat: n
     Delta = (meta['p_small'] * (U_small - ubar) ** 2 + meta['p_large'] * (U_large - ubar) ** 2
              - p_parent * (U_parent - ubar) ** 2) / N
     delta_U = eta_full * theta_abs / meta['t_small']
-    n_delta = (2.0 / N) * (meta['p_small'] * np.abs(U_small)
-                           + meta['p_large'] * np.abs(U_large)) * delta_U
+    # The noise term of Delta is 2 p (U - ubar) dU, so the floor reads the
+    # re-centred values, as Delta does.
+    n_delta = (2.0 / N) * (meta['p_small'] * np.abs(U_small - ubar)
+                           + meta['p_large'] * np.abs(U_large - ubar)) * delta_U
     b_delta = ((meta['p_small'] + meta['p_large']) / N) * delta_U ** 2
     tau_prime = np.maximum(tau_round, n_delta + b_delta)
     margin = Delta - tau_prime
