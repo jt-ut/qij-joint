@@ -1087,7 +1087,8 @@ def _score_at(X, Q, w, cfg, pis, mus, Ss, Scov, a_pen, W, s):
 
 
 def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
-         eta: float, reference=None, start: np.ndarray = None):
+         eta: float, reference=None, start: np.ndarray = None,
+         continuation: bool = False):
     """(dict_or_None, status), status in {'converged', 'em_cap',
     'newton_cap', 'newton_stalled', 'infeasible', 'linalg'}
     (spec/QIJ_estimator_fit_spec.md 2.4). The dict is None only for
@@ -1201,12 +1202,14 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
 
     n_iter_em = best['n_iter']
 
-    def _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton, n_finish_retry=0):
+    def _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton, n_finish_retry=0,
+                 g0=float('nan'), newton_halvings=0):
         theta = _pack(cfg.K, pis, mus, Ss)
         return dict(theta=theta, pis=pis, mus=mus, Ss=Ss, A=A, ll=ll, resid=resid,
                     status=status, n_iter_em=n_iter_em, n_iter_newton=n_iter_newton,
                     label_order=label_order, search=best.get('search'),
-                    n_finish_retry=n_finish_retry), status
+                    n_finish_retry=n_finish_retry, g0=g0,
+                    newton_halvings=newton_halvings), status
 
     if best['status'] != 'converged':
         # EM never reached its own stopping rule (2.1): the finish's
@@ -1259,6 +1262,91 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     last_step_u = np.asarray(best.get('last_step_u', np.zeros(p)), dtype=float)
     radius0 = max(float(np.linalg.norm(last_step_u / s)), math.sqrt(eta))
     n_cap = 2 * p
+
+    # `continuation` is set only by the public calls (`__call__`,
+    # `influence`, `fit_and_influence`) when the caller passes `start`: a
+    # perturbation of a converged fit. The search's own internal refits
+    # (the racing winner's polish, split-and-merge candidates) pass a
+    # start too but are not next to a maximum of the problem they solve,
+    # so they keep the trust-exact finish, whose ascent guarantee the
+    # search relies on; Newton on the score alone can stop at any
+    # stationary point.
+    # g0: the scaled gradient at the finish's own start, under the
+    # PERTURBED weights `w` -- the gate of spec section 6, computed once
+    # here regardless of which branch runs. Only a continuation (`start`
+    # given) is ever small enough at v0 for the gate to matter (section
+    # 6's scope note); a cold fit's v0 is a multi-start winner polished
+    # by EM, not a point next to a root, so g0 stays NaN for it and the
+    # trust-region finish runs exactly as before.
+    g0 = _score_v(v0) if continuation else float('nan')
+
+    def _newton_score_finish():
+        """Newton on the score from `v0` (spec section 6): no trust-region
+        subproblem, no role for the trust radius. Each step is the exact
+        Newton step `-solve(hess(v), jac(v))` from the current point
+        (`_eval`'s own `hess`/`jac`, already in the scaled v coordinates
+        under the perturbed weights); accepted iff it lowers the scaled
+        gradient norm, halved and retried otherwise, to the same
+        iteration cap `n_cap` the trust-region finish uses. Convergence
+        and the stall are judged on the gradient alone, at a point the
+        finish actually moved to -- `ell` plays no part here, matching
+        the rule the rejected-but-correct Newton step (section 6's
+        defect B) is built to avoid. Converged: the scaled gradient
+        <= sqrt(eta)*g0 and <= eta. A stall (a step below eta in scaled
+        v that fails to lower the gradient) is converged too when the
+        last ACCEPTED step was a full, unhalved Newton step and the
+        gradient is <= eta: a full Newton step lands at quadratic
+        accuracy, so a gradient the next one cannot lower sits at its
+        own rounding noise, and a point reached by a full step is never
+        the unmoved start of defect A. A stall after a halved step, or
+        above eta, is `newton_stalled`."""
+        thresh = math.sqrt(eta) * g0
+
+        def _converged(v, score, n_iter_newton, halvings):
+            final = _eval(v)
+            if not _cholesky_ok(final['A']):
+                return None, 'linalg'
+            extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
+            fit, _ = _stopped('converged', final['pis'], final['mus'],
+                               final['Ss'], final['A'], final['ll'], score,
+                               n_iter_newton, g0=g0, newton_halvings=halvings)
+            fit['psi'] = final['psi'] + extra
+            return fit, 'converged'
+
+        v = v0
+        score = g0
+        step = -np.linalg.solve(hess(v), jac(v))
+        step_full = True
+        last_accepted_full = False
+        n_iter_newton = 0
+        halvings = 0
+        while n_iter_newton < n_cap:
+            n_iter_newton += 1
+            step_len = float(np.linalg.norm(step))
+            v_trial = v + step
+            score_trial = _score_v(v_trial)
+            if score_trial < score:
+                v, score = v_trial, score_trial
+                last_accepted_full = step_full
+                if score <= thresh and score <= eta:
+                    return _converged(v, score, n_iter_newton, halvings)
+                step = -np.linalg.solve(hess(v), jac(v))
+                step_full = True
+                continue
+            if step_len < eta:
+                # A step below the fit's own reproducibility that still
+                # fails to reduce the gradient: the finish ends at the best
+                # (lowest-gradient) point reached, which is `v` -- the
+                # acceptance rule above never lets it move to a worse one.
+                if last_accepted_full and score <= eta:
+                    return _converged(v, score, n_iter_newton, halvings)
+                return _stopped('newton_stalled', pis, mus, Ss, A, ll, score,
+                                 n_iter_newton, g0=g0, newton_halvings=halvings)
+            step = step / 2.0
+            step_full = False
+            halvings += 1
+        return _stopped('newton_cap', pis, mus, Ss, A, ll, score, n_iter_newton,
+                         g0=g0, newton_halvings=halvings)
 
     def _finish_attempt(method, n_finish_retry):
         """One trust-region finish (2.2, 5) from `v0` by `method`: the
@@ -1320,25 +1408,36 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
             extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
             fit, _ = _stopped('converged', final['pis'], final['mus'], final['Ss'],
                                final['A'], final['ll'], resid, n_iter_newton,
-                               n_finish_retry=n_finish_retry)
+                               n_finish_retry=n_finish_retry, g0=g0)
             fit['psi'] = final['psi'] + extra
             return fit, 'converged'
 
         status = 'newton_cap' if (result.status == 1 and not stall['stalled']) else 'newton_stalled'
         return _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton,
-                         n_finish_retry=n_finish_retry)
+                         n_finish_retry=n_finish_retry, g0=g0)
 
-    fit, status = _finish_attempt('trust-exact', 0)
-    if status in ('newton_cap', 'newton_stalled'):
-        # scipy's trust-exact subproblem can return a NaN step on a
-        # near-singular or indefinite Hessian (its unsuccessful-Cholesky
-        # branch takes the sqrt of a slightly negative product), which
-        # then poisons every later iterate and ends the finish here
-        # rather than at its own floor. trust-krylov's Lanczos subproblem
-        # solver handles an indefinite Hessian without that bracketing,
-        # so one retry from the same v0, with the same stopping tests,
-        # recovers such a fit.
-        fit, status = _finish_attempt('trust-krylov', 1)
+    if continuation and g0 <= math.sqrt(eta):
+        # The gate of spec section 6: a continuation started next to a
+        # root, where the objective's change along the correct Newton
+        # step falls inside an N-term sum's own rounding noise (section
+        # 6's defect B) while the gradient is still resolved -- the
+        # trust region's own acceptance test (judged on the objective)
+        # cannot see the step it should take. Every cold fit, and every
+        # continuation whose start is not already this close, keeps the
+        # trust-exact finish below unchanged.
+        fit, status = _newton_score_finish()
+    else:
+        fit, status = _finish_attempt('trust-exact', 0)
+        if status in ('newton_cap', 'newton_stalled'):
+            # scipy's trust-exact subproblem can return a NaN step on a
+            # near-singular or indefinite Hessian (its unsuccessful-Cholesky
+            # branch takes the sqrt of a slightly negative product), which
+            # then poisons every later iterate and ends the finish here
+            # rather than at its own floor. trust-krylov's Lanczos subproblem
+            # solver handles an indefinite Hessian without that bracketing,
+            # so one retry from the same v0, with the same stopping tests,
+            # recovers such a fit.
+            fit, status = _finish_attempt('trust-krylov', 1)
     return fit, status
 
 
@@ -1359,24 +1458,29 @@ def _center_start(start, K: int, xmean: np.ndarray):
 
 
 FitInfo = namedtuple('FitInfo', ['status', 'score', 'n_iter_em', 'n_iter_newton',
-                                  'label_order', 'search', 'n_finish_retry'])
+                                  'label_order', 'search', 'n_finish_retry', 'g0',
+                                  'newton_halvings'])
 
 
 def _fit_info(fit, status) -> FitInfo:
     """`GMM2D.last_fit_info` from `_fit`'s own return
-    (spec/QIJ_estimator_fit_spec.md 2.4): `score` is the final scaled
+    (spec/QIJ_estimator_fit_spec.md 2.4, 6): `score` is the final scaled
     gradient norm of 2.3 whatever `status` is; `n_iter_em`/`n_iter_newton`
     /`label_order` are 0/0/None on 'infeasible' or 'linalg', since those
     two statuses have no dict (`_fit`'s docstring). `n_finish_retry` is 0
     there too: a retry that itself ends 'linalg' leaves no dict to record
-    having run one."""
+    having run one. `g0` is the scaled gradient at the finish's start
+    under the perturbed weights, NaN when it was never computed (no
+    dict, or a cold fit); `newton_halvings` is the Newton-on-score
+    finish's own halving count, 0 when that path did not run."""
     if fit is None:
         return FitInfo(status=status, score=float('nan'), n_iter_em=0,
                         n_iter_newton=0, label_order=None, search=None,
-                        n_finish_retry=0)
+                        n_finish_retry=0, g0=float('nan'), newton_halvings=0)
     return FitInfo(status=status, score=fit['resid'], n_iter_em=fit['n_iter_em'],
                    n_iter_newton=fit['n_iter_newton'], label_order=fit['label_order'],
-                   search=fit.get('search'), n_finish_retry=fit['n_finish_retry'])
+                   search=fit.get('search'), n_finish_retry=fit['n_finish_retry'],
+                   g0=fit['g0'], newton_halvings=fit['newton_halvings'])
 
 
 def _merge_scores(R: np.ndarray) -> np.ndarray:
@@ -1728,7 +1832,8 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c,
+                               continuation=start_c is not None)
             self.last_fit_info = _fit_info(fit, status)
             if status != 'converged':
                 return np.full(cfg.p, np.nan)
@@ -1755,7 +1860,8 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c,
+                               continuation=start_c is not None)
             self.last_fit_info = _fit_info(fit, status)
             if status != 'converged':
                 return np.full((N, cfg.p), np.nan)
@@ -1784,7 +1890,8 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c,
+                               continuation=start_c is not None)
             self.last_fit_info = _fit_info(fit, status)
             if status != 'converged':
                 return nan_theta, nan_psi
