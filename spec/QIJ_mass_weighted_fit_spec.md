@@ -126,14 +126,21 @@ V1b (the amended route, 30 September; no new runs — reads the first
 build's `'mass'` products): the rescaled profiling must reproduce the
 first build's per-Cholesky `'mass'` fit — ell/c, lam, s2 per output and
 psi0 at the points on draw 1 at both ε, local and global (same model,
-different arithmetic route; not byte identity): to rel 1e-10 where the
-stored jitter is 0, otherwise to a tolerance of jitter·max_j|D_jj − 1|/λ
-(the two routes place the jitter differently, section 2), the jitter
-reported per coordinate. The coder runs it: 4 local runs of draw 1
-(both ε × both widths) into a separate folder against the first
-build's `_massfit` products — the package's own `fit_influence_model`
-on the same inputs is the reference, not an offline reconstruction — and `'local'`/`'none'` with the cached kernel matrices must
-be byte-identical to the current main. The fit's own cost is compared
+different arithmetic route; not byte identity): s2, α and the posterior
+sd to rel 1e-10 where the stored jitter is 0, otherwise to a tolerance
+of jitter·max_j|D_jj − 1|/λ (the two routes place the jitter
+differently, section 2), the jitter reported per coordinate; the fitted
+width (ℓ or c) and psi0 at the points to rel 1e-8 — the width comes
+from a bounded scalar search (xatol 1e-5) run on two numerically
+different evaluations of the same objective, which lands 2–9e-9 apart
+(measured offline, 30 September), and psi0 inherits that. The coder
+runs it: 4 local runs of draw 1 (both ε × both widths) into a separate
+folder against the first build's `_massfit` products — the package's
+own `fit_influence_model` on the same inputs is the reference, not an
+offline reconstruction. The local cached-kernel matrices (section 2)
+are used under `'mass'` only: the cached form differs from the direct
+kernel by about one ULP, so `'local'`/`'none'` keeps the direct route
+and must be byte-identical to the current main. The fit's own cost is compared
 through `wall_time_prototype` (`'mass'` vs `'none'`, same draw: the GP
 fit runs inside that stage, and the survey part of it is identical
 under both routes, so the stage's own difference is the fit's) rather

@@ -550,7 +550,10 @@ points; the cloud and the filament are nuisance.
 every stencil and every bootstrap replicate labels against the full-data
 fit; across draws (oracle, coverage) against the true components.
 
-**The measured outputs: P2's six, on the scales below.** The estimator's
+**The measured outputs: the subject core's six, on the scales below.
+The subject is P1 (author's ruling, 29 September; the study and the
+talk report P1's analogs); P2, the first subject, stays registered as
+`('cloudfil', 'p2')` for the comparison already run.** The estimator's
 raw outputs are the 59 mixture parameters; the demo's estimands are
 functions of them, exposed as ADDITIONAL outputs of T (a thin wrapper
 estimator around `GMM2D`, `outputs` naming the six), with their analytic
@@ -559,7 +562,7 @@ the functions below at θ̂. J_g may be formed by central finite differences
 of the deterministic functions in θ (they are cheap closed forms; the one
 integral, if completeness is ever added, by fixed quadrature); the
 perturbation check of the influence applies to the six as to any output.
-With s the P2 component, λ₁ ≥ λ₂ its covariance's eigenvalues, v₁ the
+With s the subject component, λ₁ ≥ λ₂ its covariance's eigenvalues, v₁ the
 major-axis eigenvector, b the cloud, F_j the filament beads:
 
 | estimand | definition |
@@ -567,16 +570,69 @@ major-axis eigenvector, b the cloud, F_j the filament beads:
 | position x, y | μ_s |
 | log effective radius | ¼ log det Σ_s |
 | log axis ratio | log(λ₂/λ₁) |
-| position angle | ½ atan2(2Σ_s,xy, Σ_s,xx − Σ_s,yy), mod π |
+| position angle | ½ atan2(2Σ_s,xy, Σ_s,xx − Σ_s,yy), wrapped to the half-open branch [pa_lo, pa_lo + π) whose lower edge keeps the subject's true angle away from the wrap: pa_lo = −π/2 for P1 (true angle 20°, mid-branch), 0 for P2 (true angle −50° ≡ 130°) — as built on `tacc-p1` |
 | logit weight | log(π_s / (1 − π_s)) |
 | log peak contrast | log π_s − ½ log det Σ_s − log Σ_{k≠s} π_k φ(μ_s; μ_k, Σ_k) + const, the source's density at its own centre over the sum of every other component's density there (cloud and all six beads); the constant −log(2π) cancels in the ratio |
 
 Seven numbers if position counts as two; the slide shows six panels
-(position once). The rule's q for the prototype count is the number of
-MEASURED outputs, 6, giving M_𝒳 = ⌈√((1 + 2·6·17)·N/2)⌉ = 1013 at N = 10 000;
-the fit must therefore take the measured subset as an argument and the
-rule must read its length. Completeness, contamination and the
+(position once). **M_𝒳 by the cost rule on cloudfil too (author's ruling,
+30 September, superseding a one-day ruling of 1000 as an argument).**
+The rule, M_𝒳 = ⌈√((1 + 2·q·M_ref)·N/2)⌉ with M_ref = ⌈√(2.7/ε)⌉, gives
+the survey the same row budget as a stage 2 of 2·q·M_ref stencil
+evaluations. Under the joint I-VQ the bin count is no longer q·M_ref,
+so the rule is read as what it still does: it pegs the prototype count
+to N and to the tolerance by a stated budget, and it is the answer to
+"how many prototypes". The author's assessment: rough, probably not
+the optimum of (survey + derivatives) + (I-VQ + refinement), and not
+broken. Evidence: the P1 ε sweep (M_𝒳 from 920 at ε 0.02 to 534 at
+ε 0.2, 1094 at 0.01) held Winkler parity with the matched bootstrap at
+every ε — stage 2 measures V_btw on the full data, so the survey shapes
+the partition and a poorer survey costs stage-2 evaluations, not
+accuracy, until the caps bind. M_𝒳 caps joint growth (L ≤ M_𝒳_used)
+and the joint check (1 + M_𝒳_used evaluations); both are reported. The
+fit still takes the measured subset as an argument. Completeness, contamination and the
 Bhattacharyya overlap are NOT measured in v1.
+
+**Reporting set (author's ruling, 29 September).** Every study table
+(coverage, width, cost) is over the IN-BASIN draws only: a draw counts
+when the search audit of its full-data fit passes (`search_failed`
+False). The flag is the oracle product's for that draw, for EVERY method, so
+that every column of a table rests on the same draws. The bootstrap,
+qij and ijfd rows keep the audit of their own cold fit as a product
+(`ij` rows carry none); the number of draws on which a method's own
+flag disagrees with the oracle's is printed as a diagnostic, and such a
+draw stays in or out by the oracle's flag alone. The in-basin count
+out of the study's draws is printed beside every table. Intervals are
+the normal interval for every method (same ruling); the ABC interval
+and the sigma interval are not reported. **QIJ's variance is V_btw
+alone (author's ruling, 30 September):** θ̂ ± z·√V_btw, no 1/(1−ε)
+inflation (it overshoots V_ij by ~10% at loose ε) and no posterior
+term. V_btw + V_win_hat with the posterior term removed
+(QIJ_joint_check_measured_spec.md 2.5) is carried through the next
+TACC sweep under `check_rule='measured'` as a second reported variance
+and judged there on coverage and Winkler against the oracle over the
+in-basin draws; it is not the primary until that verdict.
+
+**Matched comparator (author's ruling, 30 September).** QIJ's ε (the
+within share left undiscovered, a relative error of the variance
+against V_ij) is matched to the bootstrap's B by the Monte Carlo error
+of the bootstrap variance under the normal assumption (Efron &
+Tibshirani 1993 §6.4: cv(se_B)² = cv(se_∞)² + (δ+2)/(4B), δ = 0):
+
+    B = 2/ε²,   ε = √(2/B).
+
+Every table at one matched pair states the pair. The accuracy–cost
+frontier (Winkler and coverage against the truth, cost in size-N
+evaluations and wall time, in-basin draws) is one bootstrap run at
+B = 5000 read at prefixes (the replicate stream is seeded in order, so
+the first B replicates are the bootstrap at B) against one qij run per
+ε at the matched values of B = 50, 100, 200, 500, 1000, 2000, 3000,
+4000, 5000 (ε = 0.200, 0.141, 0.100, 0.063, 0.045, 0.032, 0.026,
+0.022, 0.020, passed as the computed √(2/B)); B is not extended past
+5000. Stage 1 is repeated in every qij run (no survey cache: the
+author ruled a cache unfair to the comparison). ijfd and exact ij are
+single points on the plot, not curves. The qij pilot (gp or affine)
+for the frontier is decided by the P1 study run first.
 
 **Study settings for the TACC run.** N = 10 000; S = 500 draws; bootstrap
 B = 5000 per draw with the replicate parameters STORED as one sequential
