@@ -64,6 +64,9 @@ def main(argv=None) -> None:
     p.add_argument('--fit-weights', dest='fit_weights', choices=['none', 'mass'],
                     default='none',
                     help='qij: the pilot fit\'s kernel-regression noise (pilot=gp)')
+    p.add_argument('--tree-rule', dest='tree_rule', choices=['perbin', 'total'],
+                    default='perbin',
+                    help='qij: the joint tree\'s growth/share rule (ivqbins=joint, pilot=gp)')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
@@ -82,7 +85,8 @@ def main(argv=None) -> None:
                       gpwidth=args.gpwidth, M_X=args.M_X, ivqbins=args.ivqbins,
                       survey=args.survey, quantized_start=args.quantized_start,
                       refine_schedule=args.refine_schedule, sigma_points=args.sigma_points,
-                      check_rule=args.check_rule, fit_weights=args.fit_weights)
+                      check_rule=args.check_rule, fit_weights=args.fit_weights,
+                      tree_rule=args.tree_rule)
     elif args.method == 'boot':
         config['B'] = args.B
     elif args.method == 'ijfd':
@@ -122,7 +126,7 @@ def main(argv=None) -> None:
                       quantized_start=args.quantized_start,
                       refine_schedule=args.refine_schedule, pilot=args.pilot,
                       sigma_points=args.sigma_points, check_rule=args.check_rule,
-                      fit_weights=args.fit_weights)
+                      fit_weights=args.fit_weights, tree_rule=args.tree_rule)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
@@ -130,7 +134,7 @@ def main(argv=None) -> None:
             ivqbins=args.ivqbins, survey=args.survey, quantized_start=args.quantized_start,
             refine_schedule=args.refine_schedule, pilot=args.pilot,
             sigma_points=args.sigma_points, check_rule=args.check_rule,
-            fit_weights=args.fit_weights, tag=tag)
+            fit_weights=args.fit_weights, tree_rule=args.tree_rule, tag=tag)
     elif args.method == 'qijdt':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \

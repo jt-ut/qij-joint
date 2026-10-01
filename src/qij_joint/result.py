@@ -60,6 +60,13 @@ byte-identical) or `'mass'` (a per-observation noise diagonal
 1/m_tilde_j in place of the identity, in both the profiled marginal
 likelihood and the posterior).
 
+`tree_rule`, inert (but recorded) under `ivqbins='marginal'`, picks the
+joint tree's own growth/share rule: `'perbin'` (the default, today's
+behaviour, byte-identical) or `'total'` (`ivqbins='joint'` and
+`pilot='gp'` only). `joint_share_final` (the final
+V_win_hat/(V_btw+V_win_hat) per measured output) is populated under
+both rules on a draw that did not fail, NaN otherwise.
+
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
 the full data: `.sigma_interval(level)` from the stored `sigma_mean`/
@@ -168,6 +175,8 @@ class QIJResult:
     joint_bin_flagged: np.ndarray  # (L,) bool; empty under 'marginal'
     joint_bin_label: np.ndarray    # (N,) int; -1 under 'marginal'
     joint_busy_delta: float        # 0.0 under 'marginal'
+    joint_share_final: np.ndarray  # (q,) final V_win_hat/(V_btw+V_win_hat) per measured
+                                    # output; NaN under 'marginal' or a failed draw
     a: np.ndarray                  # (q,) ABC acceleration (spec/QIJ_mods_waves.md A10)
     b_hat: np.ndarray              # (q,) ABC second-order bias (A10)
     c_q: np.ndarray                # (q,) ABC curvature-along-influence, survey-row evaluated (A10)
@@ -182,6 +191,8 @@ class QIJResult:
                                     # spec.md); inert under ivqbins='marginal'
     fit_weights: str               # 'none' or 'mass' (spec/QIJ_mass_weighted_fit_spec.md);
                                     # unused under pilot='affine'
+    tree_rule: str                  # 'perbin' or 'total'; inert under ivqbins='marginal';
+                                     # 'total' requires ivqbins='joint' and pilot='gp'
     bridge_j: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_k: np.ndarray           # (P,) int; empty under pilot='gp'
     bridge_m: np.ndarray           # (P,) m_jk; empty under pilot='gp'

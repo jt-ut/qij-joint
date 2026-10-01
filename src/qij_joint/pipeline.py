@@ -168,10 +168,14 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
     measured trigger's own scale factor, B4's formula reused at one
     output). `fit_weights` (spec/QIJ_mass_weighted_fit_spec.md) is
-    recorded whether or not it is inert (`pilot='affine'`)."""
+    recorded whether or not it is inert (`pilot='affine'`). `tree_rule`
+    is recorded whether or not it is inert (`ivqbins='marginal'`), and
+    `share_final_<o>` is its own per-output product (the final
+    V_win_hat/(V_btw+V_win_hat), NaN under `ivqbins='marginal'` or a
+    failed draw)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
-           'fit_weights': res.fit_weights,
+           'fit_weights': res.fit_weights, 'tree_rule': res.tree_rule,
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
@@ -231,6 +235,7 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'c_{o}'] = float(res.c[j])
         row[f'c_bound_{o}'] = bool(res.c_bound[j])
         row[f'S_pred_{o}'] = float(res.joint_S_pred[j])
+        row[f'share_final_{o}'] = float(res.joint_share_final[j])
         row[f'joint_a_{o}'] = float(res.joint_a[j])
         row[f'a_{o}'] = float(res.a[j])
         row[f'b_hat_{o}'] = float(res.b_hat[j])
@@ -370,7 +375,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
             sigma_points: bool = False, check_rule: str = 'predicted',
-            fit_weights: str = 'none', tag: str = '') -> Tuple[int, int]:
+            fit_weights: str = 'none', tree_rule: str = 'perbin',
+            tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -393,7 +399,10 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     (spec/QIJ_joint_check_measured_spec.md) picks the joint check's
     continuation rule, inert under `ivqbins='marginal'`. `fit_weights`
     (spec/QIJ_mass_weighted_fit_spec.md) picks the pilot's own
-    kernel-regression noise, unused under `pilot='affine'`."""
+    kernel-regression noise, unused under `pilot='affine'`. `tree_rule`
+    picks the joint tree's own growth/share rule, inert under
+    `ivqbins='marginal'`; `'total'` requires `ivqbins='joint'` and
+    `pilot='gp'`."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -411,7 +420,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   survey=survey, quantized_start=quantized_start,
                   refine_schedule=refine_schedule, pilot=pilot,
                   sigma_points=sigma_points, check_rule=check_rule,
-                  fit_weights=fit_weights).fit(X, T, pool=pool)
+                  fit_weights=fit_weights, tree_rule=tree_rule).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}

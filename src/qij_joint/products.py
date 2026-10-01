@@ -53,7 +53,10 @@ def dir_tag(method: str, config: dict) -> str:
     `_nosigma`), `M_X` (named only when not None, as `_MX<int>`), then
     `check_rule` (spec/QIJ_joint_check_measured_spec.md 3) as a
     non-canonical suffix, named only when `'measured'`, as `_measured`
-    -- so a `check_rule='predicted'` run keeps today's folder name. `boot`
+    -- so a `check_rule='predicted'` run keeps today's folder name --
+    then `tree_rule` as the LAST non-canonical suffix, named only when
+    `'total'`, as `_total` -- so a `tree_rule='perbin'` run keeps
+    today's folder name. `boot`
     -> `''` (`B` is not in the name -- replicates are a deterministic
     prefix, so a smaller B is read from a larger run's folder; `B` is
     still recorded in config.json and so still guarded). `ijfd` -> `''`,
@@ -82,6 +85,8 @@ def dir_tag(method: str, config: dict) -> str:
             tag += f"_MX{int(config['M_X'])}"
         if config['check_rule'] == 'measured':
             tag += '_measured'
+        if config['tree_rule'] == 'total':
+            tag += '_total'
         return tag
     if method == 'boot':
         return ''
@@ -129,6 +134,11 @@ def ensure_config(md: str, config: dict) -> None:
         # (spec/QIJ_mass_weighted_fit_spec.md 3): read as 'none', so
         # today's `fit_weights='none'` runs still match it.
         stored = dict(stored, fit_weights='none')
+    if 'tree_rule' in requested and 'tree_rule' not in stored:
+        # A qij folder from before this build recorded no `tree_rule`:
+        # read as 'perbin', so today's `tree_rule='perbin'` runs still
+        # match it.
+        stored = dict(stored, tree_rule='perbin')
     if stored != requested:
         keys = sorted(set(stored) | set(requested))
         diffs = '; '.join(
