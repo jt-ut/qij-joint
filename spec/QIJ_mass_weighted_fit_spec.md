@@ -62,12 +62,42 @@ in which observation j is weighted by its mass, written as a noise
 variance s²λ_c/m̃_j; it is one mechanism, in the likelihood only —
 no mass weight elsewhere (a weighted log-likelihood on top would count
 it twice). Under `'none'` m̃_j ≡ 1 and every expression reduces to
-today's, byte for byte. The eigendecomposition-based profiling of the
-group's shared width must take the diagonal into account: the
-shortcut that diagonalizes K once and profiles λ along its eigenvalues
-does not apply to K + λD with D non-scalar; the build states which
-route it takes (a per-λ Cholesky of A_c is acceptable at M_X ≤ ~1100 —
-cost measured and reported as `ml_wall_time`, the existing product).
+today's, byte for byte. **Profiling route (amended 30 September, after the first build's
+per-λ Cholesky raised the fit time noticeably): the shortcut is kept
+by a symmetric rescaling.** With D = diag(1/m̃_j),
+
+    K + λD = D^{1/2} ( K̃ + λ I ) D^{1/2},   K̃ = D^{-1/2} K D^{-1/2},
+
+so the fit works in the scaled variables ỹ = D^{-1/2} I_c, H̃ =
+D^{-1/2} H, K̃: one eigendecomposition of K̃ per width candidate, then
+every λ candidate is the same vector operation on K̃'s eigenvalues as
+today's on K's (log det A = log det(K̃ + λI) + Σ_j log D_jj, the last
+term constant in λ and in the width; the quadratic forms and the trend
+projection in the scaled variables). β_c, α_c, s²_c and the posterior
+follow from the same factorization: α_c = D^{-1/2} (K̃ + λI)⁻¹ (ỹ − H̃β_c),
+and the point mean h(x)ᵀβ_c + k(x)ᵀα_c is unchanged in form (k(x) the
+unscaled kernel row). Under `'none'` D = I and every expression is
+today's, byte for byte. Cost under `'mass'` = cost under `'none'` up to
+the two O(M) scalings; no per-λ Cholesky anywhere. The first build's
+per-coordinate Cholesky route is replaced, not kept as an option.
+Jitter (settled with the coder, 30 September): the conditioning
+nugget is added where the factorization happens, K̃ + (λ + jitter) I
+in the rescaled space (= K + λD + jitter·D in the original); it is a
+numerical term, not a model term, and its value per coordinate is
+reported as today.
+
+**The local kernel's per-candidate cost (same amendment).** Under
+`gpwidth='local'` the non-stationary Matérn-3/2 has, per pair (i, j),
+a prefactor built from the two spacings h_i, h_j and a scaled distance
+r_ij / √((h_i² + h_j²)/2) … in the package's own form; both are
+INDEPENDENT of the fitted factor c (c multiplies every ℓ_j = c·h_j
+alike and cancels in the prefactor; it enters only as the divisor of
+the scaled distance). Compute the prefactor matrix and the scaled
+distance matrix once per fit; each width candidate is then an
+elementwise expression over them, the same per-candidate cost as the
+global kernel's. If the current code rebuilds the non-stationary
+kernel from the raw coordinates per candidate, replace that with the
+cached form; byte identity under `'local'`/`'none'` is the check.
 
 Not in this build: any exponent other than 1 on the mass (the
 finite-difference noise of a survey value scales as 1/p_j² through
@@ -91,6 +121,24 @@ what the weighting changed).
 V1 (the one pass/fail): `fit_weights='none'` at the new code vs the
 current main on draw 1 ε 0.01 (local width), column by column, the new
 column excepted; identical.
+
+V1b (the amended route, 30 September; no new runs — reads the first
+build's `'mass'` products): the rescaled profiling must reproduce the
+first build's per-Cholesky `'mass'` fit — ell/c, lam, s2 per output and
+psi0 at the points on draw 1 at both ε, local and global (same model,
+different arithmetic route; not byte identity): to rel 1e-10 where the
+stored jitter is 0, otherwise to a tolerance of jitter·max_j|D_jj − 1|/λ
+(the two routes place the jitter differently, section 2), the jitter
+reported per coordinate. The coder runs it: 4 local runs of draw 1
+(both ε × both widths) into a separate folder against the first
+build's `_massfit` products — the package's own `fit_influence_model`
+on the same inputs is the reference, not an offline reconstruction — and `'local'`/`'none'` with the cached kernel matrices must
+be byte-identical to the current main. The fit's own cost is compared
+through `wall_time_prototype` (`'mass'` vs `'none'`, same draw: the GP
+fit runs inside that stage, and the survey part of it is identical
+under both routes, so the stage's own difference is the fit's) rather
+than a new per-draw column: the amendment's purpose is that the two
+agree to within the two O(M) scalings.
 
 V2 (pilot metrics, from the diagnostic arrays, offline against the
 exact influence as scratchpad width_check/width_metrics.py computes

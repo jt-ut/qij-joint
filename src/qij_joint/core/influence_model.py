@@ -33,17 +33,29 @@ model: `'none'` (default), e_j ~ N(0, s^2 lam) as above, byte-identical
 to every product before this option existed; or `'mass'`, e_j ~
 N(0, s^2 lam / m_tilde_j), m_tilde_j = p_j / mean(p_j) over coordinate
 c's own finite design (spec section 2), so A_c = K_c + lam_c *
-diag(1/m_tilde_j) in place of K_c + lam_c*I everywhere A_c appears
-(the profiled marginal likelihood and the posterior alike). The group's
-shared eigendecomposition of K diagonalizes K_c + lam_c*I for every
-lam_c at once but not K_c + lam_c*D for a non-scalar D, so `'mass'`
-takes a different route throughout: a per-candidate Cholesky of A_c in
-the width/lam search (`_width_grid_candidate`), and, at query time
-(`_point_terms`, `bin_posterior_variance`), a per-coordinate Cholesky
-solve against the stored `chol_A`/`ainv_hb`/`g_chol` in place of the
-shared `k_eigval`/`k_eigvec`/`hb_eig` route -- bounded row chunks over
-N as today, just without the group-level sharing across coordinates.
-Cost is reported by the existing `ml_wall_time` product.
+diag(1/m_tilde_j) in place of K_c + lam_c*I everywhere A_c appears (the
+profiled marginal likelihood and the posterior alike). With D =
+diag(1/m_tilde_j), K_c + lam_c*D = D^1/2 (K~_c + lam_c*I) D^1/2, K~_c =
+D^-1/2 K_c D^-1/2 -- an ISOTROPIC noise model in the rescaled variables
+y~ = D^-1/2*I_proto, H~ = D^-1/2*Hb_g -- so `'mass'` reuses the group's
+own shared-eigendecomposition machinery throughout, on K~_c in place of
+K_c: one extra `eigh` per width candidate in the search
+(`_width_grid_candidate`), then one extra full `eigh` of the chosen
+width's K~_c, shared by the group's query-time cache (`_point_terms`,
+`bin_posterior_variance`) the same way K_c's own eigh serves `'none'`.
+Never a per-coordinate or per-lambda factorization. `alpha` is rescaled
+back by D^-1/2 to the ORIGINAL (unscaled) kernel's weights; psi0's
+h(x)^T beta + k(x)^T alpha is unchanged in form. The conditioning
+nugget is added where the factorisation happens, to K~_c's own
+eigenvalues (`_eig_jitter`); its value is reported as today. Under
+`gpwidth='local'`, `'mass'`'s per-candidate kernel is built from a pair
+prefactor and a scaled-distance matrix cached once per fit (the fitted
+factor c cancels from the prefactor and enters the scaled distance only
+as a divisor), elementwise work per candidate as the global kernel
+already was; `'none'` keeps rebuilding the kernel from c*h_design_g
+every candidate, since the cached form reorders the floating point and
+is not byte-identical to that route. Cost is reported by the existing
+`ml_wall_time` product.
 """
 
 from __future__ import annotations
@@ -140,24 +152,24 @@ class InfluenceModel:
     ml_wall_time: np.ndarray       # (q,) wall time of the marginal-likelihood fit, per coordinate
     median_sigma: np.ndarray       # (q,) median posterior sd (sigma) over Z
     p95_sigma: np.ndarray          # (q,) 95th percentile posterior sd (sigma) over Z
-    chol_A: List[Optional[Tuple]]         # per coordinate, cho_factor of A_c = K_c + lam_c*I
-                                            # ('none') or K_c + lam_c*diag(1/m_tilde_j) ('mass');
-                                            # None on the constant path. Read at query time under
-                                            # 'mass' only (`_point_terms`, `bin_posterior_variance`).
     g_chol: List[Optional[Tuple]]         # per coordinate, cho_factor of G = Hb^T A_c^-1 Hb
-                                            # (None on the constant path); read at query time under
+                                            # ('none') or H~^T (K~_c+lam_c+jit_c*I)^-1 H~ ('mass');
+                                            # None on the constant path. Read at query time under
                                             # both routes.
-    ainv_hb: List[Optional[np.ndarray]]   # per coordinate, A_c^-1 Hb, (M_c, m_c) (None on the
-                                            # constant path). Read at query time under 'mass' only.
-    # Shared eigendecomposition K = V Lambda V^T at the chosen width,
-    # one `eigh` per coordinate group (same three objects across a
-    # group): k_eigval is Lambda clipped at 0, k_eigvec is V, hb_eig is
-    # V^T Hb. None on the constant path, and None everywhere under
-    # `fit_weights='mass'` (K_c + lam_c*diag(1/m_tilde_j) does not share
-    # one eigenbasis across lam_c the way K_c + lam_c*I does).
+    # Shared eigendecomposition at the chosen width, one `eigh` per
+    # coordinate GROUP (same three objects across a group): of K_c under
+    # `fit_weights='none'` (k_eigval is Lambda clipped at 0, k_eigvec is
+    # V, hb_eig is V^T Hb); of K~_c = D^-1/2 K_c D^-1/2 under 'mass'
+    # (spec/QIJ_mass_weighted_fit_spec.md 2; hb_eig is V^T H~, H~ =
+    # D^-1/2 Hb). None on the constant path.
     k_eigval: List[Optional[np.ndarray]]  # per coordinate, (M_c,)
     k_eigvec: List[Optional[np.ndarray]]  # per coordinate, (M_c, M_c)
     hb_eig: List[Optional[np.ndarray]]    # per coordinate, (M_c, m_c)
+    mass_dhalf: List[Optional[np.ndarray]]  # per coordinate, (M_c,) D^-1/2 = sqrt(m_tilde_j) over
+                                            # that coordinate's own finite design under
+                                            # `fit_weights='mass'`; None under 'none' and on the
+                                            # constant path. Rescales a query-time kernel row onto
+                                            # the group's K~_c eigenbasis (prototype axis only).
     # The cached posterior pass over Z (`_PointTerms`), set by `_point_terms`.
     _points: Optional[_PointTerms] = field(default=None, repr=False, compare=False)
 
@@ -181,10 +193,17 @@ def _whitening_from(Z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return mean, transform
 
 
+def _kappa(s: np.ndarray) -> np.ndarray:
+    """The Matern-3/2 radial factor (1 + s) exp(-s), shared by every
+    kernel form in this module (stationary, non-stationary, and the
+    non-stationary form's cached, c-independent route alike)."""
+    return (1.0 + s) * np.exp(-s)
+
+
 def _matern32(r: np.ndarray, ell: float) -> np.ndarray:
     """k_ell(r) = (1 + sqrt(3) r / ell) exp(-sqrt(3) r / ell)."""
     s = (_SQRT3 / ell) * r
-    return (1.0 + s) * np.exp(-s)
+    return _kappa(s)
 
 
 def _matern32_nonstationary(r: np.ndarray, ell_row: np.ndarray, ell_col: np.ndarray, d_z: int) -> np.ndarray:
@@ -207,6 +226,10 @@ def _matern32_nonstationary(r: np.ndarray, ell_row: np.ndarray, ell_col: np.ndar
     sum2 = ell_row ** 2 + ell_col ** 2
     pref = (2.0 * ell_row * ell_col / sum2) ** (d_z / 2.0)
     s = _SQRT3 * (r * _SQRT2 / np.sqrt(sum2))
+    # NOT `pref * _kappa(s)`: that regroups the three-way product
+    # (pref*(1+s))*exp(-s) into pref*((1+s)*exp(-s)), off by ~1 ULP --
+    # `gpwidth='local'`'s `fit_weights='none'` route must stay the exact
+    # grouping below.
     return pref * (1.0 + s) * np.exp(-s)
 
 
@@ -346,6 +369,27 @@ def _cholesky_with_jitter(A: np.ndarray, K: np.ndarray, M_used: int):
     )
 
 
+def _eig_jitter(Lambda: np.ndarray, lam: float, K: np.ndarray, M_used: int) -> float:
+    """
+    The conditioning nugget for the eigenvalue route under
+    `fit_weights='mass'` (spec/QIJ_mass_weighted_fit_spec.md 2): K is
+    K~_c, so K~_c + (lam + jitter)*I is positive definite iff
+    `Lambda.min() + lam + jitter > 0` exactly (Lambda is K~_c's own
+    spectrum) -- no trial factorization needed, unlike
+    `_cholesky_with_jitter`. Same escalation ladder, 0 ->
+    1e-10*trace(K)/M_used -> x10 -> x10 (at most three escalations).
+    Raises RuntimeError if it still fails.
+    """
+    base = 1e-10 * float(np.trace(K)) / M_used
+    min_eig = float(np.min(Lambda))
+    for j in (0.0, base, base * 10.0, base * 100.0):
+        if min_eig + lam + j > 0.0:
+            return float(j)
+    raise RuntimeError(
+        "influence_model.fit_influence_model: mass-weighted jitter escalation failed"
+    )
+
+
 def _within_1pct_log(x: float, lo: float, hi: float) -> bool:
     """Within 1% in log of either bound."""
     if not (np.isfinite(x) and x > 0.0):
@@ -393,50 +437,59 @@ def _mass_diag(p_g: np.ndarray) -> np.ndarray:
     return 1.0 / mtilde
 
 
-def _mass_reml_nll(
-    log_lam: float, K: np.ndarray, Hb_g: np.ndarray, psi_c: np.ndarray,
-    Dmat_g: np.ndarray, M_g: int, M_minus_m: int,
-) -> float:
+def _basis_projection(Hb: np.ndarray, M: int) -> Tuple[np.ndarray, np.ndarray, float]:
     """
-    The profiled REML negative log-likelihood at one candidate lam_c,
-    direct from A_c = K + lam_c*Dmat_g (spec/QIJ_mass_weighted_fit_
-    spec.md 2): the group's shared eigendecomposition diagonalizes
-    K + lam_c*I for every lam_c at once but not K + lam_c*D for a
-    non-scalar D, so this factors A_c by Cholesky at every candidate
-    lam_c instead (the build's stated route). Up to the additive
-    constant (M_minus_m/2)*(1+log(2*pi)), equal at every candidate and
-    so irrelevant to the search,
-
-        -2*l_R(lam_c) = log|A_c| + log|Hb^T A_c^-1 Hb|
-                        + M_minus_m*log(s2_hat),
-        s2_hat = resid^T A_c^-1 resid / M_minus_m, resid = psi_c - Hb*beta_hat
-
-    (Harville 1977's REML determinant identity; `_width_grid_candidate`'s
-    `'none'` formula is this same quantity reduced to the isotropic case
-    via its shared eigenbasis, not a different objective).
+    Q (M, M-m) spans Hb's orthogonal complement, W (M, m) its column
+    space, tau = 2M (method_notes section 3): A_param = (I-P) K_param
+    (I-P) + tau*P, P = W W^T, shares Q^T K_param Q's spectrum in
+    O(m M^2), not O(M^3). Used on the UNSCALED basis Hb_g (the
+    declared-noise floor's own projection, both `fit_weights` routes
+    alike) and, under `fit_weights='mass'`, again on the rescaled basis
+    H~ = D^-1/2 Hb_g (spec/QIJ_mass_weighted_fit_spec.md 2).
     """
-    lam = math.exp(log_lam)
-    A = K + lam * Dmat_g
-    chol, _jit = _cholesky_with_jitter(A, K, M_g)
-    AinvHb = cho_solve(chol, Hb_g)
-    G = Hb_g.T @ AinvHb
-    g_chol = cho_factor(G, lower=True)
-    Ainv_psi = cho_solve(chol, psi_c)
-    u_vec = Hb_g.T @ Ainv_psi
-    beta_c = cho_solve(g_chol, u_vec)
-    resid_quad = float(psi_c @ Ainv_psi - u_vec @ beta_c)
-    s2_val = max(max(resid_quad, 0.0) / M_minus_m, 1e-300)
-    logdet_A = 2.0 * float(np.sum(np.log(np.diag(chol[0]))))
-    logdet_G = 2.0 * float(np.sum(np.log(np.diag(g_chol[0]))))
-    return (M_minus_m / 2.0) * math.log(s2_val) + 0.5 * (logdet_A + logdet_G)
+    m = Hb.shape[1]
+    Qfull, _R = np.linalg.qr(Hb, mode='complete')
+    return Qfull[:, m:], Qfull[:, :m], 2.0 * float(M)
+
+
+@dataclass
+class _MassContext:
+    """
+    Per-group precomputed pieces for `fit_weights='mass'`
+    (spec/QIJ_mass_weighted_fit_spec.md 2), shared by every width
+    candidate and every coordinate in the group; None (the whole
+    context) under `fit_weights='none'`.
+
+    dhalf        (M_g,) D^-1/2 = sqrt(m_tilde_j).
+    Hb_tilde     (M_g, m_g) the rescaled mean basis H~ = dhalf[:,None]*Hb_g.
+    W_t, tau_t   H~'s own `_basis_projection`, mirroring the floor's
+                 (unscaled) W_g/tau_g.
+    ytilde_proj  per coordinate, Q_t's projection of dhalf*I_proto onto
+                 H~'s orthogonal complement (mirrors `psi_proj`).
+    logdet_D     Sum_j log(D_jj), the REML objective's constant term
+                 (section 2); the same for every width/lam candidate, so
+                 added once to the chosen candidate's own nll, not
+                 inside the search.
+    pref, rscaled  under `gpwidth='local'` only, the non-stationary
+                 kernel's c-independent prefactor and scaled-distance
+                 matrices (section 2); None under 'global'.
+    """
+
+    dhalf: np.ndarray
+    Hb_tilde: np.ndarray
+    W_t: np.ndarray
+    tau_t: float
+    ytilde_proj: Dict[int, np.ndarray]
+    logdet_D: float
+    pref: Optional[np.ndarray]
+    rscaled: Optional[np.ndarray]
 
 
 def _width_grid_candidate(
     log_param: float, gpwidth: str, D_full_g: np.ndarray, h_design_g: Optional[np.ndarray],
     d_z: int, W_g: np.ndarray, tau_g: float, M_minus_m: int,
     cols_g: Sequence[int], psi_proj: Dict[int, np.ndarray], n_c2_g: Dict[int, float],
-    fit_weights: str, Hb_g: Optional[np.ndarray], psi_full_g: Optional[Dict[int, np.ndarray]],
-    mass_diag_g: Optional[np.ndarray],
+    fit_weights: str, mass_ctx: Optional[_MassContext],
 ) -> Tuple[dict, float]:
     """
     One width/c-grid candidate's outer objective (method_notes section
@@ -448,21 +501,33 @@ def _width_grid_candidate(
     call's own wall time.
 
     `fit_weights='mass'` (spec/QIJ_mass_weighted_fit_spec.md 2) profiles
-    lam_c against A_c = K + lam_c*diag(1/m_tilde_j) by `_mass_reml_nll`'s
-    direct per-candidate Cholesky rather than this group's shared
-    projected `eigh`, which the declared-noise floor alone still uses
-    (the floor is unaffected by the mass weighting). `Hb_g`,
-    `psi_full_g` and `mass_diag_g` are unused, and may be None, under
+    lam_c against A_c = K + lam_c*diag(1/m_tilde_j) by the symmetric
+    rescaling K~ = D^-1/2 K D^-1/2: ONE extra `eigh`, of K~'s own
+    projected form (`mass_ctx`, built once per group), shared by every
+    lam_c and every coordinate exactly as the (always-computed) floor
+    eigh already is -- never a per-coordinate or per-lambda
+    factorization. The declared-noise floor (`_lambda_floor`) is
+    unaffected by the mass weighting and always reads the UNSCALED floor
+    eigenbasis, both routes alike. `mass_ctx` is None under
     `fit_weights='none'`.
     """
     t0 = time.perf_counter()
     param = math.exp(log_param)
     if gpwidth == 'global':
         K = _matern32(D_full_g, param)
-    else:
+    elif fit_weights == 'none':
         ell_vec = param * h_design_g
         K = _matern32_nonstationary(D_full_g, ell_vec, ell_vec, d_z)
+    else:
+        # The local kernel's c-independent pieces, cached once per fit
+        # (spec section 2): c enters only as the scaled distance's
+        # divisor. Elementwise work over the cached matrices, like the
+        # global kernel's per-candidate cost.
+        s = (_SQRT3 / param) * mass_ctx.rscaled
+        K = mass_ctx.pref * _kappa(s)
 
+    # The floor eigenbasis (always unscaled K/W_g/tau_g, spec section 5
+    # Q&A: the declared-noise floor does not change under 'mass').
     C = W_g.T @ K                      # (m_g, M_g)
     E = C @ W_g                        # (m_g, m_g)
     E[np.diag_indices_from(E)] += tau_g
@@ -473,8 +538,16 @@ def _width_grid_candidate(
     V = V[:, :M_minus_m]
 
     if fit_weights == 'mass':
-        M_g = D_full_g.shape[0]
-        Dmat_g = np.diag(mass_diag_g)
+        dhalf, W_t, tau_t = mass_ctx.dhalf, mass_ctx.W_t, mass_ctx.tau_t
+        K_t = dhalf[:, None] * K * dhalf[None, :]
+        Ct = W_t.T @ K_t
+        Et = Ct @ W_t
+        Et[np.diag_indices_from(Et)] += tau_t
+        WCt = W_t @ Ct
+        At = K_t - WCt - WCt.T + W_t @ (Et @ W_t.T)
+        Lambda_t, V_t = np.linalg.eigh(At)
+        Lambda_t = np.maximum(Lambda_t[:M_minus_m], 0.0)
+        V_t = V_t[:, :M_minus_m]
 
     per_c: Dict[int, dict] = {}
     total_nll = 0.0
@@ -488,15 +561,15 @@ def _width_grid_candidate(
         lo_bound = max(math.log(lam_floor_c), _LOG_LAM_LO)
 
         if fit_weights == 'none':
-            def inner(log_lam: float, _z=z, _Lambda=Lambda) -> float:
-                denom = _Lambda + math.exp(log_lam)
-                s2_val = np.sum(_z ** 2 / denom) / M_minus_m
-                s2_val = max(s2_val, 1e-300)
-                return (M_minus_m / 2.0) * math.log(s2_val) + 0.5 * np.sum(np.log(denom))
+            z_obj, Lambda_obj = z, Lambda
         else:
-            def inner(log_lam: float, _K=K, _Hb=Hb_g, _psi=psi_full_g[c], _D=Dmat_g,
-                       _Mg=M_g) -> float:
-                return _mass_reml_nll(log_lam, _K, _Hb, _psi, _D, _Mg, M_minus_m)
+            z_obj, Lambda_obj = V_t.T @ mass_ctx.ytilde_proj[c], Lambda_t
+
+        def inner(log_lam: float, _z=z_obj, _Lambda=Lambda_obj) -> float:
+            denom = _Lambda + math.exp(log_lam)
+            s2_val = np.sum(_z ** 2 / denom) / M_minus_m
+            s2_val = max(s2_val, 1e-300)
+            return (M_minus_m / 2.0) * math.log(s2_val) + 0.5 * np.sum(np.log(denom))
 
         if lo_bound >= _LOG_LAM_HI:
             # The floor already pins lam_c at the ceiling: nothing to search.
@@ -506,6 +579,12 @@ def _width_grid_candidate(
             ir = minimize_scalar(inner, bounds=(lo_bound, _LOG_LAM_HI), method='bounded')
             log_lam_star = float(ir.x)
             nll_c = float(ir.fun)
+        if fit_weights == 'mass':
+            # The REML objective's constant term (section 2): the same
+            # for every width/lam candidate, so it never moves an
+            # argmin -- added here only so `nll` is the full REML
+            # quantity (Sum_j log(D_jj) included).
+            nll_c += 0.5 * mass_ctx.logdet_D
         per_c[c] = dict(log_lam=log_lam_star, nll=nll_c, lam_floor=lam_floor_c)
         total_nll += nll_c
 
@@ -541,8 +620,10 @@ def fit_influence_model(
     e_j ~ N(0, s^2 lam_c / m_tilde_j) at coordinate c's own finite
     design, so A_c = K_c + lam_c*diag(1/m_tilde_j) in place of
     K_c + lam_c*I in both the profiled marginal likelihood
-    (`_width_grid_candidate`, `_mass_reml_nll`) and the posterior
-    (`_point_terms`, `bin_posterior_variance`).
+    (`_width_grid_candidate`) and the posterior (`_point_terms`,
+    `bin_posterior_variance`), by the symmetric rescaling K~_c =
+    D^-1/2 K_c D^-1/2 (section 2): the group's own shared-eigendecomposition
+    route serves both, on K~_c in place of K_c.
 
     A prototype whose evaluation failed for coordinate c is a missing
     response: coordinate c's design is exactly the prototypes where
@@ -553,10 +634,12 @@ def fit_influence_model(
     `xvq.centers` are prototype positions in Z's native (unwhitened)
     coordinates; whitened here with the SAME transform derived from Z,
     so a coordinate's design lands in the space `psi0`/`uncertainty`
-    query in. Cost: O(M_X_used^3), independent of N under `'none'`;
-    under `'mass'` the width/lam search pays one Cholesky of A_c per
-    candidate lam_c rather than one shared `eigh` per width candidate
-    (measured and reported as `ml_wall_time`).
+    query in. Cost: O(M_X_used^3), independent of N, under either
+    `fit_weights` route -- `'mass'` pays one or two extra `eigh`s per
+    width candidate (the search) and one extra full `eigh` per group
+    (the posterior/query cache) over `'none'`'s own, never a
+    per-coordinate or per-lambda factorization (measured and reported as
+    `ml_wall_time`).
 
     With a `pool`, every group's five grid candidates run as pool tasks
     submitted together (the bounded refinement stays serial: method_
@@ -609,12 +692,11 @@ def fit_influence_model(
     n_width_evals = np.zeros(q, dtype=int)
     ml_wall_time = np.zeros(q, dtype=float)
 
-    chol_A: List[Optional[tuple]] = [None] * q
     g_chol: List[Optional[tuple]] = [None] * q
-    ainv_hb: List[Optional[np.ndarray]] = [None] * q
     k_eigval: List[Optional[np.ndarray]] = [None] * q
     k_eigvec: List[Optional[np.ndarray]] = [None] * q
     hb_eig: List[Optional[np.ndarray]] = [None] * q
+    mass_dhalf: List[Optional[np.ndarray]] = [None] * q
 
     groups: Dict[tuple, List[int]] = {}
     for c in range(q):
@@ -681,15 +763,12 @@ def fit_influence_model(
 
         grid_log_param = np.linspace(math.log(param_min), math.log(param_max), _N_WIDTH_GRID)
 
-        Qfull, _R = np.linalg.qr(Hb_g, mode='complete')
-        Q = Qfull[:, m_g:]
+        # Q/W_g/tau_g project out the UNSCALED mean basis (method_notes
+        # section 3); the declared-noise floor always reads this
+        # projection, both `fit_weights` routes alike (spec/
+        # QIJ_mass_weighted_fit_spec.md 5).
+        Q, W_g, tau_g = _basis_projection(Hb_g, M_g)
         M_minus_m = M_g - m_g
-
-        # A_param = (I-P) K_param (I-P) + tau*P, P = W W^T, gives the
-        # same spectrum as Q^T K_param Q in O(m_g M_g^2), not O(M_g^3)
-        # (derivation: spec/method_notes.md section 3).
-        W_g = Qfull[:, :m_g]
-        tau_g = 2.0 * float(M_g)
         psi_proj = {c: Q @ (Q.T @ I_proto[idx_g, c]) for c in cols_g}
 
         # n_c^2 = 2*eta^2*theta_Q,c^2*median_j(1/t_j^2), independent of
@@ -699,26 +778,40 @@ def fit_influence_model(
         inv_t2_median_g = float(np.median(1.0 / t_g ** 2))
         n_c2_g = {c: 2.0 * eta ** 2 * float(theta_Q[c]) ** 2 * inv_t2_median_g for c in cols_g}
 
-        # fit_weights='mass' (spec/QIJ_mass_weighted_fit_spec.md 2):
-        # m_tilde_j is the same for every coordinate in this group
-        # (they share idx_g), so the diagonal multiplier and the raw
-        # (unprojected) psi columns it is used against are built once
-        # per group; both are None, unused, under 'none'.
+        # fit_weights='mass' (spec/QIJ_mass_weighted_fit_spec.md 2): the
+        # group's own rescaling D^-1/2 and every piece built from it (the
+        # rescaled basis, its own orthogonal-complement projection, the
+        # rescaled response projections, the REML objective's constant
+        # term, and, under 'local', the kernel's c-independent prefactor/
+        # scaled-distance pieces) are shared by every width candidate and
+        # every coordinate in the group; None under 'none'.
+        mass_ctx = None
         if fit_weights == 'mass':
             mass_diag_g = _mass_diag(p_g)
-            psi_full_g = {c: I_proto[idx_g, c] for c in cols_g}
-        else:
-            mass_diag_g = None
-            psi_full_g = None
+            dhalf_g = mass_diag_g ** -0.5
+            Hb_tilde_g = dhalf_g[:, None] * Hb_g
+            Q_t, W_t, tau_t = _basis_projection(Hb_tilde_g, M_g)
+            ytilde_proj_g = {c: Q_t @ (Q_t.T @ (dhalf_g * I_proto[idx_g, c])) for c in cols_g}
+            logdet_D_g = float(np.sum(np.log(mass_diag_g)))
+            if gpwidth == 'local':
+                h_row = h_design_g.reshape(-1, 1)
+                h_col = h_design_g.reshape(1, -1)
+                H2_g = h_row ** 2 + h_col ** 2
+                pref_g = (2.0 * h_row * h_col / H2_g) ** (d_z / 2.0)
+                rscaled_g = D_full_g * _SQRT2 / np.sqrt(H2_g)
+            else:
+                pref_g = rscaled_g = None
+            mass_ctx = _MassContext(dhalf=dhalf_g, Hb_tilde=Hb_tilde_g, W_t=W_t, tau_t=tau_t,
+                                     ytilde_proj=ytilde_proj_g, logdet_D=logdet_D_g,
+                                     pref=pref_g, rscaled=rscaled_g)
 
         gi = len(group_ctx)
         group_ctx.append((idx_g, M_g, centers_g, m_g, Hb_g, D_full_g, h_design_g,
                            param_min, param_max, grid_log_param, W_g, tau_g, M_minus_m,
-                           cols_g, psi_proj, n_c2_g, mass_diag_g, psi_full_g))
+                           cols_g, psi_proj, n_c2_g, mass_ctx))
         for lp in grid_log_param:
             tasks.append((float(lp), gpwidth, D_full_g, h_design_g, d_z, W_g, tau_g,
-                          M_minus_m, cols_g, psi_proj, n_c2_g,
-                          fit_weights, Hb_g, psi_full_g, mass_diag_g))
+                          M_minus_m, cols_g, psi_proj, n_c2_g, fit_weights, mass_ctx))
             task_group.append(gi)
 
     # Every group's five grid candidates -- independent of each other
@@ -746,19 +839,18 @@ def fit_influence_model(
     # the outer objective is the SUM of the group's per-coordinate
     # profiled restricted NLLs.
     for gi, (idx_g, M_g, centers_g, m_g, Hb_g, D_full_g, h_design_g, param_min, param_max,
-             grid_log_param, W_g, tau_g, M_minus_m, cols_g, psi_proj, n_c2_g, mass_diag_g,
-             psi_full_g) in enumerate(group_ctx):
+             grid_log_param, W_g, tau_g, M_minus_m, cols_g, psi_proj, n_c2_g,
+             mass_ctx) in enumerate(group_ctx):
         t_shared0 = time.perf_counter()
         trace = traces[gi]
 
         def outer_obj(log_param: float, _trace=trace, _cols_g=cols_g,
                        _psi_proj=psi_proj, _W=W_g, _tau=tau_g, _M_minus_m=M_minus_m,
                        _n_c2=n_c2_g, _gpwidth=gpwidth, _D=D_full_g, _h=h_design_g,
-                       _dz=d_z, _fit_weights=fit_weights, _Hb=Hb_g, _psi_full=psi_full_g,
-                       _mass_diag=mass_diag_g) -> float:
+                       _dz=d_z, _fit_weights=fit_weights, _mass_ctx=mass_ctx) -> float:
             entry, _wall = _width_grid_candidate(
                 log_param, _gpwidth, _D, _h, _dz, _W, _tau, _M_minus_m, _cols_g, _psi_proj, _n_c2,
-                _fit_weights, _Hb, _psi_full, _mass_diag)
+                _fit_weights, _mass_ctx)
             _trace.append(entry)
             return entry['nll']
 
@@ -797,39 +889,63 @@ def fit_influence_model(
             Lambda_K, V_K = np.linalg.eigh(K_c)
             Lambda_K = np.maximum(Lambda_K, 0.0)
             HbV_g = V_K.T @ Hb_g
-            noise_mat_g = np.eye(M_g)
+            dhalf_g = Hb_tilde_g = None
         else:
-            # No shared eigenbasis under a non-scalar noise diagonal
-            # (spec/QIJ_mass_weighted_fit_spec.md 2): query time reads
-            # each coordinate's own `chol_A`/`ainv_hb` instead.
-            Lambda_K = V_K = HbV_g = None
-            noise_mat_g = np.diag(mass_diag_g)
+            # fit_weights='mass' (spec/QIJ_mass_weighted_fit_spec.md 2):
+            # the SAME shared-eigendecomposition role, of K~_c = D^-1/2
+            # K_c D^-1/2 in place of K_c, serves both the final solve
+            # below and the query-time cache -- no per-coordinate
+            # Cholesky anywhere in this route.
+            dhalf_g = mass_ctx.dhalf
+            Hb_tilde_g = mass_ctx.Hb_tilde
+            K_tilde_c = dhalf_g[:, None] * K_c * dhalf_g[None, :]
+            Lambda_K, V_K = np.linalg.eigh(K_tilde_c)
+            Lambda_K = np.maximum(Lambda_K, 0.0)
+            HbV_g = V_K.T @ Hb_tilde_g
 
         # Per-coordinate final solve (A_c depends on lam_c).
         for c in cols_g:
             t0 = time.perf_counter()
-            psi_c = I_proto[idx_g, c]
             lam_c = math.exp(best['per_c'][c]['log_lam'])
             lam_floor_final = best['per_c'][c]['lam_floor']
 
-            A = K_c + lam_c * noise_mat_g
-            chol, jit = _cholesky_with_jitter(A, K_c, M_g)
-
-            AinvHb_c = cho_solve(chol, Hb_g)
-            G = Hb_g.T @ AinvHb_c
-            G_chol_c = cho_factor(G, lower=True)
-
-            Ainv_psi = cho_solve(chol, psi_c)
-            u_vec = Hb_g.T @ Ainv_psi
-            beta_c = cho_solve(G_chol_c, u_vec)
-            alpha_c = Ainv_psi - AinvHb_c @ beta_c
+            if fit_weights == 'none':
+                psi_c = I_proto[idx_g, c]
+                A = K_c + lam_c * np.eye(M_g)
+                chol, jit = _cholesky_with_jitter(A, K_c, M_g)
+                AinvHb_c = cho_solve(chol, Hb_g)
+                G = Hb_g.T @ AinvHb_c
+                G_chol_c = cho_factor(G, lower=True)
+                Ainv_psi = cho_solve(chol, psi_c)
+                u_vec = Hb_g.T @ Ainv_psi
+                beta_c = cho_solve(G_chol_c, u_vec)
+                alpha_c = Ainv_psi - AinvHb_c @ beta_c
+                resid_quad = float(psi_c @ Ainv_psi - u_vec @ beta_c)
+            else:
+                # The rescaled posterior (spec/QIJ_mass_weighted_fit_
+                # spec.md 2): beta by GLS in y~ = D^-1/2*psi_c, H~; alpha
+                # = D^-1/2*(K~+lam+jit*I)^-1*(y~-H~ beta); the unscaled
+                # k(x) is used only at query time, never here. The
+                # conditioning nugget is added to K~_c's own eigenvalues
+                # (`_eig_jitter`), not to a factored matrix.
+                y_c = dhalf_g * I_proto[idx_g, c]
+                jit = _eig_jitter(Lambda_K, lam_c, K_tilde_c, M_g)
+                w_c = 1.0 / (Lambda_K + lam_c + jit)
+                AinvHb_c = V_K @ (w_c[:, None] * HbV_g)
+                G = Hb_tilde_g.T @ AinvHb_c
+                G_chol_c = cho_factor(G, lower=True)
+                Ainv_y = V_K @ (w_c * (V_K.T @ y_c))
+                u_vec = Hb_tilde_g.T @ Ainv_y
+                beta_c = cho_solve(G_chol_c, u_vec)
+                alpha_tilde_c = Ainv_y - AinvHb_c @ beta_c
+                alpha_c = dhalf_g * alpha_tilde_c
+                resid_quad = float(y_c @ Ainv_y - u_vec @ beta_c)
 
             # denom_m = M_g - m_g is always > 0 here: every coordinate
             # in this group left the constant path, which requires
             # M_g >= 3, and m_g is 1 (M_g <= m_full+1) or m_full
             # (M_g > m_full+1) -- either way M_g - m_g >= 2.
             denom_m = M_g - m_g
-            resid_quad = float(psi_c @ Ainv_psi - u_vec @ beta_c)
             s2_c = max(resid_quad, 0.0) / denom_m
 
             centers[c] = centers_g
@@ -852,12 +968,11 @@ def fit_influence_model(
             # when active, moves the lower edge.
             at_bound[c, 1] = _within_1pct_log(lam_c, max(lam_floor_final, 1e-10), 1e2)
 
-            chol_A[c] = chol
             g_chol[c] = G_chol_c
-            ainv_hb[c] = AinvHb_c
             k_eigval[c] = Lambda_K
             k_eigvec[c] = V_K
             hb_eig[c] = HbV_g
+            mass_dhalf[c] = dhalf_g
 
             ml_wall_time[c] = t_shared_share + (time.perf_counter() - t0)
 
@@ -887,12 +1002,11 @@ def fit_influence_model(
         ml_wall_time=ml_wall_time,
         median_sigma=np.zeros(q, dtype=float),
         p95_sigma=np.zeros(q, dtype=float),
-        chol_A=chol_A,
         g_chol=g_chol,
-        ainv_hb=ainv_hb,
         k_eigval=k_eigval,
         k_eigvec=k_eigvec,
         hb_eig=hb_eig,
+        mass_dhalf=mass_dhalf,
     )
 
     preds = psi0(model, Z)
@@ -938,12 +1052,15 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
     `_matern32` at the group's shared ell.
 
     Under `fit_weights='mass'` (spec/QIJ_mass_weighted_fit_spec.md 2)
-    sigma and R come from each coordinate's own Cholesky solve against
-    `model.chol_A`/`model.ainv_hb` rather than the group's shared
-    eigendecomposition: A_c = K_c + lam_c*diag(1/m_tilde_j) does not
-    share one eigenbasis across the group's coordinates the way
-    K_c + lam_c*I does. psi0 is unaffected either way (`model.alpha`/
-    `model.beta` already encode whichever A_c was fitted).
+    `k_eigval`/`k_eigvec`/`hb_eig` hold the group's shared
+    eigendecomposition of K~_c = D^-1/2 K_c D^-1/2 rather than of K_c
+    itself, so the SAME eigenvalue-vector code below serves both
+    routes; only the kernel rows fed into the eigen-projection are
+    rescaled by D^-1/2 on the prototype axis first (`model.mass_dhalf`),
+    since a query point carries no mass weight of its own. psi0 is
+    unaffected either way (`model.alpha`/`model.beta` already encode
+    whichever A_c was fitted, and k(x) there is always the unscaled
+    kernel).
     """
     cached = model._points
     if cached is not None and cached.Z is Z:
@@ -978,23 +1095,26 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
             c_val_g = float(model.c[c0])
             h_col_g = c_val_g * model.h_design[c0]
 
+        dhalf_g = model.mass_dhalf[c0]  # None under 'none'
+
         for c in cols:
             R_out[c] = np.empty((N, m_g), dtype=float)
 
-        if model.fit_weights == 'none':
-            V_K = model.k_eigvec[c0]
-            Lambda_K = model.k_eigval[c0]
-            HbV_g = model.hb_eig[c0]
-            # Per-coordinate constants of the eigen form: w_c = 1 /
-            # (Lambda + lam_c + jit_c) is A_c^-1's spectrum, and B_c =
-            # (V^T Hb) scaled by it turns the affine-mean correction into
-            # one (nb, M) x (M, m) product against the shared P.
-            w_by_c = {}
-            B_by_c = {}
-            for c in cols:
-                w_c = 1.0 / (Lambda_K + float(model.lam[c]) + float(model.jitter[c]))
-                w_by_c[c] = w_c
-                B_by_c[c] = HbV_g * w_c[:, None]
+        # The shared eigenbasis -- of K under 'none', of K~ under 'mass'
+        # (spec/QIJ_mass_weighted_fit_spec.md 2) -- turns every
+        # coordinate's A_c^-1 into one eigenvalue-vector operation: w_c =
+        # 1/(Lambda+lam_c+jit_c), and B_c = (V^T H) scaled by it turns
+        # the affine-mean correction into one (nb, M) x (M, m) product
+        # against the shared P below.
+        V_K = model.k_eigvec[c0]
+        Lambda_K = model.k_eigval[c0]
+        HbV_g = model.hb_eig[c0]
+        w_by_c = {}
+        B_by_c = {}
+        for c in cols:
+            w_c = 1.0 / (Lambda_K + float(model.lam[c]) + float(model.jitter[c]))
+            w_by_c[c] = w_c
+            B_by_c[c] = HbV_g * w_c[:, None]
 
         for start in range(0, N, batch):
             sl = slice(start, start + batch)
@@ -1009,40 +1129,26 @@ def _point_terms(model: InfluenceModel, Z: np.ndarray) -> _PointTerms:
             for c in cols:
                 psi0_out[sl, c] = Hc @ model.beta[c] + Kc @ model.alpha[c]
 
-            if model.fit_weights == 'none':
-                Pc = Kc @ V_K  # (nb, M_g); ONE product for every output
-                for c in cols:
-                    Rc = Hc - Pc @ B_by_c[c]  # (nb, m_g)
-                    R_out[c][sl] = Rc
+            # The eigenbasis projection reads the RESCALED kernel row
+            # k~(x, w) = D^-1/2 k(x, w) under 'mass' (prototype axis
+            # only); Kc itself, unscaled, under 'none' (dhalf_g is None
+            # there, so this is Kc @ V_K exactly as before).
+            Pc = (Kc * dhalf_g[None, :] if dhalf_g is not None else Kc) @ V_K  # (nb, M_g)
+            for c in cols:
+                Rc = Hc - Pc @ B_by_c[c]  # (nb, m_g)
+                R_out[c][sl] = Rc
 
-                # Pc^2 goes into Kc's buffer: Kc has done its work above
-                # and the two have identical shape, so the pass holds two
-                # (nb, M_g) arrays at a time.
-                np.multiply(Pc, Pc, out=Kc)
-                for c in cols:
-                    term1 = Kc @ w_by_c[c]
-                    Rc = R_out[c][sl]
-                    GinvRcT = cho_solve(model.g_chol[c], Rc.T)  # (m_c, nb)
-                    term2 = np.einsum('ij,ji->i', Rc, GinvRcT)
-                    sigma2 = model.s2[c] * (1.0 - term1 + term2)
-                    sigma2 = np.maximum(sigma2, 0.0)
-                    sigma_out[sl, c] = np.sqrt(sigma2)
-            else:
-                # No shared eigenbasis under a non-scalar noise diagonal
-                # (spec/QIJ_mass_weighted_fit_spec.md 2): each
-                # coordinate solves its own A_c, via the stored
-                # `chol_A`/`ainv_hb`/`g_chol`, against this same row
-                # chunk's kernel rows (E4: bounded by `batch`, never N).
-                for c in cols:
-                    Rc = Hc - Kc @ model.ainv_hb[c]  # (nb, m_g)
-                    R_out[c][sl] = Rc
-                    AinvKcT = cho_solve(model.chol_A[c], Kc.T)  # (M_g, nb)
-                    term1 = np.einsum('ij,ji->i', Kc, AinvKcT)
-                    GinvRcT = cho_solve(model.g_chol[c], Rc.T)  # (m_c, nb)
-                    term2 = np.einsum('ij,ji->i', Rc, GinvRcT)
-                    sigma2 = model.s2[c] * (1.0 - term1 + term2)
-                    sigma2 = np.maximum(sigma2, 0.0)
-                    sigma_out[sl, c] = np.sqrt(sigma2)
+            # Pc squared in place: Pc has done its work above, no need
+            # for a third (nb, M_g) buffer.
+            np.multiply(Pc, Pc, out=Pc)
+            for c in cols:
+                term1 = Pc @ w_by_c[c]
+                Rc = R_out[c][sl]
+                GinvRcT = cho_solve(model.g_chol[c], Rc.T)  # (m_c, nb)
+                term2 = np.einsum('ij,ji->i', Rc, GinvRcT)
+                sigma2 = model.s2[c] * (1.0 - term1 + term2)
+                sigma2 = np.maximum(sigma2, 0.0)
+                sigma_out[sl, c] = np.sqrt(sigma2)
 
     terms = _PointTerms(Z=Z, Zw=Zw, psi0=psi0_out, sigma=sigma_out, R=R_out)
     model._points = terms
@@ -1125,13 +1231,14 @@ def bin_posterior_variance(
     sides so no block larger than 2048 x 2048 is ever materialized.
 
     `s^T A^-1 s` is taken through the group's shared eigendecomposition
-    under `fit_weights='none'` (never a Cholesky solve of A_c there):
-    v_k is a difference of two nearly equal quantities, and using the
-    same factorisation of A_c^-1 that `sigma_c` was built from on both
-    sides of the subtraction keeps the cancellation clean. Under
-    `'mass'` there is no shared eigenbasis (spec/QIJ_mass_weighted_fit_
-    spec.md 2), so `s^T A_c^-1 s` is one Cholesky solve of the stored
-    `chol_A[coordinate]` against the single (M,) vector `s`.
+    under BOTH routes (never a Cholesky solve of A_c): v_k is a
+    difference of two nearly equal quantities, and using the same
+    factorisation of A_c^-1 that `sigma_c` was built from on both sides
+    of the subtraction keeps the cancellation clean. Under `'mass'`
+    (spec/QIJ_mass_weighted_fit_spec.md 2) `s` -- itself a sum of
+    unscaled kernel rows on the prototype axis -- is rescaled by D^-1/2
+    first, matching `_point_terms`'s own kernel-row rescaling, before
+    projecting onto the group's K~_c eigenbasis.
 
     Returns 0.0 for a group of size <= 1, and 0.0 for every group when
     `model.constant_path[coordinate]` is true. Clipped at 0 from below.
@@ -1160,9 +1267,9 @@ def bin_posterior_variance(
     g_chol_c = model.g_chol[c]
     centers_c = model.centers[c]
     M = centers_c.shape[0]
-    if model.fit_weights == 'none':
-        V_K = model.k_eigvec[c]
-        w_c = 1.0 / (model.k_eigval[c] + float(model.lam[c]) + float(model.jitter[c]))
+    V_K = model.k_eigvec[c]
+    w_c = 1.0 / (model.k_eigval[c] + float(model.lam[c]) + float(model.jitter[c]))
+    dhalf_c = model.mass_dhalf[c]  # None under 'none'
 
     is_local = model.gpwidth == 'local'
     if is_local:
@@ -1216,11 +1323,9 @@ def bin_posterior_variance(
                 SS_k += float(Kcc.sum())
 
         R_vec = R_full[idx].sum(axis=0)
-        if model.fit_weights == 'none':
-            Vt_s = s_vec @ V_K
-            quad_A = float(np.sum(Vt_s ** 2 * w_c))
-        else:
-            quad_A = float(s_vec @ cho_solve(model.chol_A[c], s_vec))
+        s_for_eig = s_vec * dhalf_c if dhalf_c is not None else s_vec
+        Vt_s = s_for_eig @ V_K
+        quad_A = float(np.sum(Vt_s ** 2 * w_c))
         Ginv_R = cho_solve(g_chol_c, R_vec)
         mean_Sigma = (s2_c / (n_k ** 2)) * (SS_k - quad_A + R_vec @ Ginv_R)
 
