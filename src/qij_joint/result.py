@@ -123,6 +123,10 @@ class QIJResult:
     psi0: np.ndarray               # (N, q)
     sigma: np.ndarray              # (N, q)
     psi_hat: np.ndarray            # (N, q); under ivqbins='joint', core.joint.joint_psi_hat's field
+                                    # (joint_mode='staged') or core.seed.run_seeded's own updated
+                                    # state (joint_mode='seeded')
+    sd_hat: np.ndarray              # (N, q); joint_mode='seeded' only (spec/QIJ_seeded_measured_
+                                    # tree_spec.md section 2), NaN otherwise
     bin_label: np.ndarray          # (N, q) int; -1 under ivqbins='joint'
     bin_U: Tuple[np.ndarray, ...]  # per output (L_c, q); every measured output's
                                     # derivative on this output's own final bins
@@ -136,6 +140,8 @@ class QIJResult:
     prototype_h: np.ndarray        # (M,) local CONN spacing; NaN under gpwidth='global'
     ivqbins: str                   # 'marginal' or 'joint' (method_notes joint section)
     survey: str                    # 'points' or 'moments' (method_notes section 2)
+    joint_mode: str                 # 'staged' or 'seeded' (spec/QIJ_seeded_measured_tree_spec.md);
+                                    # inert (but recorded) under ivqbins='marginal'
     joint_S_pred: np.ndarray       # (q,) predicted within share at end of growth; NaN under 'marginal'
     joint_a: np.ndarray            # (q,) the check's fitted scale factor; NaN under 'marginal'
     joint_S_pred_pre_lloyd: np.ndarray  # (q,); NaN under 'marginal' or when the Lloyd pass did not run
@@ -168,6 +174,26 @@ class QIJResult:
     joint_bin_flagged: np.ndarray  # (L,) bool; empty under 'marginal'
     joint_bin_label: np.ndarray    # (N,) int; -1 under 'marginal'
     joint_busy_delta: float        # 0.0 under 'marginal'
+    # joint_mode='seeded' only (spec/QIJ_seeded_measured_tree_spec.md
+    # sections 3-5); 0/NaN/empty under 'staged' (and under 'marginal').
+    joint_seed_K_zador: int         # section 3.1, unclipped Zador count
+    joint_seed_K: int               # section 3.1, clipped
+    joint_seed_L: int               # K': the seed partition's own bin count (section 3.2)
+    joint_seed_reweight_passes: int  # section 3.2
+    joint_seed_S_pred: np.ndarray   # (q,) section 3.2
+    joint_seed_centering_residual: np.ndarray  # (q,) section 3.3, in units of sqrt(V_btw)
+    joint_seed_lambda: np.ndarray   # (2,) section 3.1, NaN-padded at d_eff=1
+    joint_evals_seed: int           # section 5
+    joint_evals_tree: int           # section 5
+    joint_n_closed_infeasible: int  # section 4/5: infeasible two-means OR a failed split evaluation
+    joint_n_update_scale: np.ndarray   # (q,) int, section 3.3/8
+    joint_n_update_shift: np.ndarray   # (q,) int, section 3.3/8
+    joint_n_update_negative_scale: np.ndarray  # (q,) int, section 8
+    joint_tree_centering_drift: np.ndarray  # (q,) section 4, in units of sqrt(V_btw) at termination
+    joint_n_closed_hot: int         # section 4: one-miss-closed bins still over eps/L at termination
+    joint_V_win_closed: np.ndarray  # (q,) section 4
+    joint_n_open_per_round: np.ndarray  # (n_rounds,) int, section 5/6: the parallel width of each round
+    joint_split_noise: Dict[str, np.ndarray]  # section 4: one entry per split (array product)
     a: np.ndarray                  # (q,) ABC acceleration (spec/QIJ_mods_waves.md A10)
     b_hat: np.ndarray              # (q,) ABC second-order bias (A10)
     c_q: np.ndarray                # (q,) ABC curvature-along-influence, survey-row evaluated (A10)

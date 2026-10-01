@@ -171,7 +171,7 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     recorded whether or not it is inert (`pilot='affine'`)."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
-           'fit_weights': res.fit_weights,
+           'joint_mode': res.joint_mode, 'fit_weights': res.fit_weights,
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
@@ -198,6 +198,18 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['n_closed_unpaid'] = int(res.joint_n_closed_unpaid)
     row['n_closed_unflagged'] = int(res.joint_n_closed_unflagged)
     row['n_noise_floored'] = int(res.joint_n_noise_floored)
+    # joint_mode='seeded' only (spec/QIJ_seeded_measured_tree_spec.md
+    # section 5); 0/NaN under 'staged'.
+    row['seed_K_zador'] = int(res.joint_seed_K_zador)
+    row['seed_K'] = int(res.joint_seed_K)
+    row['seed_L'] = int(res.joint_seed_L)
+    row['seed_reweight_passes'] = int(res.joint_seed_reweight_passes)
+    row['seed_lambda_1'] = float(res.joint_seed_lambda[0])
+    row['seed_lambda_2'] = float(res.joint_seed_lambda[1])
+    row['evals_seed'] = int(res.joint_evals_seed)
+    row['evals_tree'] = int(res.joint_evals_tree)
+    row['n_closed_infeasible'] = int(res.joint_n_closed_infeasible)
+    row['n_closed_hot'] = int(res.joint_n_closed_hot)
     # The sigma-points stage (spec/QIJ_sigma_points_spec.md 3): its own
     # 'sigma' stage entry (outside the loop above, whose own product
     # names -- 'wall_sigma', not 'wall_time_sigma' -- differ from the
@@ -241,6 +253,15 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'sigma_bias_{o}'] = float(res.sigma_bias[j])
         row[f'lo_sigma_{o}'] = float(lo_sigma[j])
         row[f'hi_sigma_{o}'] = float(hi_sigma[j])
+        # joint_mode='seeded' only (spec/QIJ_seeded_measured_tree_spec.md
+        # sections 3.3/4/5); NaN/0 under 'staged'.
+        row[f'seed_S_pred_{o}'] = float(res.joint_seed_S_pred[j])
+        row[f'seed_centering_residual_{o}'] = float(res.joint_seed_centering_residual[j])
+        row[f'n_update_scale_{o}'] = int(res.joint_n_update_scale[j])
+        row[f'n_update_shift_{o}'] = int(res.joint_n_update_shift[j])
+        row[f'n_update_negative_scale_{o}'] = int(res.joint_n_update_negative_scale[j])
+        row[f'tree_centering_drift_{o}'] = float(res.joint_tree_centering_drift[j])
+        row[f'V_win_closed_{o}'] = float(res.joint_V_win_closed[j])
     return row
 
 
@@ -261,12 +282,17 @@ def _qij_points(res) -> pd.DataFrame:
     psi_hat_<o>, bin_label_<o>` under `ivqbins='marginal'`; under
     `'joint'` a single shared `bin_label` in place of the per-output
     labels, since every output shares one partition
-    (spec/method_notes.md section 6)."""
+    (spec/method_notes.md section 6). Under `joint_mode='seeded'`
+    (spec/QIJ_seeded_measured_tree_spec.md section 5), `sd_hat_<o>`
+    replaces `sigma_<o>` -- the method's own reported uncertainty on
+    this mode, not the pilot's raw posterior sd."""
     N = res.psi0.shape[0]
     data = {'i': np.arange(N), 'bmu': np.asarray(res.bmu, dtype=np.int32)}
+    seeded = res.ivqbins == 'joint' and res.joint_mode == 'seeded'
     for j, o in enumerate(res.outputs):
         data[f'psi0_{o}'] = res.psi0[:, j]
-        data[f'sigma_{o}'] = res.sigma[:, j]
+        data[f'sd_hat_{o}' if seeded else f'sigma_{o}'] = (
+            res.sd_hat[:, j] if seeded else res.sigma[:, j])
         data[f'psi_hat_{o}'] = res.psi_hat[:, j]
         if res.ivqbins == 'marginal':
             data[f'bin_label_{o}'] = np.asarray(res.bin_label[:, j], dtype=np.int32)
@@ -352,6 +378,29 @@ def _qij_cells(res) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _qij_split_noise(res) -> pd.DataFrame:
+    """`split_noise` for every `joint_mode='seeded'` draw (spec/
+    QIJ_seeded_measured_tree_spec.md section 4, 'The per-split identity'):
+    one row per split, `split_id, parent_mass, mass_small, mass_large,
+    t_parent, t_small, t_large, delta_<o>`; `res.joint_split_noise`
+    (`core.seed._split_noise_arrays`'s own dict of arrays)."""
+    sn = res.joint_split_noise
+    data = {k: sn[k] for k in
+            ('split_id', 'parent_mass', 'mass_small', 'mass_large',
+             't_parent', 't_small', 't_large')}
+    for j, o in enumerate(res.outputs):
+        data[f'delta_{o}'] = sn['delta'][:, j]
+    return pd.DataFrame(data)
+
+
+def _qij_tree_rounds(res) -> pd.DataFrame:
+    """`tree_rounds` for every `joint_mode='seeded'` draw (spec/
+    QIJ_seeded_measured_tree_spec.md section 5/6): `round, n_open`, the
+    parallel width of every round (`n_open_per_round`)."""
+    n_open = res.joint_n_open_per_round
+    return pd.DataFrame({'round': np.arange(n_open.size), 'n_open': n_open})
+
+
 def _qij_sigma_points(res) -> pd.DataFrame:
     """`sigma_points` for every draw under `sigma_points=True`
     (spec/QIJ_sigma_points_spec.md 3): one row per evaluation, `k`
@@ -370,7 +419,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
             sigma_points: bool = False, check_rule: str = 'predicted',
-            fit_weights: str = 'none', tag: str = '') -> Tuple[int, int]:
+            fit_weights: str = 'none', joint_mode: str = 'staged',
+            tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
     prototype survey (method_notes section 2), under `ivqbins='joint'`
@@ -393,7 +443,11 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     (spec/QIJ_joint_check_measured_spec.md) picks the joint check's
     continuation rule, inert under `ivqbins='marginal'`. `fit_weights`
     (spec/QIJ_mass_weighted_fit_spec.md) picks the pilot's own
-    kernel-regression noise, unused under `pilot='affine'`."""
+    kernel-regression noise, unused under `pilot='affine'`. `joint_mode`
+    (spec/QIJ_seeded_measured_tree_spec.md), inert under `ivqbins=
+    'marginal'`, picks the second stage's own code path; under
+    `'seeded'`, every draw also writes the `split_noise` and
+    `tree_rounds` array products (section 4/5/6)."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -411,7 +465,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   survey=survey, quantized_start=quantized_start,
                   refine_schedule=refine_schedule, pilot=pilot,
                   sigma_points=sigma_points, check_rule=check_rule,
-                  fit_weights=fit_weights).fit(X, T, pool=pool)
+                  fit_weights=fit_weights, joint_mode=joint_mode).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}
@@ -427,6 +481,12 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             arrays['cells'] = _qij_cells(res)
         if res.sigma_points:
             arrays['sigma_points'] = _qij_sigma_points(res)
+        if ivqbins == 'joint' and joint_mode == 'seeded':
+            # Every draw, like `bin_U` above (spec/QIJ_seeded_measured_
+            # tree_spec.md section 7's V3 reads these across the full
+            # draw set, not only `--diag-draws`).
+            arrays['split_noise'] = _qij_split_noise(res)
+            arrays['tree_rounds'] = _qij_tree_rounds(res)
         if s in diag:
             arrays['points'] = _qij_points(res)
             arrays['prototypes'] = _qij_prototypes(res)

@@ -36,7 +36,7 @@ noise-aware floor; no second chance once a split fails to pay.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -122,6 +122,30 @@ class JointResult:
     bin_flagged: np.ndarray
     bin_label: np.ndarray
     busy_delta: float
+
+    # `joint_mode='seeded'` only (spec/QIJ_seeded_measured_tree_spec.md);
+    # every default below is the neutral value `'staged'` never reads
+    # (R2: 'staged' never constructs a JointResult with any of these).
+    psi_hat: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))         # (N, q): section 2's updated state
+    sd_hat: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))          # (N, q): section 2's updated state
+    seed_K_zador: int = 0            # section 3.1, unclipped
+    seed_K: int = 0                  # section 3.1, clipped
+    seed_L: int = 0                  # K': the seed partition's own bin count (section 3.2)
+    seed_reweight_passes: int = 0    # section 3.2
+    seed_S_pred: np.ndarray = field(default_factory=lambda: np.zeros(0))          # (q,) section 3.2
+    seed_centering_residual: np.ndarray = field(default_factory=lambda: np.zeros(0))  # (q,) section 3.3, in units of sqrt(V_btw)
+    seed_lambda: np.ndarray = field(default_factory=lambda: np.zeros(0))          # (2,) section 3.1, NaN-padded at d_eff=1
+    evals_seed: int = 0              # section 5
+    evals_tree: int = 0              # section 5
+    n_closed_infeasible: int = 0     # section 4/5: infeasible two-means OR a failed split evaluation
+    n_update_scale: np.ndarray = field(default_factory=lambda: np.zeros(0))       # (q,) section 3.3/8
+    n_update_shift: np.ndarray = field(default_factory=lambda: np.zeros(0))       # (q,) section 3.3/8
+    n_update_negative_scale: np.ndarray = field(default_factory=lambda: np.zeros(0))  # (q,) section 8
+    tree_centering_drift: np.ndarray = field(default_factory=lambda: np.zeros(0))  # (q,) section 4, in units of sqrt(V_btw) at termination
+    n_closed_hot: int = 0            # section 4: one-miss-closed bins still over eps/L at termination
+    V_win_closed: np.ndarray = field(default_factory=lambda: np.zeros(0))         # (q,) section 4
+    n_open_per_round: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))  # section 5/6
+    split_noise: Dict[str, np.ndarray] = field(default_factory=dict)              # section 4, one row per split
 
 
 def two_means_split(rows: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
@@ -424,7 +448,7 @@ def run_joint(
     start: np.ndarray = None, measured: Optional[Sequence[int]] = None,
     pilot: str = 'gp', bridge_pair_id: Optional[np.ndarray] = None,
     bridge_pair_n: Optional[np.ndarray] = None, bridge_value: Optional[np.ndarray] = None,
-    check_rule: str = 'predicted',
+    check_rule: str = 'predicted', joint_mode: str = 'staged',
 ) -> JointResult:
     """
     The joint second stage (spec/method_notes.md section 6): grow a
@@ -472,11 +496,24 @@ def run_joint(
     own flag holds for it AND its parent's split paid against a
     finite-difference-aware floor; both gates read no posterior
     variance beyond the flag's own `u`, and there is no second chance).
+
+    `joint_mode` (spec/QIJ_seeded_measured_tree_spec.md, R2) picks the
+    second stage's own code path, chosen once, before growth ever runs:
+    `'staged'` (today's path below -- growth, the initial stencil, the
+    check -- every product byte-identical) or `'seeded'` (`pilot='gp'`
+    only -- a ValueError otherwise -- `core.seed.run_seeded`'s own
+    Zador-sized minimax k-means seed and measured round loop, dispatched
+    immediately below; `check_rule` is inert under `'seeded'`, the loop
+    itself is the check).
     """
     if check_rule not in ('predicted', 'measured'):
         raise ValueError(f"unknown check_rule {check_rule!r}")
     if check_rule == 'measured' and pilot != 'gp':
         raise ValueError("check_rule='measured' requires pilot='gp'")
+    if joint_mode not in ('staged', 'seeded'):
+        raise ValueError(f"unknown joint_mode {joint_mode!r}")
+    if joint_mode == 'seeded' and pilot != 'gp':
+        raise ValueError("joint_mode='seeded' requires pilot='gp'")
 
     N, q = psi0_all.shape
     if measured is None:
@@ -489,6 +526,15 @@ def run_joint(
     # in `qij.py`).
     if pilot == 'gp' and np.any(model.constant_path):
         return _failed_result(N, q)
+
+    if joint_mode == 'seeded':
+        # A local import: `core.seed` imports `grow`/`two_means_split`/
+        # `_group_stats`/`_lloyd_all`/`_predicted_share`/`JointResult`
+        # from this module, so a module-level import here would be
+        # circular; by call time both modules are fully loaded.
+        from .seed import run_seeded
+        return run_seeded(X, counter, theta_hat, psi0_all, sigma_all, offset, xvq, eta, eps,
+                           pool, start, measured)
 
     growth = grow(psi0_all, eps, M_X_used)
     L0 = growth.L0

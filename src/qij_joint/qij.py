@@ -120,7 +120,11 @@ from .result import QIJResult
 
 
 def _joint_defaults(N: int, q: int) -> dict:
-    """The `joint_*` `QIJResult` fields, inert under `ivqbins='marginal'`."""
+    """The `joint_*` `QIJResult` fields, inert under `ivqbins='marginal'`.
+    The `joint_mode='seeded'`-only fields (spec/QIJ_seeded_measured_
+    tree_spec.md) default to the same neutral values `core.joint.
+    JointResult`'s own dataclass defaults carry, 0/NaN/empty under
+    `'staged'`."""
     return dict(
         joint_S_pred=np.full(q, np.nan), joint_a=np.full(q, np.nan),
         joint_S_pred_pre_lloyd=np.full(q, np.nan),
@@ -132,6 +136,15 @@ def _joint_defaults(N: int, q: int) -> dict:
         joint_failed=False, joint_bin_mass=np.zeros(0), joint_bin_U=np.zeros((0, q)),
         joint_bin_m=np.zeros((0, q)), joint_bin_flagged=np.zeros(0, dtype=bool),
         joint_bin_label=np.full(N, -1, dtype=int), joint_busy_delta=0.0,
+        joint_seed_K_zador=0, joint_seed_K=0, joint_seed_L=0, joint_seed_reweight_passes=0,
+        joint_seed_S_pred=np.full(q, np.nan), joint_seed_centering_residual=np.full(q, np.nan),
+        joint_seed_lambda=np.full(2, np.nan), joint_evals_seed=0, joint_evals_tree=0,
+        joint_n_closed_infeasible=0,
+        joint_n_update_scale=np.zeros(q, dtype=int), joint_n_update_shift=np.zeros(q, dtype=int),
+        joint_n_update_negative_scale=np.zeros(q, dtype=int),
+        joint_tree_centering_drift=np.full(q, np.nan),
+        joint_n_closed_hot=0, joint_V_win_closed=np.full(q, np.nan),
+        joint_n_open_per_round=np.zeros(0, dtype=int), joint_split_noise={},
     )
 
 
@@ -139,13 +152,16 @@ def _marginal_defaults(N: int, q: int) -> dict:
     """The marginal-only `QIJResult` fields, inert under `ivqbins='joint'` --
     except `psi_hat`/`rho`, which the joint branch of `QIJ.fit` overrides
     with `core.joint.joint_psi_hat`'s own field/rho_c on a draw that did
-    not fail; these NaN defaults are what a failed joint draw keeps."""
+    not fail (`joint_mode='staged'`) or with `core.seed.run_seeded`'s own
+    updated state (`joint_mode='seeded'`); these NaN defaults are what a
+    failed joint draw keeps. `sd_hat` (`joint_mode='seeded'` only) is a
+    top-level field like `psi0`/`sigma`/`psi_hat`, NaN except there."""
     return dict(
         L=np.zeros(q, dtype=int), n_level_splits=np.zeros(q, dtype=int),
         n_adjacency_splits=np.zeros(q, dtype=int), rho=np.full(q, np.nan),
         n_refine_evals=np.zeros(q, dtype=int),
         psi_hat=np.full((N, q), np.nan), bin_label=np.full((N, q), -1, dtype=int),
-        bin_U=(),
+        bin_U=(), sd_hat=np.full((N, q), np.nan),
     )
 
 
@@ -204,7 +220,7 @@ def _empty_pilot_products(q: int) -> dict:
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, ivqbins, survey,
                   sv, quantized_start, refine_schedule, pilot, sigma_points,
-                  check_rule, fit_weights) -> QIJResult:
+                  check_rule, fit_weights, joint_mode) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -247,7 +263,8 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, refine_schedule=refine_schedule, n_rounds=0,
-        pilot=pilot, check_rule=check_rule, fit_weights=fit_weights, sigma_points=sigma_points,
+        pilot=pilot, check_rule=check_rule, fit_weights=fit_weights, joint_mode=joint_mode,
+        sigma_points=sigma_points,
         **_marginal_defaults(N, q), **_joint_defaults(N, q), **_empty_pilot_products(q),
         **_sigma_defaults(q),
     )
@@ -262,9 +279,13 @@ class QIJ:
                  quantized_start: str = 'multistart',
                  refine_schedule: str = 'queue', pilot: str = 'affine',
                  sigma_points: bool = False, check_rule: str = 'predicted',
-                 fit_weights: str = 'none') -> None:
+                 fit_weights: str = 'none', joint_mode: str = 'staged') -> None:
         if pilot not in ('affine', 'gp'):
             raise ValueError(f"unknown pilot {pilot!r}")
+        if joint_mode not in ('staged', 'seeded'):
+            raise ValueError(f"unknown joint_mode {joint_mode!r}")
+        if joint_mode == 'seeded' and ivqbins != 'joint':
+            raise ValueError("joint_mode='seeded' requires ivqbins='joint'")
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -279,6 +300,7 @@ class QIJ:
         self.sigma_points = sigma_points
         self.check_rule = check_rule
         self.fit_weights = fit_weights
+        self.joint_mode = joint_mode
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -394,7 +416,7 @@ class QIJ:
                                      self.gptrend, self.gpwidth, M_X_source, workers, self.ivqbins,
                                      self.survey, sv, self.quantized_start, self.refine_schedule,
                                      self.pilot, self.sigma_points, self.check_rule,
-                                     self.fit_weights)
+                                     self.fit_weights, self.joint_mode)
             psi0_all = _psi0(model, Z)
             sigma_all = _uncertainty(model, Z)
             offset = np.asarray(model.offset, dtype=float)
@@ -505,7 +527,8 @@ class QIJ:
                            self.eps, offset, pool=pool, I_proto=I_proto[:, measured],
                            start=start_second_stage, measured=measured, pilot=self.pilot,
                            bridge_pair_id=bridge_pair_id, bridge_pair_n=bridge_pair_n,
-                           bridge_value=bridge_value, check_rule=self.check_rule)
+                           bridge_value=bridge_value, check_rule=self.check_rule,
+                           joint_mode=self.joint_mode)
             # A failed output, or a failed initial bin measurement before
             # any check ran, voids every output's variance quantities, as
             # the marginal path voids them on any one coordinate's failure.
@@ -519,7 +542,16 @@ class QIJ:
                                         V_tot_hat=jr.V_tot_hat, gain_ratio=jr.gain_ratio,
                                         a=jr.a_bca[measured], b_hat=jr.B_hat[measured],
                                         **_marginal_defaults(N, q))
-            if not jr.failed:
+            if not jr.failed and self.joint_mode == 'seeded':
+                # `joint_mode='seeded'` (spec/QIJ_seeded_measured_tree_
+                # spec.md section 5): `jr.psi_hat`/`jr.sd_hat` ARE the
+                # method's own reported per-point estimate and its
+                # uncertainty, already updated by `core.seed.run_seeded`'s
+                # round loop; no reconstruction (`rho` is not produced,
+                # stays NaN via `_marginal_defaults`).
+                second_stage_fields['psi_hat'] = jr.psi_hat
+                second_stage_fields['sd_hat'] = jr.sd_hat
+            elif not jr.failed:
                 # psi_hat/rho (spec/method_notes.md section 6): the
                 # marginal path's own per-coordinate field, evaluated on
                 # the joint path's shared final bins instead of a private
@@ -530,7 +562,12 @@ class QIJ:
                                               jr.bin_mass, jr.V_btw)
                 second_stage_fields['psi_hat'] = psi_hat
                 second_stage_fields['rho'] = rho
-            joint_fields = dict(
+            # `_joint_defaults`' own (q,)-shaped NaN/0 placeholders for the
+            # `joint_mode='seeded'`-only keys, overridden by the `if` block
+            # below when this draw IS 'seeded'; every other key here is
+            # overwritten explicitly next.
+            joint_fields = _joint_defaults(N, q)
+            joint_fields.update(
                 joint_S_pred=jr.S_pred, joint_a=jr.a,
                 joint_S_pred_pre_lloyd=jr.S_pred_pre_lloyd,
                 joint_L0=jr.L0, joint_L=jr.L, joint_n_growth_rounds=jr.n_growth_rounds,
@@ -545,6 +582,26 @@ class QIJ:
                 joint_bin_flagged=jr.bin_flagged, joint_bin_label=jr.bin_label,
                 joint_busy_delta=jr.busy_delta,
             )
+            if self.joint_mode == 'seeded':
+                # spec/QIJ_seeded_measured_tree_spec.md section 5; `jr`'s
+                # own fields read directly, now that both `run_seeded`'s
+                # success path and `_seeded_failed` always shape them
+                # (q,)/(2,), never `JointResult`'s own shape-(0,) class
+                # default (`core/seed.py`).
+                joint_fields.update(
+                    joint_seed_K_zador=jr.seed_K_zador, joint_seed_K=jr.seed_K,
+                    joint_seed_L=jr.seed_L, joint_seed_reweight_passes=jr.seed_reweight_passes,
+                    joint_seed_S_pred=jr.seed_S_pred,
+                    joint_seed_centering_residual=jr.seed_centering_residual,
+                    joint_seed_lambda=jr.seed_lambda,
+                    joint_evals_seed=jr.evals_seed, joint_evals_tree=jr.evals_tree,
+                    joint_n_closed_infeasible=jr.n_closed_infeasible,
+                    joint_n_update_scale=jr.n_update_scale, joint_n_update_shift=jr.n_update_shift,
+                    joint_n_update_negative_scale=jr.n_update_negative_scale,
+                    joint_tree_centering_drift=jr.tree_centering_drift,
+                    joint_n_closed_hot=jr.n_closed_hot, joint_V_win_closed=jr.V_win_closed,
+                    joint_n_open_per_round=jr.n_open_per_round, joint_split_noise=jr.split_noise,
+                )
         else:
             # One coordinate per MEASURED output only (its own cost is an
             # evaluation loop, unlike the shared full-data bin measurement
@@ -742,5 +799,6 @@ class QIJ:
             quantized_start=self.quantized_start,
             refine_schedule=self.refine_schedule, n_rounds=n_rounds,
             pilot=self.pilot, check_rule=self.check_rule, fit_weights=self.fit_weights,
+            joint_mode=self.joint_mode,
             **second_stage_fields, **joint_fields, **pilot_products, **sigma_fields,
         )
