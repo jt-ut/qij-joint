@@ -375,7 +375,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             survey: str = 'points', quantized_start: str = 'multistart',
             refine_schedule: str = 'queue', pilot: str = 'affine',
             sigma_points: bool = False, check_rule: str = 'predicted',
-            fit_weights: str = 'none', tree_rule: str = 'perbin',
+            fit_weights: str = 'none', tree_rule: str = 'total',
             tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the

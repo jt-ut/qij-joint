@@ -269,14 +269,16 @@ class QIJ:
                  quantized_start: str = 'multistart',
                  refine_schedule: str = 'queue', pilot: str = 'affine',
                  sigma_points: bool = False, check_rule: str = 'predicted',
-                 fit_weights: str = 'none', tree_rule: str = 'perbin') -> None:
+                 fit_weights: str = 'none', tree_rule: str = 'total') -> None:
         if pilot not in ('affine', 'gp'):
             raise ValueError(f"unknown pilot {pilot!r}")
         if tree_rule not in ('perbin', 'total'):
             raise ValueError(f"unknown tree_rule {tree_rule!r}")
-        if tree_rule == 'total' and (ivqbins != 'joint' or pilot != 'gp'):
+        if tree_rule == 'total' and ivqbins == 'joint' and pilot != 'gp':
+            # 'total' (the default) is inert under ivqbins='marginal'.
             raise ValueError(
-                "tree_rule='total' requires ivqbins='joint' and pilot='gp'")
+                "tree_rule='total' requires pilot='gp' on the joint path; "
+                "pass tree_rule='perbin' (--tree-rule perbin) for pilot='affine'")
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform

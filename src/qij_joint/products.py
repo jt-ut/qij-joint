@@ -55,8 +55,9 @@ def dir_tag(method: str, config: dict) -> str:
     non-canonical suffix, named only when `'measured'`, as `_measured`
     -- so a `check_rule='predicted'` run keeps today's folder name --
     then `tree_rule` as the LAST non-canonical suffix, named only when
-    `'total'`, as `_total` -- so a `tree_rule='perbin'` run keeps
-    today's folder name. `boot`
+    `'total'` on the joint path, as `_total` -- so a `tree_rule='perbin'`
+    run keeps today's folder name, and the default `'total'` (inert under
+    `ivqbins='marginal'`) never renames a marginal folder. `boot`
     -> `''` (`B` is not in the name -- replicates are a deterministic
     prefix, so a smaller B is read from a larger run's folder; `B` is
     still recorded in config.json and so still guarded). `ijfd` -> `''`,
@@ -85,7 +86,7 @@ def dir_tag(method: str, config: dict) -> str:
             tag += f"_MX{int(config['M_X'])}"
         if config['check_rule'] == 'measured':
             tag += '_measured'
-        if config['tree_rule'] == 'total':
+        if config['tree_rule'] == 'total' and config['ivqbins'] == 'joint':
             tag += '_total'
         return tag
     if method == 'boot':

@@ -65,8 +65,8 @@ def main(argv=None) -> None:
                     default='none',
                     help='qij: the pilot fit\'s kernel-regression noise (pilot=gp)')
     p.add_argument('--tree-rule', dest='tree_rule', choices=['perbin', 'total'],
-                    default='perbin',
-                    help='qij: the joint tree\'s growth/share rule (ivqbins=joint, pilot=gp)')
+                    default='total',
+                    help='qij: the joint tree\'s growth/share rule (ivqbins=joint, pilot=gp; default total)')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
