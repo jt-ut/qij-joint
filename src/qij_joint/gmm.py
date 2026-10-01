@@ -1087,7 +1087,8 @@ def _score_at(X, Q, w, cfg, pis, mus, Ss, Scov, a_pen, W, s):
 
 
 def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
-         eta: float, reference=None, start: np.ndarray = None):
+         eta: float, reference=None, start: np.ndarray = None,
+         continuation: bool = False):
     """(dict_or_None, status), status in {'converged', 'em_cap',
     'newton_cap', 'newton_stalled', 'infeasible', 'linalg'}
     (spec/QIJ_estimator_fit_spec.md 2.4). The dict is None only for
@@ -1262,6 +1263,14 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     radius0 = max(float(np.linalg.norm(last_step_u / s)), math.sqrt(eta))
     n_cap = 2 * p
 
+    # `continuation` is set only by the public calls (`__call__`,
+    # `influence`, `fit_and_influence`) when the caller passes `start`: a
+    # perturbation of a converged fit. The search's own internal refits
+    # (the racing winner's polish, split-and-merge candidates) pass a
+    # start too but are not next to a maximum of the problem they solve,
+    # so they keep the trust-exact finish, whose ascent guarantee the
+    # search relies on; Newton on the score alone can stop at any
+    # stationary point.
     # g0: the scaled gradient at the finish's own start, under the
     # PERTURBED weights `w` -- the gate of spec section 6, computed once
     # here regardless of which branch runs. Only a continuation (`start`
@@ -1269,7 +1278,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     # 6's scope note); a cold fit's v0 is a multi-start winner polished
     # by EM, not a point next to a root, so g0 stays NaN for it and the
     # trust-region finish runs exactly as before.
-    g0 = _score_v(v0) if start is not None else float('nan')
+    g0 = _score_v(v0) if continuation else float('nan')
 
     def _newton_score_finish():
         """Newton on the score from `v0` (spec section 6): no trust-region
@@ -1404,7 +1413,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
         return _stopped(status, pis, mus, Ss, A, ll, resid, n_iter_newton,
                          n_finish_retry=n_finish_retry, g0=g0)
 
-    if start is not None and g0 <= math.sqrt(eta):
+    if continuation and g0 <= math.sqrt(eta):
         # The gate of spec section 6: a continuation started next to a
         # root, where the objective's change along the correct Newton
         # step falls inside an N-term sum's own rounding noise (section
@@ -1820,7 +1829,8 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c,
+                               continuation=start_c is not None)
             self.last_fit_info = _fit_info(fit, status)
             if status != 'converged':
                 return np.full(cfg.p, np.nan)
@@ -1847,7 +1857,8 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c,
+                               continuation=start_c is not None)
             self.last_fit_info = _fit_info(fit, status)
             if status != 'converged':
                 return np.full((N, cfg.p), np.nan)
@@ -1876,7 +1887,8 @@ class GMM2D:
             xmean, Xc, Q, XP = prep if prep is not None else self.prepare(X)
             start_c = _center_start(start, cfg.K, xmean)
             eta_use = self.eta if eta is None else eta
-            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c)
+            fit, status = _fit(Xc, w, cfg, Q, XP, eta_use, self.reference, start_c,
+                               continuation=start_c is not None)
             self.last_fit_info = _fit_info(fit, status)
             if status != 'converged':
                 return nan_theta, nan_psi
