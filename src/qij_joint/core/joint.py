@@ -819,20 +819,25 @@ def run_joint(
     _, m0, var0 = _bin_stats(psi0_all, bins.labels, L0)
     a = _fit_scale(bins.p, U0, m0)
 
-    # A18 (spec/QIJ_mods_waves.md): a change of units on the pilot's
-    # output axes, applied once here, right after `a` is fitted. Every
-    # pilot-derived quantity read from this point on -- `psi0_all`
-    # itself, `offset`, the growth-bin means `m0` and `V_hat` (first
-    # and second moments respectively), the bridge table's pair_delta
-    # (via `bridge_value`, squared, so a_c^2) -- is rebound to a NEW
-    # local array in its a_c-corrected units, so the flag test and the
-    # reported variance below compare the pilot's vector against the
-    # measurement on ONE scale instead of patching the comparison
-    # (spec "the rule that answers every site"). These are rebindings,
-    # never in-place writes: under `pilot='gp'`, `psi0_all` is
-    # `influence_model.psi0`'s own cache ("THE RETURNED ARRAY IS THE
-    # CACHE, not a copy: callers must not write into it"), and `offset`
-    # may alias `model.offset`; `a[None, :] * x` (or `x * a[None, :]`)
+    # A18 (spec/QIJ_mods_waves.md): a_c is the gap between SURVEY units
+    # and FULL-DATA units on each output axis (the planner's sharpened
+    # ruling), applied once here, right after `a` is fitted. Every
+    # survey-unit quantity read from this point on -- `psi0_all` itself,
+    # `offset`, the growth-bin means `m0` and `V_hat` (first and second
+    # moments respectively), the bridge table's pair_delta (via
+    # `bridge_value`, squared, so a_c^2), and the survey's own prototype
+    # influences `I_proto` (first moment, wherever it meets a corrected
+    # quantity below) -- is rebound to a NEW local array in its
+    # a_c-corrected units, so the flag test, the reported variance and
+    # the check's adjacency pricing below compare survey-unit and
+    # full-data quantities on ONE scale instead of patching the
+    # comparison (spec "the rule that answers every site"). These are
+    # rebindings, never in-place writes: under `pilot='gp'`, `psi0_all`
+    # is `influence_model.psi0`'s own cache ("THE RETURNED ARRAY IS THE
+    # CACHE, not a copy: callers must not write into it"), `offset` may
+    # alias `model.offset`, and `I_proto` is the caller's own array
+    # (`qij.py`'s stage-1 product, left alone there -- spec "leave
+    # alone... the marginal path"); `a[None, :] * x` (or `x * a[None, :]`)
     # always allocates a fresh array, so the cached/aliased object
     # itself is untouched. `psi_tilde` and `V_hat`'s role in the growth
     # tolerance were already fixed above (lines 815-816), from the
@@ -849,6 +854,17 @@ def run_joint(
     V_hat = V_hat * (a ** 2)
     if bridge_value is not None:
         bridge_value = bridge_value * (a[None, :] ** 2)
+    if I_proto is not None:
+        # Survey units, first moment (I_proto is the prototype's own
+        # survey influence, what the pilot was fitted to): corrected
+        # wherever the check's adjacency pricing below reads it
+        # (`decide_split_gp`/`_affine`/`_measured`, via
+        # `adjacency_split_gain`/`_try_adjacency_split`); this can
+        # change which split kind the check chooses (spec, Identities).
+        # Stage 1's own `I_proto` (`qij.py`'s GP/affine pilot fit, ABC
+        # curvature, the stored `prototype_I`) is untouched -- this
+        # rebinds only `run_joint`'s own local parameter.
+        I_proto = I_proto * a[None, :]
 
     groups0 = [np.where(bins.labels == k)[0] for k in range(L0)]
 
