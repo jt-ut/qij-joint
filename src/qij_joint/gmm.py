@@ -1228,9 +1228,13 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     finish runs for every fit -- cold, the search's own internal
     refits, and every public continuation alike, no gate, no second
     path: one trust-region Newton loop (`_trust_region_step` each
-    iteration) to `2 * cfg.p` iterations (`newton_cap`) or a trust
-    radius fallen below `eta` (`newton_stalled` unless the gradient
-    there is already <= eta, in which case `converged`); either ending
+    iteration) to `2 * cfg.p` iterations (`newton_cap`). At an ACCEPTED
+    point, converged fires when the scaled gradient there is <=
+    sqrt(eta) * g0, g0 the scaled gradient at the finish's own start --
+    relative to the finish's start, so a continuation's residual is
+    small relative to its own perturbation. Short of that, a trust
+    radius fallen below `eta` is `newton_stalled` unless the gradient
+    there is already <= eta, in which case `converged`; either ending
     returns the last point the loop accepted, never a rejected trial."""
     W, a_pen, Scov, d = _weighted_cov(X, w)
 
@@ -1370,8 +1374,13 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     # is a multi-start winner polished by EM, not a point next to a
     # root, so g0 is typically not small there; a continuation's v0 can
     # be, which is exactly the regime the ACCEPT rule's gradient test
-    # below is for.
+    # below is for. g_conv, the loop's one convergence threshold at an
+    # accepted point, is relative to g0 (sqrt(eta) * g0) rather than an
+    # absolute floor, so a continuation's residual is judged small
+    # relative to its own perturbation, not against a fixed eta; EM
+    # itself stops at g0 <= sqrt(eta), so g_conv <= eta always.
     g0 = _score_v(v0)
+    g_conv = math.sqrt(eta) * g0
 
     def _converged(v, score, n_iter_newton):
         final = _eval(v)
@@ -1394,7 +1403,12 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
     # recomputed only after an accepted move (a rejection changes the
     # radius, never the point, so the model at `v` is unchanged); the
     # finish always attempts at least one step, and convergence is
-    # tested only at a point a step actually moved to, never at v0.
+    # tested only at a point a step actually moved to, never at v0. The
+    # ONE convergence test at an accepted point is score_v <= g_conv
+    # (sqrt(eta) * g0, relative to the finish's own start, not an
+    # absolute eta floor); there is no second, absolute-eta clause here
+    # -- the stall branch below (radius < eta) is the only place eta
+    # itself still gates convergence.
     v = v0
     fun_v = fun(v)
     score_v = g0
@@ -1425,7 +1439,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
 
         if accept:
             v, fun_v, score_v = v_trial, fun_trial, score_trial
-            if score_v <= eta:
+            if score_v <= g_conv:
                 return _converged(v, score_v, n_iter_newton)
             g_v, H_v = jac(v), hess(v)
 
