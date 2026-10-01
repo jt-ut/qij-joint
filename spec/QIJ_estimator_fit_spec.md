@@ -389,3 +389,130 @@ Constants: none new. √η and η are the caller's measured tolerance;
 there is no threshold on the objective and no gradient floor — the
 noise floor is certified by a full Newton step, not by a number. The
 step rule of the quantizer stages is unchanged by this section.
+
+## 7. One finish for every fit: trust-region Newton, step acceptance on ℓ where ℓ can see and on the gradient where it cannot (planner, 1 October 2026, cleared by the author; REPLACES section 6's algorithm — section 6 stays as the record of what was found)
+
+**Why section 6 was not the end.** Every version of the finish has
+judged the Newton step by one instrument. The trust region (2.2, 5)
+judges by the change in ℓ: right far from the maximum, blind at the
+root, where the predicted change sits under the rounding noise of an
+N-term sum while the gradient is still resolved to many digits (section
+6, defect B). Section 6 judged continuations by the gradient instead:
+right at the root, but with no globalization, so a continuation whose
+EM endpoint is not in Newton's basin fails (coder, 1 October: seeded
+draw 7, ε 0.01, one fit with g0 1.9e-4, EM 27 iterations, 105 halvings,
+`newton_cap`, NaN). The gate between the two paths, g0 ≤ √η, was
+vacuous: EM's own stop already requires a scaled gradient ≤ √η, so every
+public continuation took the gradient path. Each fix handled one regime
+and broke the other; a fallback from one path to the other would be a
+third layer on the same mistake. The code facts: `gmm_param.chain`
+carries the map-curvature term and `A` is Louis's observed information,
+so `hess` IS the exact Jacobian of `jac`; the failing fit's symptom
+(halving cannot find a gradient decrease) is what a long Newton step
+from a near-singular Hessian does (slow EM = a small eigenvalue), which
+a trust region bounds and halving does not. The design below does not
+depend on which it was.
+
+**The finish, stated once, for every fit (cold, the search's internal
+refits, every continuation; no gate, no second path, no fallback).** In
+the scaled coordinates v of section 5, from EM's endpoint, with the
+initial radius of 5.3:
+
+    loop, at most 2p iterations (5.4):
+      solve the trust-region subproblem EXACTLY on the quadratic model
+        (p = 59: eigendecomposition of hess(v), Moré–Sorensen, the hard
+        case included); step s, predicted gain m > 0
+      evaluate ℓ, g, H at v + s;  ρ = actual gain / m
+      ACCEPT if ρ ≥ 1/4,
+         or if s is the INTERIOR solution of the subproblem (the full
+            Newton step, |s| < radius, hess(v) positive definite) AND
+            the scaled gradient norm (section 5's max-norm) at v + s is
+            below the one at v
+      RADIUS: ρ < 1/4 → radius = |s|/4;  ρ > 3/4 with s on the boundary
+         → radius × 2;  a step accepted on the gradient alone leaves
+         the radius unchanged
+      CONVERGED when the scaled gradient at an ACCEPTED point is ≤ η
+      STALL when the radius falls below η (5.5): converged if the
+         gradient at the current point is ≤ η, else `newton_stalled`
+
+Then, unchanged: the finish always attempts at least one step from
+EM's endpoint; `A` must be positive definite at the converged point
+(`_cholesky_ok`, else `linalg`); the penalty influence term; the status
+set {converged, em_cap, newton_cap, newton_stalled, infeasible, linalg}.
+
+**Removed.** The `continuation` flag and the g0 ≤ √η gate; the
+Newton-on-score path with its halving loop; the `scipy.optimize.minimize`
+wrapper with its StopIteration callback; the trust-krylov retry (an
+exact eigendecomposition subproblem never produces a NaN step, the only
+reason the retry existed); the "stalled at √η counts as converged" rule
+(`at_floor`); the two-consecutive-small-steps stall counter; the
+relative √η·g0 convergence test; `newton_halvings` and
+`n_finish_retry`. `last_fit_info` keeps `g0` (the scaled gradient at
+the finish's start, now recorded for every fit) and gains nothing.
+
+**Constants.** 1/4, 3/4 and the factors 4 and 2 are the trust-region
+method's own (Nocedal and Wright, Algorithm 4.1), not fitted to any
+data. η and √η are the caller's measured tolerance. There is no
+threshold on the objective and no gradient floor.
+
+**Every case, and what it gets.**
+* Tiny perturbation, gradient already ≤ η at the start: one step is
+  attempted; the Newton step lowers the gradient, is accepted on the
+  gradient, the point is converged. Defect A cannot occur: convergence
+  is tested only at a point the finish moved to.
+* The correct Newton step whose ℓ change is noise (defect B): accepted
+  on the gradient; radius unchanged; the next step is quadratically
+  smaller.
+* Gradient at its noise floor: the step fails both tests, the radius
+  shrinks by 4 per round and is under η within a few evaluations;
+  converged, since the gradient there is ≤ η by construction.
+* EM's endpoint not in Newton's basin (today's failure): ℓ is resolved
+  there, the gradient test is never reached, the loop is the textbook's
+  — the regime where trust-exact had zero failures.
+* Indefinite Hessian (saddle neighbourhood): the exact subproblem takes
+  the negative-curvature direction; the gradient test is disabled, so
+  only resolved ascent moves the point.
+* Near-singular positive-definite Hessian: the Newton step is long, the
+  radius bounds it, ρ decides.
+* A saddle wearing a small gradient: converges there, fails the
+  Cholesky check, `linalg` (unchanged).
+* Boundary steps (the radius truncates the step): judged by ρ alone,
+  the textbook rule, so the cold search and the split-and-merge
+  candidates never move off resolved ascent (the draw-1 episode of
+  section 6 cannot recur). The gradient test is never needed there: a
+  boundary step with the gradient ≥ η and the radius ≥ η has a
+  predicted gain ≥ η²·|ℓ| ≈ 3e-14, above the objective's measured
+  noise (3.5e-15 on bin 355), so ρ is resolved; the only steps ℓ cannot
+  judge are interior Newton steps at the root, which is where the
+  gradient test applies. (The coder's tightening, 1 October, accepted.)
+* Interior Newton step, positive definite, but the quadratic model is
+  bad at the step's scale and the gradient does not fall: rejected, the
+  radius drops to |s|/4, the following boundary steps are judged by ℓ.
+* Cold fits and the search's internal refits: the same loop; the search
+  still gets ascent wherever ℓ can see it and ranks on ℓ as now.
+* The cap: 2p, safety only, `newton_cap`.
+
+**Downstream.** Cold fits are no longer byte-identical to main (an own
+loop replaces scipy's subproblem arithmetic); they agree to the fit's
+tolerance: ℓ to the rounding level, scaled gradient ≤ η. The mixture
+estimator is in no paper audit, so no bit-identity constraint applies.
+The sweep is not rerun for the talk.
+
+**Validation (author's machine; draws 1 and 7 only; nothing else).**
+1. The probe: seeded draw 7 at ε 0.01 (branch qij-seeded with this fit
+   underneath), expecting n_failed 0; L, size-N evaluations and
+   shortfall per output reported beside the 464 / 1125 / ≤ 0.54% of
+   the last run.
+2. Cold fits of draws 1 and 7 against main's: ℓ equal to 1e-10, scaled
+   gradient ≤ η, and the P1 estimates' movement reported in units of
+   the oracle's in-basin sd.
+3. Section 6's item (i-b) on today's pipeline at ε 0.01, draws 1 and
+   7: the slope of measured U on the exact bin mean per output (was
+   1.0000) and V_btw/V_ij per output against the fitfix branch's.
+4. The step scan at 1t (scratchpad step_scan_d{1,7}.parquet), judged by
+   its own aggregate as in section 6 (ii).
+5. Cost: Hessian formations per fit against the fitfix branch, on the
+   continuations of item 3 and the cold fits of item 2; expected no
+   increase on continuations, fewer on cold fits.
+Acceptance: item 1 at zero failures; items 2–4 unchanged within the
+stated tolerances; item 5 reported.
