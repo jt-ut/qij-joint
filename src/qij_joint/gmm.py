@@ -1291,26 +1291,33 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
         and the stall are judged on the gradient alone, at a point the
         finish actually moved to -- `ell` plays no part here, matching
         the rule the rejected-but-correct Newton step (section 6's
-        defect B) is built to avoid. `g_floor`, formed once at v0 from
-        the fit's own per-point score terms, is the gradient's float
-        resolution: the RMS over points of the weighted score term
-        |w_n * psi_raw[n, i]| / W that `_score_info_penalized` sums (with
-        the penalty's own deterministic gradient) into `psi_bar`'s i-th
-        entry is the natural per-coordinate size of one term of that
-        N-term sum, so eps * sqrt(N) times its largest scaled coordinate
-        is the sum's own rounding walk, in `scaled_gradient_norm`'s
-        units."""
-        e0 = _eval(v0)
-        N = X.shape[0]
-        terms = np.abs(w[:, None] * e0['psi']) / W
-        score_scale = np.sqrt(np.mean(terms ** 2, axis=0))
-        g_floor = float(np.finfo(float).eps * math.sqrt(N)
-                         * np.max(s * score_scale) / max(abs(e0['ll']), 1.0))
-        thresh = max(math.sqrt(eta) * g0, g_floor)
+        defect B) is built to avoid. Converged: the scaled gradient
+        <= sqrt(eta)*g0 and <= eta. A stall (a step below eta in scaled
+        v that fails to lower the gradient) is converged too when the
+        last ACCEPTED step was a full, unhalved Newton step and the
+        gradient is <= eta: a full Newton step lands at quadratic
+        accuracy, so a gradient the next one cannot lower sits at its
+        own rounding noise, and a point reached by a full step is never
+        the unmoved start of defect A. A stall after a halved step, or
+        above eta, is `newton_stalled`."""
+        thresh = math.sqrt(eta) * g0
+
+        def _converged(v, score, n_iter_newton, halvings):
+            final = _eval(v)
+            if not _cholesky_ok(final['A']):
+                return None, 'linalg'
+            extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
+            fit, _ = _stopped('converged', final['pis'], final['mus'],
+                               final['Ss'], final['A'], final['ll'], score,
+                               n_iter_newton, g0=g0, newton_halvings=halvings)
+            fit['psi'] = final['psi'] + extra
+            return fit, 'converged'
 
         v = v0
         score = g0
         step = -np.linalg.solve(hess(v), jac(v))
+        step_full = True
+        last_accepted_full = False
         n_iter_newton = 0
         halvings = 0
         while n_iter_newton < n_cap:
@@ -1320,27 +1327,23 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
             score_trial = _score_v(v_trial)
             if score_trial < score:
                 v, score = v_trial, score_trial
+                last_accepted_full = step_full
                 if score <= thresh and score <= eta:
-                    final = _eval(v)
-                    if not _cholesky_ok(final['A']):
-                        return None, 'linalg'
-                    extra = _penalty_influence_extra(final['Ss'], Scov, a_pen, W, d)
-                    fit, _ = _stopped('converged', final['pis'], final['mus'],
-                                       final['Ss'], final['A'], final['ll'], score,
-                                       n_iter_newton, g0=g0, newton_halvings=halvings)
-                    fit['psi'] = final['psi'] + extra
-                    return fit, 'converged'
+                    return _converged(v, score, n_iter_newton, halvings)
                 step = -np.linalg.solve(hess(v), jac(v))
+                step_full = True
                 continue
             if step_len < eta:
                 # A step below the fit's own reproducibility that still
-                # fails to reduce the gradient: give up here, at the best
+                # fails to reduce the gradient: the finish ends at the best
                 # (lowest-gradient) point reached, which is `v` -- the
-                # acceptance rule above never lets the finish move to a
-                # worse one.
+                # acceptance rule above never lets it move to a worse one.
+                if last_accepted_full and score <= eta:
+                    return _converged(v, score, n_iter_newton, halvings)
                 return _stopped('newton_stalled', pis, mus, Ss, A, ll, score,
                                  n_iter_newton, g0=g0, newton_halvings=halvings)
             step = step / 2.0
+            step_full = False
             halvings += 1
         return _stopped('newton_cap', pis, mus, Ss, A, ll, score, n_iter_newton,
                          g0=g0, newton_halvings=halvings)

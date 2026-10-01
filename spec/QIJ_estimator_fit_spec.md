@@ -241,12 +241,26 @@ that cannot see it; every symptom above (the rejected correct step, the
 callback reading a gradient still under η, the stall accepting) follows
 from that. Therefore:
 
-**On a continuation whose starting gradient is small — `start` given
-AND g0 ≤ √η, g0 the scaled gradient norm at the finish's start v0
-under the perturbed weights — the finish is Newton on the score,
-judged on the gradient and never on the objective. A continuation with
-g0 > √η, and every cold fit, keeps trust-exact on ℓ unchanged, byte
-for byte.** (The scope is in the rule, settled with the coder 1
+**On a PUBLIC continuation whose starting gradient is small — the
+caller of `__call__`/`influence`/`fit_and_influence` passes `start`, a
+converged fit of the base problem being perturbed, AND g0 ≤ √η, g0
+the scaled gradient norm at the finish's start v0 under the perturbed
+weights — the finish is Newton on the score, judged on the gradient
+and never on the objective. A continuation with g0 > √η, every cold
+fit, and every INTERNAL refit of the cold fit's own search (the racing
+winner's polish and the split-and-merge candidates, which `_fit` also
+runs with a `start`) keep trust-exact on ℓ unchanged, byte for byte.
+The reason, found by the first validation run (coder, 1 October): the
+root-finding premise holds only next to a MAXIMUM of the problem being
+solved; Newton on the score finds any stationary point, and the search
+relies on trust-exact's ascent guarantee to rank and accept candidates
+— with the internal refits on the gradient-judged path, draw 1's cold
+full-data fit landed on a different optimum with the log-likelihood
+lower by 23 units over N and the P1 estimates moved (log_reff −3.245 →
+−3.404). The code carries the scope as an explicit `continuation`
+flag set only by the three public entry points when `start` is
+passed; the gate is `continuation and g0 ≤ √η`. After that fix the
+cold fits of draws 1 and 7 are bit-identical to main.** (The scope is in the rule, settled with the coder 1
 October: the failures sit at g0 ≈ 2–4e-8 against √η = 3e-4, and every
 survey row, stencil, check split and the η measurement is a
 continuation, so a rule on the whole continuation path would change
@@ -258,24 +272,31 @@ the last digits of everything already validated.)
   (at most the trust-region iteration cap of section 5 item 4, which
   stays as the safety limit); the objective ℓ is not consulted for
   acceptance.
-* Convergence: the scaled gradient norm ≤ max(√η · g0, g_floor) AND
-  ≤ η (the absolute test of section 5 item 6), both required. √η is
-  the same factor the EM stop and the stall rule use; η·g0 would demand
-  a gradient below what can be computed (bin 381 ends at 9.7e-14 from
-  g0 1.85e-8). g_floor is the scaled gradient's own float resolution,
-  formed from the fit's terms: eps · √N · max_i |s_i · (score scale)_i|
-  / max(|ℓ|, 1), the rounding random walk of the N-term score sums in
-  the units of the scaled gradient — needed because without it a
-  continuation whose √η·g0 lies below what the gradient can resolve
-  could never converge, would halve to the cap, and would return as a
-  FAILED evaluation (GMM2D.__call__ returns NaN unless converged);
-  today's worst margin is ~60× (5.9e-12 against 9.7e-14 on bin 381) and
-  shrinks with N and with smaller η.
+* Convergence: the scaled gradient norm ≤ √η · g0 AND ≤ η (the
+  absolute test of section 5 item 6), both required. √η is the same
+  factor the EM stop and the stall rule use; η·g0 would demand a
+  gradient below what can be computed (bin 381 ends at 9.7e-14 from
+  g0 1.85e-8).
 * A rejected or halved step is never convergence: the convergence test
   is applied only to a point the finish has moved to.
-* Stall: when a step below the give-up radius (section 5 item 5) fails
-  to reduce the gradient, the finish returns the best point reached
-  with status `newton_stalled`; a stall is never `converged`.
+* Stall, and the gradient's noise floor (revised after the first
+  validation, coder, 1 October). When a step fails to reduce the
+  gradient the finish is at a stall. If the stall comes IMMEDIATELY
+  after an ACCEPTED FULL (unhalved) Newton step and the score is ≤ η,
+  the point is `converged`: Newton from a point a full Newton step just
+  reached lands at quadratic accuracy, and if the gradient can then not
+  be reduced it is at its own noise floor, so the point is the root to
+  resolution; the partial-step case (defect A) is excluded because the
+  last accepted step was full — defect A needed a point that never
+  moved. A stall after only halved steps, or with the score > η,
+  returns the best point reached with status `newton_stalled`, never
+  `converged`. This rule replaces the explicit gradient floor g_floor
+  of the earlier draft: the validation found a continuation with g0 at
+  the gradient's noise (8.9e-12) whose first full step reduced the
+  score 2000× to 4.6e-15 and which then stalled below a g_floor that
+  underestimated the noise, returning NaN — a failed evaluation where
+  the old code converged; no RMS-vs-max tuning of a floor is wanted,
+  and the quadratic-step certificate needs no constant.
 * The initial step is the exact Newton step from v0 with hess(v0)
   under the PERTURBED weights, as the finish's own `_eval` forms it
   (not θ̂'s base-weight information: the difference is O(t), harmless to
@@ -290,21 +311,73 @@ quantity is g_floor, on the gradient, formed from eps, N and the fit's
 own terms. The √N random-walk form on the OBJECTIVE of the earlier
 draft is withdrawn with the rule that needed it.
 
-**Validation (author's machine; no sweep).** (i) Byte identity: every
-cold fit (oracle, the full-data θ̂ of every method) and every
-continuation whose g0 > √η (where the absolute test already implied the
-relative one) on draw 1 and draw 7 at ε 0.01 — the whole qij product
-set of today's pipeline identical to current main, new status fields
-excepted. (ii) The step-scan bins of draws 7 and 1 (scratchpad
+**Validation (author's machine; no sweep).** Scope fact (coder, 1
+October, after the scope was set): every QIJ bin measurement is a small
+perturbation — even a seed bin of mass 0.05 has t ≈ 3e-5 at η 1e-7 and
+a g0 far below √η = 3e-4 — so nearly every stencil, check split and
+seed/tree evaluation takes the Newton-on-score path; only cold fits and
+continuations with g0 > √η (the η measurement's unit-weight refits,
+perhaps some survey rows) stay byte-identical. Whole-product identity
+therefore cannot hold and is not asked; the scope stays at √η rather
+than η because for η < g0 ≤ √η the old callback cannot falsely converge
+but defect B (noise rejection, then a stall accepted at resid ≤ √η) can
+still leave a partial step.
+(i-a) Byte identity for cold fits only: θ̂, the oracle fits, and every
+continuation with g0 > √η, checked at the fit level on draws 1 and 7,
+plus η_full unchanged.
+(i-b) The qij products of draws 1 and 7 at ε 0.01 (today's pipeline,
+the study configuration): per-bin U under the new fit against the old
+fit and against the exact bin means (ij) — agreement with the old
+within the forward-difference reproducibility on bins where the defect
+did not fire, movement toward the exact mean where it did; V_btw/V_ij
+old vs new per output; the evaluation counts (normalized_rows)
+unchanged.
+(i-c) Fit cost per evaluation: the Newton-on-score path costs no more
+than one or two Hessian formations against trust-exact's iterations;
+`wall_time_prototype` and the check-stage wall reported old vs new. (ii) The step-scan bins of draws 7 and 1 (scratchpad
 step_scan_d{1,7}.parquet) re-measured at 1t, judged by the scan's own
 aggregate: the mass-weighted slope of measured U on the exact bin mean,
 per group (single-point, smallest multi-point) and output, within 3e-4
-of 1 at 1t (as the 3t and 10t rows are today), AND no bin with a
-response below 0.99 (today 4 of 20 single-point bins sit at 0.81–0.91).
+of 1 at 1t (as the 3t and 10t rows are today), AND no SYSTEMATIC
+shrink per bin: the per-bin responses spread symmetrically about 1 and
+the spread falls as 1/t across the 1t–30t rows (the forward
+difference's own reproducibility η|θ̂|/t, ≈ 2e-8 in the output, which on
+bins with a small exact mean reads as ±5% at 1t and vanishes by 30t);
+a one-sided deficit that persists is the defect, a symmetric spread
+that shrinks with t is not. (The earlier "no bin below 0.99" was wrong
+in kind: 5 of 178 bins on draw 1 and 2 of 188 on draw 7 sit below it
+after the fix, with both signs, 1/t decay and small |exact| — noise.)
 Per-bin agreement to 3e-4 is not required: unaffected bins already
-scatter 0.9986–1.0038 per bin from forward-step truncation and from the
-exact influence being the linearization. The 10t–100t responses
-unchanged. (iii) The seeded branch's draw-7 ε 0.01
+scatter from forward-step truncation and from the exact influence
+being the linearization. The 10t–100t responses unchanged.
+
+**Result (coder, 1 October, commit 26492a1, before the stall rule):**
+(i-a) θ̂ bit-identical on draws 1 and 7; η_full on draw 1 moved 1e-6 →
+1e-7 (η is measured by public continuations, which now reproduce
+tighter). (i-b) slope of measured U on the exact bin mean, all bins:
+draw 1 ε 0.01 0.995–1.000 → 1.0000 on every output (smallest half of
+bins 1.0000–1.0001); draw 7 ε 0.01 0.998–1.000 → 1.0000; both draws at
+ε 0.141 → 0.9999–1.0001. V_btw/V_ij at ε 0.01: draw 1 0.997–1.058 →
+0.9957–0.9987 (the +5.8% overshoot gone), draw 7 0.996–0.999 →
+0.997–0.999; at ε 0.141 within ±1% of old. Evaluation counts ±1–3%
+(the partitions differ); wall 26–45% lower on every run. (ii) Step
+scan at 1t: draw 7 0.9989–1.0002 (was 0.981–1.003), draw 1
+0.9986–1.0006; worst group single-point logit_w at 0.9986–0.9989, just
+outside 3e-4. (iii) Seeded draw 7 ε 0.01: shortfall per output 1.72 →
+0.29%, 2.01 → 0.24%, 3.44 → 0.25%, 1.48 → 0.18%, 1.18 → 0.13%, 2.60 →
+0.39%, 0.14 → 0.39% — every output under ε: the seeded tree's failure
+was this defect; its cost 1243 vs 1237 (today's pipeline, new fit) —
+no saving at tight ε even before a central seed. The check's scale a_c
+is NOT the fit: joint_a old → new moves by ≤ 0.006 (draw 1 ε 0.01:
+1.078 → 1.083 … 1.177 → 1.180; draw 7 ε 0.141 1.11–1.54 unchanged),
+and the survey prototypes' I_old/I_new slope is 0.9996–1.0001 in every
+mass quartile incl. the lightest on draw 7 (draw 1's light quartile
+moves 0.98–1.05 from the η change) — the survey-vs-full-data disparity
+is representation. ONE defect left: n_failed rose 0 → 1–2 per run
+(stalls at the gradient's noise after a full accepted step, g0 8.9e-12
+→ 4.6e-15, NaN) — fixed by the stall rule above; the four runs and
+seeded d7 are rerun with it, expecting n_failed 0 and nothing else
+changed. (iii) The seeded branch's draw-7 ε 0.01
 run repeated with the amended fit: the measured-between deficit
 (1–3.2%) gone, shortfall ≤ max(ε, today's) — the number that motivated
 this section. (iv) Fit cost: `wall_time_prototype` and the check-stage
@@ -312,7 +385,7 @@ wall unchanged within noise (the gradient-judged Newton path removes
 the rejected trust-region iterations and adds no evaluation where the
 absolute test was already sufficient).
 
-Constants: none new. eps is machine epsilon; √η and η are the caller's
-measured tolerance; g_floor is formed from eps, N and the fit's own
-score terms; there is no threshold on the objective. The step rule of
-the quantizer stages is unchanged by this section.
+Constants: none new. √η and η are the caller's measured tolerance;
+there is no threshold on the objective and no gradient floor — the
+noise floor is certified by a full Newton step, not by a number. The
+step rule of the quantizer stages is unchanged by this section.
