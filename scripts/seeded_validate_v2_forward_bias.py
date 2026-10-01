@@ -65,7 +65,11 @@ def main() -> None:
     theta_hat = np.asarray(counter(X, np.ones(N)), dtype=float)
     eta_full, _n, _ = measure_eta_full(counter, X, theta_hat)
     q_full = len(T.outputs)
-    M_requested = cost_rule_M(N, q_full, args.eps)
+    # The production path's own A11 slicing (qij.py): the prototype count,
+    # the pilot fit and the seed read only T's MEASURED outputs.
+    measured = list(getattr(T, 'measured', range(q_full)))
+    q = len(measured)
+    M_requested = cost_rule_M(N, q, args.eps)
 
     Z, inverse = (case.vq_transform(X) if case.vq_transform is not None
                   else (X, lambda A: A))
@@ -79,10 +83,9 @@ def main() -> None:
         quantized_start=QIJ_CANONICAL['quantized_start'], theta_hat=theta_hat,
         eta_rows=eta_full if getattr(counter, 'takes_start', False) else None)
     model, _mbusy = fit_influence_model(
-        Z, xvq, I_proto, theta_Q, eta, gptrend=QIJ_CANONICAL['gptrend'],
+        Z, xvq, I_proto[:, measured], theta_Q[measured], eta, gptrend=QIJ_CANONICAL['gptrend'],
         gpwidth=args.gpwidth, fit_weights=args.fit_weights)
     psi0_all = _psi0(model, Z)
-    measured = list(range(q_full))
 
     growth = grow(psi0_all, args.eps, xvq.M_used)
     K_Z, K, lam, v1 = _seed_count(psi0_all, growth.std, X.shape[1], args.eps,
@@ -94,8 +97,8 @@ def main() -> None:
     delta_c = central_step(eta_full)
     p_mass = np.bincount(labels, minlength=L).astype(float) / N
 
-    U_fwd = np.empty((L, q_full))
-    U_ctr = np.empty((L, q_full))
+    U_fwd = np.empty((L, q))
+    U_ctr = np.empty((L, q))
     for k in range(L):
         mask = labels == k
         pk = float(p_mass[k])
@@ -107,7 +110,8 @@ def main() -> None:
         def evaluate(t, _mask=mask):
             return counter(X, _weights(N, _mask, t), start=start, eta=eta_full)
 
-        U_ctr[k], _D2 = difference(pk, delta_c, evaluate, theta_hat)
+        U_ctr_full, _D2 = difference(pk, delta_c, evaluate, theta_hat)
+        U_ctr[k] = np.asarray(U_ctr_full)[measured]
 
     rel_diff = (U_fwd - U_ctr) / U_ctr
     V_btw_fwd = np.sum(p_mass[:, None] * U_fwd ** 2, axis=0) / N
@@ -115,7 +119,7 @@ def main() -> None:
     effect = np.abs(V_btw_fwd - V_btw_ctr) / np.where(V_btw_ctr > 0, V_btw_ctr, np.nan)
 
     print(f'{args.dataset}/{args.estimator} N={N} draw={args.draw} eps={args.eps} K={L}')
-    for j, o in enumerate(T.outputs):
+    for j, o in enumerate(T.outputs[i] for i in measured):
         print(f'  {o}: effect on V_btw = {effect[j]:.4%}; '
               f'median|rel diff| = {np.median(np.abs(rel_diff[:, j])):.4%}; '
               f'max|rel diff| = {np.max(np.abs(rel_diff[:, j])):.4%}')
