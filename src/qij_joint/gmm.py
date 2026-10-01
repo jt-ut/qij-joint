@@ -1143,7 +1143,7 @@ def _trust_region_step(g: np.ndarray, H: np.ndarray, radius: float):
     lam_lo = max(0.0, -lam1)
     at_min = eigvals <= lam1 + 1e-10 * max(1.0, abs(lam1))
     b_null = float(np.linalg.norm(b[at_min]))
-    tol_hard = 1e-8 * max(1.0, float(np.linalg.norm(g)))
+    tol_hard = 1e-8 * float(np.linalg.norm(g))
 
     if lam1 < 0.0 and b_null <= tol_hard:
         # Hard case: g has no resolvable component in the lambda_1
