@@ -534,6 +534,24 @@ class QIJ:
                                         a=jr.a_bca[measured], b_hat=jr.B_hat[measured],
                                         **_marginal_defaults(N, q))
             if not jr.failed:
+                # A18 (spec/QIJ_mods_waves.md): `run_joint` applies its
+                # own a_c correction to a LOCAL rebinding of `psi0_all`/
+                # `offset` only (it must not write into `psi0_all` in
+                # place -- under `pilot='gp'` that array is
+                # `influence_model.psi0`'s own read-only cache -- so the
+                # correction never reaches this caller's own variables
+                # by itself). `jr.a` is the SAME a_c `run_joint` fitted
+                # and applied internally (`JointResult.a`, B4's scale
+                # factor; not `jr.a_bca`, the unrelated ABC bias/
+                # acceleration stored above as `second_stage_fields['a']`).
+                # Rebinding here, once, puts every reader of `psi0_all`/
+                # `offset` from this point on -- `joint_psi_hat` next,
+                # and the `psi0=psi0_all` stored in `QIJResult` below --
+                # on the same full-data units as the measured products
+                # (`V_btw`, `jr.bin_U`) it is compared against or
+                # combined with.
+                psi0_all = psi0_all * jr.a[None, :]
+                offset = offset * jr.a
                 # psi_hat/rho (spec/method_notes.md section 6): the
                 # marginal path's own per-coordinate field, evaluated on
                 # the joint path's shared final bins instead of a private

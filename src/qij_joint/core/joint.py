@@ -447,13 +447,19 @@ def _fit_scale(p: np.ndarray, U: np.ndarray, m: np.ndarray) -> np.ndarray:
     return num / den
 
 
-def _flag_mask(p, U, m, a, V_hat, u, L: int, eps: float) -> np.ndarray:
-    """Bin k is flagged when for some output c the rescaled measured
-    derivative disagrees with the predicted mean by more than the bin's
-    share of the tolerance plus what the posterior allows for the error
-    of a bin mean: p_k*(U_kc-a_c*m_kc)^2 > eps*V_hat_c/L + p_k*a_c^2*u_kc."""
-    lhs = p[:, None] * (U - a[None, :] * m) ** 2
-    rhs = (eps * V_hat[None, :] / L) + p[:, None] * (a[None, :] ** 2) * u
+def _flag_mask(p, U, m, V_hat, u, L: int, eps: float) -> np.ndarray:
+    """Bin k is flagged when for some output c the measured derivative
+    disagrees with the predicted mean by more than the bin's share of
+    the tolerance plus what the posterior allows for the error of a
+    bin mean: p_k*(U_kc-m_kc)^2 > eps*V_hat_c/L + p_k*u_kc. (A18,
+    spec/QIJ_mods_waves.md: `m`, `u` and `V_hat` are already in the
+    pilot's a_c-corrected units -- the same units as `U` -- by the time
+    every caller of this function reaches it, so no `a_c`/`a_c^2`
+    factor is carried here any more; carrying it was the earlier bug,
+    comparing a measured-scale left side against a pilot-scale
+    threshold.)"""
+    lhs = p[:, None] * (U - m) ** 2
+    rhs = (eps * V_hat[None, :] / L) + p[:, None] * u
     return np.any(lhs > rhs, axis=1)
 
 
@@ -507,6 +513,7 @@ def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: 
 
 def _run_total(
     N: int, q: int, X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
+    psi_tilde: np.ndarray,
     measured: Sequence[int], pool, start: Optional[np.ndarray], eta: float, eps: float,
     M_X_used: int, growth: Growth, bins: BinSet, V_btw: np.ndarray,
     groups0: Sequence[np.ndarray], U0: np.ndarray, m0: np.ndarray, var0: np.ndarray,
@@ -554,9 +561,21 @@ def _run_total(
     `gain_ratio` is NaN throughout: there is no predicted-gain geometry
     to size a split under this rule (no flag, no v, no adjacency), so
     there is nothing to compare a realized `Delta` against.
+
+    `psi0_all`, `m0`, `var0` arrive already in A18's a_c-corrected
+    units (spec/QIJ_mods_waves.md A18; `run_joint`'s own correction,
+    applied once right after `a` is fitted, before this function is
+    called), so `win_hat`, `candidates` and `E` below read the
+    corrected within-bin spread with no further factor. `psi_tilde` is
+    passed in SEPARATE from `psi0_all` and is NOT recomputed here from
+    `psi0_all`/`growth.std`: it is the one array `run_joint` built
+    before that correction, from the pre-correction `psi0_all` and
+    `growth.std`, so every `two_means_split` cut drawn from it stays
+    byte-identical to the pre-A18 code (scaling `psi0_all` and
+    `growth.std` by the same `a_c` and then dividing is not
+    bit-identical to the pre-correction ratio).
     """
     L0 = growth.L0
-    psi_tilde = psi0_all / growth.std
     centering_residual = bins.centering_residual[measured]
     delta_f = forward_step(eta)
     evals_cap = 1 + M_X_used
@@ -799,16 +818,51 @@ def run_joint(
     centering_residual = bins.centering_residual[measured]
     _, m0, var0 = _bin_stats(psi0_all, bins.labels, L0)
     a = _fit_scale(bins.p, U0, m0)
+
+    # A18 (spec/QIJ_mods_waves.md): a change of units on the pilot's
+    # output axes, applied once here, right after `a` is fitted. Every
+    # pilot-derived quantity read from this point on -- `psi0_all`
+    # itself, `offset`, the growth-bin means `m0` and `V_hat` (first
+    # and second moments respectively), the bridge table's pair_delta
+    # (via `bridge_value`, squared, so a_c^2) -- is rebound to a NEW
+    # local array in its a_c-corrected units, so the flag test and the
+    # reported variance below compare the pilot's vector against the
+    # measurement on ONE scale instead of patching the comparison
+    # (spec "the rule that answers every site"). These are rebindings,
+    # never in-place writes: under `pilot='gp'`, `psi0_all` is
+    # `influence_model.psi0`'s own cache ("THE RETURNED ARRAY IS THE
+    # CACHE, not a copy: callers must not write into it"), and `offset`
+    # may alias `model.offset`; `a[None, :] * x` (or `x * a[None, :]`)
+    # always allocates a fresh array, so the cached/aliased object
+    # itself is untouched. `psi_tilde` and `V_hat`'s role in the growth
+    # tolerance were already fixed above (lines 815-816), from the
+    # PRE-correction `psi0_all`/`growth.std`, and must stay that way:
+    # every `two_means_split` cut below (and `_run_total`'s own) reads
+    # that already-built `psi_tilde`, never a recomputation from the
+    # now-corrected `psi0_all`, since scaling `psi0_all` and
+    # `growth.std` by the same `a_c` and then dividing is NOT
+    # bit-identical, in floating point, to the pre-correction ratio.
+    psi0_all = psi0_all * a[None, :]
+    offset = offset * a
+    m0 = m0 * a[None, :]
+    var0 = var0 * (a[None, :] ** 2)
+    V_hat = V_hat * (a ** 2)
+    if bridge_value is not None:
+        bridge_value = bridge_value * (a[None, :] ** 2)
+
     groups0 = [np.where(bins.labels == k)[0] for k in range(L0)]
 
     if tree_rule == 'total':
         # No flag, no pay test, no adjacency split, no posterior v
         # below this point (module docstring, `_run_total`'s own);
         # everything from here to the end of this function is the
-        # `tree_rule='perbin'` path, untouched.
-        return _run_total(N, q, X, counter, theta_hat, psi0_all, measured, pool, start, eta,
-                           eps, M_X_used, growth, bins, V_btw, groups0, U0, m0, var0, B_hat,
-                           a_bca, a, busy_delta)
+        # `tree_rule='perbin'` path, untouched. `psi0_all`/`m0`/`var0`
+        # passed in are already A18-corrected (above); `psi_tilde` is
+        # the pre-correction array built at line 816, passed separately
+        # so `_run_total`'s own cuts stay byte-identical.
+        return _run_total(N, q, X, counter, theta_hat, psi0_all, psi_tilde, measured, pool,
+                           start, eta, eps, M_X_used, growth, bins, V_btw, groups0, U0, m0, var0,
+                           B_hat, a_bca, a, busy_delta)
 
     # `pilot` selects the within-bin pricing input ONCE here (R2): 'gp'
     # reads the GP posterior (v0/u0) via `_posterior_vu`; 'affine' never
@@ -818,6 +872,13 @@ def run_joint(
     # each bin's own bridge vector instead (`_bridge_vectors`).
     if pilot == 'gp':
         v0, u0 = _posterior_vu(model, Z, sigma_all, groups0)
+        # A18: `_posterior_vu` always reads the model against the
+        # UNCORRECTED `sigma_all` (the GP fit itself does not change,
+        # spec "what does not change"), so its v/u come back raw; the
+        # explicit x a_c^2 here puts them in `psi0_all`'s own new units
+        # (second moments), matching `var0`/`m0`/`V_hat` above.
+        v0 = v0 * (a[None, :] ** 2)
+        u0 = u0 * (a[None, :] ** 2)
         bridge0 = None
     else:
         v0 = np.zeros((L0, q))
@@ -834,7 +895,7 @@ def run_joint(
         for k in range(L0):
             leaves[k]['bridge'] = bridge0[k]
 
-    flagged_mask = _flag_mask(bins.p, U0, m0, a, V_hat, u0, L0, eps)
+    flagged_mask = _flag_mask(bins.p, U0, m0, V_hat, u0, L0, eps)
     n_flagged = int(flagged_mask.sum())
     current_flagged = set(np.where(flagged_mask)[0].tolist())
 
@@ -984,7 +1045,7 @@ def run_joint(
         """`check_rule='predicted'`'s continuation rule (today's,
         unchanged): re-flag every new child against `_flag_mask`, the
         same pilot means that were already wrong for the parent."""
-        flagged_new = _flag_mask(p_new, Us, means_new, a, V_hat, u_new, L_current, eps)
+        flagged_new = _flag_mask(p_new, Us, means_new, V_hat, u_new, L_current, eps)
         for i, nid in enumerate(ids):
             leaves[nid] = dict(indices=idxs[i], n=idxs[i].size, U=Us[i], m=means_new[i],
                                 var=var_new[i], v=v_new[i], ubar=psi_centered[idxs[i]].mean(axis=0))
@@ -1015,7 +1076,7 @@ def run_joint(
         accumulates b_Delta over every split measured this round (it is
         never subtracted from V_btw, only reported against it)."""
         nonlocal n_closed_unpaid, n_closed_unflagged, n_noise_floored, sum_b_delta
-        flagged_new = _flag_mask(p_new, Us, means_new, a, V_hat, u_new, L_current, eps)
+        flagged_new = _flag_mask(p_new, Us, means_new, V_hat, u_new, L_current, eps)
         paid = {}
         for rec in split_records:
             delta_U = eta * theta_floor / rec['t_small']
@@ -1153,6 +1214,10 @@ def run_joint(
             # v_new comes back from the same call but no split decision
             # reads it (spec section 1).
             v_new, u_new = _posterior_vu(model, Z, sigma_all, idxs)
+            # A18: same explicit x a_c^2 as the first `_posterior_vu`
+            # call above (`sigma_all` itself never changes).
+            v_new = v_new * (a[None, :] ** 2)
+            u_new = u_new * (a[None, :] ** 2)
             bridge_new = None
         else:
             v_new = np.zeros((len(idxs), q))
