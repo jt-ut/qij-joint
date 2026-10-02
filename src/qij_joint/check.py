@@ -2,11 +2,12 @@
 
 The weighted-mean scale identity: S_btw + S_win == (1/N) sum_i psi_i^2,
 where psi_i = x_i - weighted_mean(x) is the weighted mean's exact
-analytic influence, evaluated on the pipeline's own final I-VQ bins
-(`bin_label`): S_btw = sum_k p_k*psi_bar_k^2, S_win = sum_k p_k*Var_k(psi).
-An exact ANOVA decomposition of the same psi values, so it holds to
-machine precision for any partition, or the partition arithmetic is
-wrong.
+analytic influence, evaluated on the joint second stage's final shared
+partition (`joint_bin_label`, spec/QIJ_mods_waves.md A21 -- the only
+second stage, since the per-output marginal path was removed):
+S_btw = sum_k p_k*psi_bar_k^2, S_win = sum_k p_k*Var_k(psi). An exact
+ANOVA decomposition of the same psi values, so it holds to machine
+precision for any partition, or the partition arithmetic is wrong.
 """
 from __future__ import annotations
 
@@ -27,8 +28,8 @@ def main() -> None:
     res = QIJ().fit(X, _weighted_mean)
     psi = X[:, 0] - res.theta_hat[0]
 
-    labels = res.bin_label[:, 0]
-    L = int(res.L[0])
+    labels = res.joint_bin_label
+    L = int(res.joint_L)
     counts = np.bincount(labels, minlength=L).astype(float)
     p = counts / N
     psi_bar = np.bincount(labels, weights=psi, minlength=L) / counts

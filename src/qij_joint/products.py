@@ -28,10 +28,11 @@ def method_dir(out_dir: str, dataset: str, estimator: str, N: int, method: str,
 
 
 # The S=1000 cloudfil study's fixed qij choices (spec/QIJ_mods_waves.md);
-# `dir_tag` names only the settings that differ from these.
+# `dir_tag` names only the settings that differ from these. A21 removed
+# `ivqbins`/`refine_schedule` (along with `pilot`/`check_rule`/
+# `tree_rule`) as config keys entirely, so they no longer appear here.
 QIJ_CANONICAL = dict(survey='moments', quantized_start='full-data', gptrend='quadratic',
-                      gpwidth='global', ivqbins='joint', refine_schedule='rounds',
-                      sigma_points=True, M_X=None)
+                      gpwidth='global', sigma_points=True, M_X=None)
 
 
 def _num(x) -> str:
@@ -42,22 +43,21 @@ def dir_tag(method: str, config: dict) -> str:
     """The method-folder suffix a configuration maps to (Section 2):
     configurations must never share a folder, so `run.py` derives this
     from `config` rather than letting `--out` be used to separate them.
-    `qij` -> `<pilot>_eps<eps>`, e.g. `gp_eps0.02`, then one suffix per
-    setting that differs from `QIJ_CANONICAL`, in a fixed order:
-    `survey`, `quantized_start`, `gptrend`, `gpwidth`, then `fit_weights`
+    `qij` -> `eps<eps>`, e.g. `eps0.02`, then one suffix per setting
+    that differs from `QIJ_CANONICAL`, in a fixed order: `survey`,
+    `quantized_start`, `gptrend`, `gpwidth`, then `fit_weights`
     (spec/QIJ_mass_weighted_fit_spec.md 3) as a non-canonical suffix
     right after `gpwidth`'s own, named only when `'mass'`, as
     `_massfit` -- so a `fit_weights='none'` run keeps today's folder
-    name -- then `ivqbins`,
-    `refine_schedule`, `sigma_points` (named only when False, as
-    `_nosigma`), `M_X` (named only when not None, as `_MX<int>`), then
-    `check_rule` (spec/QIJ_joint_check_measured_spec.md 3) as a
-    non-canonical suffix, named only when `'measured'`, as `_measured`
-    -- so a `check_rule='predicted'` run keeps today's folder name --
-    then `tree_rule` as the LAST non-canonical suffix, named only when
-    `'total'` on the joint path, as `_total` -- so a `tree_rule='perbin'`
-    run keeps today's folder name, and the default `'total'` (inert under
-    `ivqbins='marginal'`) never renames a marginal folder. `boot`
+    name -- then `sigma_points` (named only when False, as `_nosigma`),
+    `M_X` (named only when not None, as `_MX<int>`). A21
+    (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
+    `refine_schedule`/`check_rule`/`tree_rule` as both switches and
+    config keys: a new run's folder name carries only the surviving
+    settings (eps, gpwidth, fit_weights, sigma, survey, quantized_
+    start, gptrend, M_X source) -- the `<pilot>_` prefix, the `_bins
+    <ivqbins>`/`_sched<refine_schedule>`/`_measured`/`_total` suffixes
+    are no longer written. `boot`
     -> `''` (`B` is not in the name -- replicates are a deterministic
     prefix, so a smaller B is read from a larger run's folder; `B` is
     still recorded in config.json and so still guarded). `ijfd` -> `''`,
@@ -65,7 +65,7 @@ def dir_tag(method: str, config: dict) -> str:
     -> `MX<M_X>_B<budget>_W<budget_win>_Q<budget_quad>`. `oracle`, `ij`,
     anything else -> `''`."""
     if method == 'qij':
-        tag = f"{config['pilot']}_eps{_num(config['eps'])}"
+        tag = f"eps{_num(config['eps'])}"
         if config['survey'] != QIJ_CANONICAL['survey']:
             tag += f"_survey{config['survey']}"
         if config['quantized_start'] != QIJ_CANONICAL['quantized_start']:
@@ -76,18 +76,10 @@ def dir_tag(method: str, config: dict) -> str:
             tag += f"_width{config['gpwidth']}"
         if config['fit_weights'] == 'mass':
             tag += '_massfit'
-        if config['ivqbins'] != QIJ_CANONICAL['ivqbins']:
-            tag += f"_bins{config['ivqbins']}"
-        if config['refine_schedule'] != QIJ_CANONICAL['refine_schedule']:
-            tag += f"_sched{config['refine_schedule']}"
         if config['sigma_points'] != QIJ_CANONICAL['sigma_points']:
             tag += '_nosigma'
         if config['M_X'] != QIJ_CANONICAL['M_X']:
             tag += f"_MX{int(config['M_X'])}"
-        if config['check_rule'] == 'measured':
-            tag += '_measured'
-        if config['tree_rule'] == 'total' and config['ivqbins'] == 'joint':
-            tag += '_total'
         return tag
     if method == 'boot':
         return ''
@@ -112,7 +104,17 @@ def ensure_config(md: str, config: dict) -> None:
     arguments. Many single-draw processes may start against a new folder
     at once; each writes its own `config.json.<pid>.tmp`, so racing
     creators never share a temp file, and they write identical content,
-    so whichever `os.replace` lands last is harmless."""
+    so whichever `os.replace` lands last is harmless.
+
+    A21 (spec/QIJ_mods_waves.md A21): a stored config.json may carry a
+    key current code no longer reads or writes -- a switch removed
+    since that run (`ivqbins`/`pilot`/`check_rule`/`tree_rule`/
+    `refine_schedule`, all gone as both switches and config keys).
+    Such a key is simply unknown to `requested` (today's config never
+    sets it) and is dropped from the comparison rather than registering
+    as a mismatch, so a pre-removal folder still loads; `requested`
+    itself never carries a removed key, so nothing of the kind is ever
+    written back out."""
     os.makedirs(md, exist_ok=True)
     path = os.path.join(md, 'config.json')
     requested = json.loads(json.dumps(config))
@@ -124,22 +126,15 @@ def ensure_config(md: str, config: dict) -> None:
         return
     with open(path) as f:
         stored = json.load(f)
-    if 'check_rule' in requested and 'check_rule' not in stored:
-        # A qij folder from before this build recorded no `check_rule`
-        # (spec/QIJ_joint_check_measured_spec.md 3): read as 'predicted',
-        # so today's `check_rule='predicted'` runs still match it. Only a
-        # configuration that carries the key (qij) gets the default.
-        stored = dict(stored, check_rule='predicted')
     if 'fit_weights' in requested and 'fit_weights' not in stored:
         # A qij folder from before this build recorded no `fit_weights`
         # (spec/QIJ_mass_weighted_fit_spec.md 3): read as 'none', so
         # today's `fit_weights='none'` runs still match it.
         stored = dict(stored, fit_weights='none')
-    if 'tree_rule' in requested and 'tree_rule' not in stored:
-        # A qij folder from before this build recorded no `tree_rule`:
-        # read as 'perbin', so today's `tree_rule='perbin'` runs still
-        # match it.
-        stored = dict(stored, tree_rule='perbin')
+    # Ignore any stored key current code no longer knows (A21's own
+    # removals among them): only keys `requested` could possibly carry
+    # are compared.
+    stored = {k: v for k, v in stored.items() if k in requested}
     if stored != requested:
         keys = sorted(set(stored) | set(requested))
         diffs = '; '.join(

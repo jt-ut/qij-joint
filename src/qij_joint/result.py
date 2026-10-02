@@ -6,23 +6,39 @@ spec/QIJ_mods_waves.md A10). `BootstrapResult` carries the bootstrap
 comparator's replicates, theta_hat, the percentile interval and
 `.bc_interval(level)` (the bias-corrected percentile interval, A10).
 
-`ivqbins` picks the second stage: `'marginal'` (a per-output refinement,
-one partition per output) or `'joint'` (one partition shared by every
-output, method_notes joint section). `V_btw`/`V_win_hat`/`V_tot_hat`/`gain_ratio`
-are populated by whichever stage ran; the marginal-only fields (`L`,
-`bin_label`, `bin_U`, the refinement counts) are NaN/0/-1/empty under
-`'joint'`; the `joint_*` fields are NaN/0/False/empty under `'marginal'`.
-`rho` and `psi_hat` are populated under both: under `'joint'` they are
-`core.joint.joint_psi_hat`'s per-output rho_c and the refined field on
-the joint path's own shared final bins, in place of the marginal path's
-per-coordinate partition.
-
-`refine_schedule` picks the marginal path's own schedule
-(spec/QIJ_mods_waves.md A14): `'queue'` (ported, the default) or
-`'rounds'` (every measured output refined together in synchronized
-rounds); inert under `ivqbins='joint'`, whose own check already
-advances in rounds. `n_rounds` is the round count `'rounds'` actually
-ran; 0 under `'queue'` or `'joint'`.
+A21 (spec/QIJ_mods_waves.md A21, "one path: the removals") removed
+every switch this result used to carry beside the one surviving
+method: `ivqbins` (the per-output marginal second stage, and `'joint'`
+as an alternative to it), `pilot` (the affine pilot, an alternative to
+the GP), `check_rule` (the per-bin check's continuation rule) and
+`tree_rule` (the per-bin growth/share rule, an alternative to the
+total-share one) are gone as both switches and fields, along with
+every product that existed only to report a choice among them or the
+marginal/affine/per-bin-check machinery itself: `L`, `n_level_splits`,
+`n_adjacency_splits`, `rho`, `gain_ratio`, `n_refine_evals`,
+`bin_label`, `bin_U` (the marginal path's own per-output partition and
+counts), `refine_schedule`/`n_rounds` (the marginal path's own
+schedule), `bridge_j`/`bridge_k`/`bridge_m`/`bridge_delta`/`cell_p`/
+`cell_mu`/`cell_g` (the affine pilot's own products), and
+`joint_n_flagged`/`joint_n_adjacency_splits`/`joint_bin_flagged`/
+`joint_n_closed_unpaid`/`joint_n_closed_unflagged`/
+`joint_n_noise_floored`/`joint_sum_b_delta` (the per-bin check's own
+flag/pay bookkeeping). `V_btw`/`V_win_hat`/`V_tot_hat` are the one
+remaining second stage's own; `psi_hat` is that stage's final per-point
+STATE vector (THE ARCHITECTURE RULE, spec/QIJ_mods_waves.md A20),
+rewritten in place after every measurement; `joint_n_update_scale`/
+`joint_n_update_shift`/`joint_n_update_negative`/`joint_pilot_err_btw`
+are its own products. Which bin is split next reads the bin's own
+measured error against the update's noise term, falling back to the
+current vector's within-variance (the A20 amendment, 2 October);
+`joint_rank_rule` (always `'measured_error'`) and `joint_bin_ebar`
+(each final bin's own error, beside `joint_bin_U`/`joint_bin_m`) record
+it. `joint_bin_m` is the leaf's own m_pre (the state vector's mean over
+the leaf's points at measurement time), never a fixed copy of the
+pilot (THE ARCHITECTURE RULE again; A21's own fix, spec/QIJ_mods_
+waves.md A20's validation note). `joint_share_final` (the final
+V_win_hat/(V_btw+V_win_hat) per measured output) is populated on a
+draw that did not fail, NaN otherwise.
 
 `quantized_start` picks the quantized base fit theta_Q's starting point
 (spec/QIJ_mods_waves.md A9 item 5): `'multistart'` (ported) or
@@ -35,47 +51,15 @@ curvature and bias/acceleration ingredients still cost their declared
 evaluations (a and b_hat from the deterministic optimizer's own bins),
 only `eta_Q`/`survey_step_ratio` stay NaN (no continuation to check).
 
-`pilot` (spec/QIJ_affine_pilot_spec.md) picks stage 1's initial
-influence estimate: `'affine'` or `'gp'`. Under `'affine'`, `ell`,
-`lam`, `ell_bound`, `lam_bound`, `c`, `c_bound`, `sigma` and
-`prototype_h` are NaN/False (no posterior variance or width/local-scale
-search of any kind), and `bridge_j`/`bridge_k`/`bridge_m`/`bridge_delta`
-(the bridge score, one row per CADJ pair with a non-empty second-order
-cell) and `cell_p`/`cell_mu`/`cell_g` (the affine field's own per-cell
-mass, mean and gradient) are populated; both are empty under `'gp'`,
-whose every other field stays exactly as before this option existed.
-
-`check_rule` (spec/QIJ_joint_check_measured_spec.md), inert (but
-recorded) under `ivqbins='marginal'`, picks the joint check's
-continuation rule: `'predicted'` (the default, today's rule, every
-product byte-identical) or `'measured'` (`pilot='gp'` only), which also
-populates `joint_n_closed_unpaid`/`joint_n_closed_unflagged`/
-`joint_n_noise_floored`/`joint_sum_b_delta` and changes `V_win_hat`/
-`V_tot_hat`'s own definition (no posterior variance).
-
-`fit_weights` (spec/QIJ_mass_weighted_fit_spec.md), unused under
-`pilot='affine'` the way `gptrend`/`gpwidth` are, picks the pilot's own
-kernel-regression noise: `'none'` (the default, every product
-byte-identical) or `'mass'` (a per-observation noise diagonal
-1/m_tilde_j in place of the identity, in both the profiled marginal
-likelihood and the posterior).
-
-`tree_rule`, inert (but recorded) under `ivqbins='marginal'`, picks the
-joint tree's own growth/share rule: `'perbin'` (the default, today's
-behaviour, byte-identical) or `'total'` (`ivqbins='joint'` and
-`pilot='gp'` only). `joint_share_final` (the final
-V_win_hat/(V_btw+V_win_hat) per measured output) is populated under
-both rules on a draw that did not fail, NaN otherwise. Under `'total'`
-(spec/QIJ_mods_waves.md A20, the method, no switch) `psi_hat` is a
-per-point STATE vector, rewritten in place after every measurement and
-reported as-is (`rho` stays NaN); `joint_n_update_scale`/
-`joint_n_update_shift`/`joint_n_update_negative`/`joint_pilot_err_btw`
-are its own products, 0/NaN under `'perbin'`, which never updates
-anything. Which bin is split next reads the bin's own measured error
-against the update's noise term, falling back to the current vector's
-within-variance (the A20 amendment, 2 October); `joint_rank_rule`
-('measured_error', 'n/a' under `'perbin'`) and `joint_bin_ebar` (each
-final bin's own error, beside `joint_bin_U`/`joint_bin_m`) record it.
+`fit_weights` (spec/QIJ_mass_weighted_fit_spec.md), beside `gptrend`/
+`gpwidth` the GP pilot's own settings (A21: "they shape the vector's
+population"), picks the pilot's own kernel-regression noise: `'none'`
+(the default, every product byte-identical) or `'mass'` (a
+per-observation noise diagonal 1/m_tilde_j in place of the identity, in
+both the profiled marginal likelihood and the posterior). `sigma` is
+the GP's per-point posterior sd: under A20/A21's architecture rule it
+is read by no decision and is carried here only as a stored survey
+diagnostic, never as a per-point companion of `psi_hat`.
 
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
@@ -109,18 +93,8 @@ class QIJResult:
     theta_hat: np.ndarray          # (q,)
     theta_hat_full: np.ndarray     # (q_full,) every T output; the search audit's input
     V_btw: np.ndarray              # (q,)
-    V_win_hat: np.ndarray          # (q,) model quantity: under ivqbins='joint', the pilot's
-                                    # within-bin spread including the posterior variance v
-                                    # (check_rule='predicted') or plain psi0 variance with no v
-                                    # (check_rule='measured'; spec/QIJ_joint_check_measured_
-                                    # spec.md 2.5); unaffected under ivqbins='marginal'
+    V_win_hat: np.ndarray          # (q,) model quantity: the joint path's within-bin spread
     V_tot_hat: np.ndarray          # (q,) model quantity: V_btw + V_win_hat
-    L: np.ndarray                  # (q,) int; 0 under ivqbins='joint'
-    n_level_splits: np.ndarray     # (q,) int; 0 under ivqbins='joint'
-    n_adjacency_splits: np.ndarray  # (q,) int; 0 under ivqbins='joint'
-    rho: np.ndarray                # (q,); under ivqbins='joint', core.joint.joint_psi_hat's rho_c
-    gain_ratio: np.ndarray         # (q,); populated by whichever stage ran
-    n_refine_evals: np.ndarray     # (q,) int; 0 under ivqbins='joint'
     ell: np.ndarray                # (q,); NaN under gpwidth='local'
     lam: np.ndarray                # (q,)
     ell_bound: np.ndarray          # (q,) bool; False under gpwidth='local'
@@ -138,71 +112,54 @@ class QIJResult:
     busy_time_total: float
     workers: int
     psi0: np.ndarray               # (N, q)
-    sigma: np.ndarray              # (N, q)
-    psi_hat: np.ndarray            # (N, q); under ivqbins='joint', core.joint.joint_psi_hat's field
-    bin_label: np.ndarray          # (N, q) int; -1 under ivqbins='joint'
-    bin_U: Tuple[np.ndarray, ...]  # per output (L_c, q); every measured output's
-                                    # derivative on this output's own final bins
-                                    # (spec/QIJ_mods_waves.md A14); empty under 'joint'
-    refine_schedule: str            # 'queue' or 'rounds' (A14); inert under 'joint'
-    n_rounds: int                   # rounds run under 'rounds'; 0 under 'queue' or 'joint'
+    sigma: np.ndarray              # (N, q) the GP posterior sd; a stored survey diagnostic
+                                    # only (THE ARCHITECTURE RULE, spec/QIJ_mods_waves.md
+                                    # A20/A21) -- read by no decision
+    psi_hat: np.ndarray            # (N, q); the joint path's final per-point STATE vector
+                                    # (A20), rewritten in place after every measurement
     bmu: np.ndarray                # (N,) int
     prototype_p: np.ndarray        # (M,)
     prototype_w: np.ndarray        # (M,) or (M, d), native coordinates
     prototype_I: np.ndarray        # (M, q)
     prototype_h: np.ndarray        # (M,) local CONN spacing; NaN under gpwidth='global'
-    ivqbins: str                   # 'marginal' or 'joint' (method_notes joint section)
     survey: str                    # 'points' or 'moments' (method_notes section 2)
-    joint_S_pred: np.ndarray       # (q,) predicted within share at end of growth; NaN under 'marginal'
-    joint_a: np.ndarray            # (q,) the check's fitted scale factor; NaN under 'marginal'
-    joint_S_pred_pre_lloyd: np.ndarray  # (q,); NaN under 'marginal' or when the Lloyd pass did not run
-    joint_L0: int                  # bins after growth; 0 under 'marginal'
-    joint_L: int                   # final joint bin count after the check; 0 under 'marginal'
+    joint_S_pred: np.ndarray       # (q,) predicted within share at end of growth
+    joint_a: np.ndarray            # (q,) the A18 scale factor (spec/QIJ_mods_waves.md A18)
+    joint_S_pred_pre_lloyd: np.ndarray  # (q,); NaN when the Lloyd pass did not run
+    joint_L0: int                  # bins after growth
+    joint_L: int                   # final bin count after the continuation
     joint_n_growth_rounds: int
     joint_growth_capped: bool
-    joint_n_flagged: int
     joint_n_check_rounds: int
     joint_n_check_evals: int
     joint_n_level_splits: int
-    joint_n_adjacency_splits: int
     joint_check_capped: bool
-    joint_n_closed_unpaid: int     # check_rule='measured' only, 0 under 'predicted' (spec/
-                                    # QIJ_joint_check_measured_spec.md 2.4): splits whose two
-                                    # children were closed because the split did not pay
-    joint_n_closed_unflagged: int  # check_rule='measured' only, 0 under 'predicted' (spec
-                                    # 2.4): children of a paying split closed by the pilot's
-                                    # own flag alone
-    joint_n_noise_floored: int     # check_rule='measured' only, 0 under 'predicted' (spec
-                                    # 2.4): splits whose deciding tau' was the noise floor
-    joint_sum_b_delta: np.ndarray  # (q,) check_rule='measured' only, NaN under 'predicted'
-                                    # (spec 2.4-2.5): summed finite-difference noise-bias
-                                    # floor over every split measured, the residual bias left
-                                    # in V_btw (never subtracted from it)
-    joint_failed: bool             # a failed output, or a failed initial bin measurement before any check ran
-    joint_bin_mass: np.ndarray     # (L,); empty under 'marginal'
-    joint_bin_U: np.ndarray        # (L, q); empty under 'marginal'
-    joint_bin_m: np.ndarray        # (L, q); empty under 'marginal'
-    joint_bin_flagged: np.ndarray  # (L,) bool; empty under 'marginal'
-    joint_bin_label: np.ndarray    # (N,) int; -1 under 'marginal'
-    joint_busy_delta: float        # 0.0 under 'marginal'
+    joint_failed: bool             # a failed output, or a failed initial bin measurement
+                                    # before any continuation ran
+    joint_bin_mass: np.ndarray     # (L,)
+    joint_bin_U: np.ndarray        # (L, q) the measured bin mean
+    joint_bin_m: np.ndarray        # (L, q) the leaf's own m_pre (THE ARCHITECTURE RULE,
+                                    # spec/QIJ_mods_waves.md A20/A21): psi_hat's mean over the
+                                    # leaf's points at measurement time, never a fixed copy of
+                                    # the pilot (A21's own fix to the A20 build)
+    joint_bin_label: np.ndarray    # (N,) int
+    joint_busy_delta: float
     joint_share_final: np.ndarray  # (q,) final V_win_hat/(V_btw+V_win_hat) per measured
-                                    # output; NaN under 'marginal' or a failed draw
-    joint_n_update_scale: np.ndarray     # (q,) int; A20 (spec/QIJ_mods_waves.md), tree_rule=
-                                          # 'total' only, 0 under 'marginal'/'perbin': bins
-                                          # whose state-vector update scaled (`core.joint.
+                                    # output; NaN on a failed draw
+    joint_n_update_scale: np.ndarray     # (q,) int; A20 (spec/QIJ_mods_waves.md): bins whose
+                                          # state-vector update scaled (`core.joint.
                                           # _apply_update`'s own count, every measured bin)
     joint_n_update_shift: np.ndarray     # (q,) int; ditto, shifted instead of scaled
     joint_n_update_negative: np.ndarray  # (q,) int; ditto, of n_update_scale, a negative ratio
     joint_pilot_err_btw: np.ndarray      # (q,) A20: sum_k p_k*(U_k-m_k^pilot)^2/N over the
                                           # stage-1 leaves (the between-leaf part of the
-                                          # pilot's error variance, V_btw's own O(1/N) scale);
-                                          # NaN under 'marginal'/'perbin' or a failed draw
-    joint_rank_rule: str                 # A20 amendment (2 October): 'measured_error' under
-                                          # tree_rule='total' (the method, no switch), 'n/a'
-                                          # under 'marginal'/'perbin'
+                                          # PILOT's own error variance, V_btw's own O(1/N)
+                                          # scale, deliberately read from the fixed pilot mean
+                                          # -- unrelated to joint_bin_m); NaN on a failed draw
+    joint_rank_rule: str                 # A20 amendment (2 October): always 'measured_error'
+                                          # (the method, no switch); 'n/a' on a failed draw
     joint_bin_ebar: np.ndarray           # (L,q) A20 amendment: each final bin's own measured
-                                          # error at creation, beside joint_bin_U/joint_bin_m;
-                                          # (0,q) under 'marginal'/'perbin'
+                                          # error at creation, beside joint_bin_U/joint_bin_m
     a: np.ndarray                  # (q,) ABC acceleration (spec/QIJ_mods_waves.md A10)
     b_hat: np.ndarray              # (q,) ABC second-order bias (A10)
     c_q: np.ndarray                # (q,) ABC curvature-along-influence, survey-row evaluated (A10)
@@ -212,20 +169,8 @@ class QIJResult:
                                     # without `takes_start`
     survey_step_ratio: np.ndarray  # (5, q) A9 item 4; NaN rows/columns as eta_Q is
     quantized_start: str           # 'multistart' or 'full-data' (A9 item 5)
-    pilot: str                     # 'affine' or 'gp' (spec/QIJ_affine_pilot_spec.md 1)
-    check_rule: str                # 'predicted' or 'measured' (spec/QIJ_joint_check_measured_
-                                    # spec.md); inert under ivqbins='marginal'
     fit_weights: str               # 'none' or 'mass' (spec/QIJ_mass_weighted_fit_spec.md);
-                                    # unused under pilot='affine'
-    tree_rule: str                  # 'perbin' or 'total'; inert under ivqbins='marginal';
-                                     # 'total' requires ivqbins='joint' and pilot='gp'
-    bridge_j: np.ndarray           # (P,) int; empty under pilot='gp'
-    bridge_k: np.ndarray           # (P,) int; empty under pilot='gp'
-    bridge_m: np.ndarray           # (P,) m_jk; empty under pilot='gp'
-    bridge_delta: np.ndarray       # (P, q) Delta_jk; empty under pilot='gp'
-    cell_p: np.ndarray             # (M,) p_j; empty under pilot='gp'
-    cell_mu: np.ndarray            # (M, d_z) mu_j; empty under pilot='gp'
-    cell_g: np.ndarray             # (M, d_z, q) g_j; empty under pilot='gp'
+                                    # the GP pilot's own setting, beside gptrend/gpwidth
     sigma_points: bool              # spec/QIJ_sigma_points_spec.md 1
     sigma_status: Optional[str]     # None under sigma_points=False; else 'ok'/
                                      # 'base_unconverged'/'eval_failed'

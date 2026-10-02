@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.9
 """CLI: one (dataset, estimator, method) over a range of draws (Section
 6.2). `--out` is the study root; the method folder's name is derived
-from the run's configuration (e.g. `qij_gp_eps0.02`) and recorded, then
+from the run's configuration (e.g. `qij_eps0.02`) and recorded, then
 checked on every later run, in that folder's `config.json`.
 
     python scripts/run.py pareto tail qij --N 2000 --draws 0:1000 --out runs/cloudfil_s1000
@@ -48,25 +48,14 @@ def main(argv=None) -> None:
                    help='qijt within-term pairs (required for qijt)')
     p.add_argument('--budget-quad', dest='budget_quad', type=int, default=None,
                    help='qijt quadratic contrasts (required for qijt)')
-    p.add_argument('--ivqbins', choices=['marginal', 'joint'], default='marginal')
     p.add_argument('--survey', choices=['points', 'moments'], default='points')
     p.add_argument('--quantized-start', dest='quantized_start',
                     choices=['multistart', 'full-data'], default='multistart')
-    p.add_argument('--refine-schedule', dest='refine_schedule',
-                    choices=['queue', 'rounds'], default='queue')
-    p.add_argument('--pilot', choices=['affine', 'gp'], default='affine',
-                    help='qij: the stage-1 initial influence estimate')
     p.add_argument('--sigma-points', dest='sigma_points', action='store_true',
                     help='qij: the optional sigma-points interval stage after refinement')
-    p.add_argument('--check-rule', dest='check_rule', choices=['predicted', 'measured'],
-                    default='predicted',
-                    help='qij: the joint check continuation rule (ivqbins=joint)')
     p.add_argument('--fit-weights', dest='fit_weights', choices=['none', 'mass'],
                     default='none',
-                    help='qij: the pilot fit\'s kernel-regression noise (pilot=gp)')
-    p.add_argument('--tree-rule', dest='tree_rule', choices=['perbin', 'total'],
-                    default='total',
-                    help='qij: the joint tree\'s growth/share rule (ivqbins=joint, pilot=gp; default total)')
+                    help='qij: the GP pilot fit\'s kernel-regression noise')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
@@ -81,12 +70,10 @@ def main(argv=None) -> None:
     config = dict(method=args.method, dataset=args.dataset, estimator=args.estimator,
                   N=args.N, seed=args.seed)
     if args.method == 'qij':
-        config.update(eps=args.eps, pilot=args.pilot, gptrend=args.gptrend,
-                      gpwidth=args.gpwidth, M_X=args.M_X, ivqbins=args.ivqbins,
+        config.update(eps=args.eps, gptrend=args.gptrend,
+                      gpwidth=args.gpwidth, M_X=args.M_X,
                       survey=args.survey, quantized_start=args.quantized_start,
-                      refine_schedule=args.refine_schedule, sigma_points=args.sigma_points,
-                      check_rule=args.check_rule, fit_weights=args.fit_weights,
-                      tree_rule=args.tree_rule)
+                      sigma_points=args.sigma_points, fit_weights=args.fit_weights)
     elif args.method == 'boot':
         config['B'] = args.B
     elif args.method == 'ijfd':
@@ -122,19 +109,15 @@ def main(argv=None) -> None:
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \
             if args.diag_draws else []
         params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
-                      ivqbins=args.ivqbins, survey=args.survey,
-                      quantized_start=args.quantized_start,
-                      refine_schedule=args.refine_schedule, pilot=args.pilot,
-                      sigma_points=args.sigma_points, check_rule=args.check_rule,
-                      fit_weights=args.fit_weights, tree_rule=args.tree_rule)
+                      survey=args.survey, quantized_start=args.quantized_start,
+                      sigma_points=args.sigma_points, fit_weights=args.fit_weights)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
             workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
-            ivqbins=args.ivqbins, survey=args.survey, quantized_start=args.quantized_start,
-            refine_schedule=args.refine_schedule, pilot=args.pilot,
-            sigma_points=args.sigma_points, check_rule=args.check_rule,
-            fit_weights=args.fit_weights, tree_rule=args.tree_rule, tag=tag)
+            survey=args.survey, quantized_start=args.quantized_start,
+            sigma_points=args.sigma_points,
+            fit_weights=args.fit_weights, tag=tag)
     elif args.method == 'qijdt':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \

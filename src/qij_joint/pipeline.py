@@ -152,42 +152,36 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
 
 def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> dict:
     """One `qij` scalar row: `QIJResult`'s scalars flattened to columns
-    per stage and per output, plus `ivqbins`, `survey`, `quantized_start`,
-    `refine_schedule`/`n_rounds` (the marginal path's own schedule,
-    spec/QIJ_mods_waves.md A14), `eta_full` (A15), the ABC interval's
-    ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`, `eta_Q`,
-    spec/QIJ_mods_waves.md A10) and the joint scalars from the joint
-    second stage (spec/method_notes.md section 6) -- the joint scalars
-    inert under `ivqbins='marginal'`. `check_rule` (spec/QIJ_joint_
-    check_measured_spec.md) is recorded whether or not it is inert, and
-    `n_closed_unpaid`/`n_closed_unflagged`/`n_noise_floored`/
-    `sum_b_delta_<o>` are its own products, 0/NaN under
-    `check_rule='predicted'`. The joint check's own scale factor
-    (B6, also lettered `a` in the spec) is `joint_a_<o>` here, kept
-    distinct from A10's `a_<o>` (the ABC acceleration, populated under
-    both `ivqbins` values) and from A15's own `a_c_<o>` (the marginal
-    measured trigger's own scale factor, B4's formula reused at one
-    output). `fit_weights` (spec/QIJ_mass_weighted_fit_spec.md) is
-    recorded whether or not it is inert (`pilot='affine'`). `tree_rule`
-    is recorded whether or not it is inert (`ivqbins='marginal'`), and
-    `share_final_<o>` is its own per-output product (the final
-    V_win_hat/(V_btw+V_win_hat), NaN under `ivqbins='marginal'` or a
-    failed draw). `rank_rule` (A20 amendment, spec/QIJ_mods_waves.md,
-    recorded whether or not inert) is `'measured_error'` under
-    `tree_rule='total'`, `'n/a'` otherwise; `n_update_scaled_<o>`/
-    `n_update_shifted_<o>`/`n_update_negative_<o>`/`pilot_err_btw_<o>`
-    (A20) are its own per-output products, 0/NaN under
-    `tree_rule='perbin'`, which never updates the state vector."""
+    per stage and per output, plus `survey`, `quantized_start`,
+    `eta_full` (A15), the ABC interval's ingredients (`a`, `b_hat`,
+    `c_q`, `c_q_one_sided`, `eta_Q`, spec/QIJ_mods_waves.md A10) and the
+    joint second stage's own scalars (spec/method_notes.md section 6).
+    The joint path's own scale factor (also lettered `a` in the spec)
+    is `joint_a_<o>` here, kept distinct from A10's `a_<o>` (the ABC
+    acceleration). `fit_weights` (spec/QIJ_mass_weighted_fit_spec.md) is
+    recorded; `share_final_<o>` is its own per-output product (the final
+    V_win_hat/(V_btw+V_win_hat), NaN on a failed draw). `rank_rule`
+    (A20 amendment, spec/QIJ_mods_waves.md) is always 'measured_error';
+    `n_update_scaled_<o>`/`n_update_shifted_<o>`/`n_update_negative_<o>`/
+    `pilot_err_btw_<o>` (A20) are its own per-output products. A21
+    (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/`check_rule`/
+    `tree_rule`/`refine_schedule`/`n_rounds` as both switches and
+    columns, along with every column that only ever reported the
+    marginal path, the affine pilot or the per-bin check's own
+    flag/pay bookkeeping (`gain_ratio_<o>`, `n_flagged`, `n_closed_
+    unpaid`, `n_closed_unflagged`, `n_noise_floored`, `sum_b_delta_<o>`,
+    the per-output `L_<o>`/`n_level_splits_<o>`/`n_adjacency_splits_<o>`/
+    `n_refine_evals_<o>`/`rho_<o>`, and the `bridge`/`cells` array
+    products): the code that produced them no longer exists."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
-           's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
-           'fit_weights': res.fit_weights, 'tree_rule': res.tree_rule,
+           's': s, 'seed': seed,
+           'fit_weights': res.fit_weights,
            'rank_rule': res.joint_rank_rule,
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
-           'ivqbins': res.ivqbins, 'survey': res.survey,
+           'survey': res.survey,
            'quantized_start': res.quantized_start, 'eta_Q': float(res.eta_Q),
-           'eta_full': float(res.eta_full),
-           'refine_schedule': res.refine_schedule, 'n_rounds': int(res.n_rounds)}
+           'eta_full': float(res.eta_full)}
     for stage in ('prototype', 'full_data', 'refinement', 'curvature', 'eta_full', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
@@ -199,15 +193,9 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['L'] = int(res.joint_L)
     row['n_growth_rounds'] = int(res.joint_n_growth_rounds)
     row['growth_capped'] = bool(res.joint_growth_capped)
-    row['n_flagged'] = int(res.joint_n_flagged)
     row['n_check_rounds'] = int(res.joint_n_check_rounds)
     row['n_check_evals'] = int(res.joint_n_check_evals)
     row['check_capped'] = bool(res.joint_check_capped)
-    # check_rule='measured' only (spec/QIJ_joint_check_measured_spec.md
-    # 2.4-2.5); 0 under 'predicted'.
-    row['n_closed_unpaid'] = int(res.joint_n_closed_unpaid)
-    row['n_closed_unflagged'] = int(res.joint_n_closed_unflagged)
-    row['n_noise_floored'] = int(res.joint_n_noise_floored)
     # The sigma-points stage (spec/QIJ_sigma_points_spec.md 3): its own
     # 'sigma' stage entry (outside the loop above, whose own product
     # names -- 'wall_sigma', not 'wall_time_sigma' -- differ from the
@@ -227,13 +215,6 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'V_btw_{o}'] = float(res.V_btw[j])
         row[f'V_win_hat_{o}'] = float(res.V_win_hat[j])
         row[f'V_tot_hat_{o}'] = float(res.V_tot_hat[j])
-        row[f'L_{o}'] = int(res.L[j])
-        row[f'n_level_splits_{o}'] = int(res.n_level_splits[j])
-        row[f'n_adjacency_splits_{o}'] = int(res.n_adjacency_splits[j])
-        row[f'rho_{o}'] = float(res.rho[j])
-        row[f'gain_ratio_{o}'] = float(res.gain_ratio[j])
-        row[f'sum_b_delta_{o}'] = float(res.joint_sum_b_delta[j])
-        row[f'n_refine_evals_{o}'] = int(res.n_refine_evals[j])
         row[f'ell_{o}'] = float(res.ell[j])
         row[f'lam_{o}'] = float(res.lam[j])
         row[f'ell_bound_{o}'] = bool(res.ell_bound[j])
@@ -275,65 +256,36 @@ def _qij_step_ratio(res) -> pd.DataFrame:
 
 def _qij_points(res) -> pd.DataFrame:
     """`points` for `--diag-draws`: `i, bmu, psi0_<o>, sigma_<o>,
-    psi_hat_<o>, bin_label_<o>` under `ivqbins='marginal'`; under
-    `'joint'` a single shared `bin_label` in place of the per-output
-    labels, since every output shares one partition
-    (spec/method_notes.md section 6)."""
+    psi_hat_<o>, bin_label` -- a single shared `bin_label` (not one per
+    output), since every output shares one partition
+    (spec/method_notes.md section 6; A21, spec/QIJ_mods_waves.md,
+    removed the per-output marginal path this used to also serve)."""
     N = res.psi0.shape[0]
-    data = {'i': np.arange(N), 'bmu': np.asarray(res.bmu, dtype=np.int32)}
+    data = {'i': np.arange(N), 'bmu': np.asarray(res.bmu, dtype=np.int32),
+            'bin_label': np.asarray(res.joint_bin_label, dtype=np.int32)}
     for j, o in enumerate(res.outputs):
         data[f'psi0_{o}'] = res.psi0[:, j]
         data[f'sigma_{o}'] = res.sigma[:, j]
         data[f'psi_hat_{o}'] = res.psi_hat[:, j]
-        if res.ivqbins == 'marginal':
-            data[f'bin_label_{o}'] = np.asarray(res.bin_label[:, j], dtype=np.int32)
-    if res.ivqbins == 'joint':
-        data['bin_label'] = np.asarray(res.joint_bin_label, dtype=np.int32)
     return pd.DataFrame(data)
 
 
 def _qij_bins(res) -> pd.DataFrame:
-    """`bins` for `--diag-draws` under `ivqbins='joint'`: `k, bin_mass,
-    bin_flagged, U_<o>, m_<o>`, the shared bin constituents of the joint
-    second stage (spec/method_notes.md section 6); under `tree_rule=
-    'total'` (A20 amendment, spec/QIJ_mods_waves.md) also `ebar_<o>`,
-    each final bin's own measured error at creation -- `joint_bin_ebar`
-    is (0,q) under `tree_rule='perbin'`, which never populates it, so
-    those columns are added only under `'total'`."""
+    """`bins` for `--diag-draws`: `k, bin_mass, U_<o>, m_<o>, ebar_<o>`,
+    the shared bin constituents of the joint second stage
+    (spec/method_notes.md section 6): `m_<o>` is the leaf's own m_pre
+    (THE ARCHITECTURE RULE, spec/QIJ_mods_waves.md A20/A21), not a
+    fixed copy of the pilot; `ebar_<o>` is the A20 ranking amendment's
+    own per-leaf diagnostic, each final bin's own measured error at
+    creation. A21 removed the per-bin check's own flag concept
+    (`bin_flagged`), which no longer applies to any bin."""
     L = res.joint_bin_mass.shape[0]
-    data = {'k': np.arange(L), 'bin_mass': res.joint_bin_mass,
-            'bin_flagged': np.asarray(res.joint_bin_flagged, dtype=bool)}
+    data = {'k': np.arange(L), 'bin_mass': res.joint_bin_mass}
     for j, o in enumerate(res.outputs):
         data[f'U_{o}'] = res.joint_bin_U[:, j]
         data[f'm_{o}'] = res.joint_bin_m[:, j]
-        if res.tree_rule == 'total':
-            data[f'ebar_{o}'] = res.joint_bin_ebar[:, j]
+        data[f'ebar_{o}'] = res.joint_bin_ebar[:, j]
     return pd.DataFrame(data)
-
-
-def _qij_bin_U(res) -> pd.DataFrame:
-    """`bin_U` for EVERY `qij` draw under `ivqbins='marginal'`
-    (spec/QIJ_mods_waves.md A14's bin_U product, not gated behind
-    `--diag-draws` -- the comparison layer needs it every draw to form
-    Cov_btw(c, c') = sum_k p_k U_kc U_kc' per draw over the S-draw
-    study): one long table keyed by `output`, `output, k, bin_mass,
-    U_<o>` for every measured output `o` -- each row is one of THAT
-    output's own final I-VQ bins, and `U_<o>` is every measured
-    output's derivative on it, mirroring `_qij_bins`'s joint-path
-    columns (kept under the distinct product name `bin_U` so the two
-    tables' gating -- this one always written, the joint `bins` table
-    diag-only -- stays independent). Bin mass is recovered from
-    `bin_label` (already stored per point) rather than stored again, no
-    new evaluation spent either way."""
-    frames = []
-    for j, o in enumerate(res.outputs):
-        L = res.bin_U[j].shape[0]
-        mass = np.bincount(res.bin_label[:, j], minlength=L) / res.N
-        data = {'output': o, 'k': np.arange(L), 'bin_mass': mass}
-        for j2, o2 in enumerate(res.outputs):
-            data[f'U_{o2}'] = res.bin_U[j][:, j2]
-        frames.append(pd.DataFrame(data))
-    return pd.concat(frames, ignore_index=True)
 
 
 def _qij_prototypes(res) -> pd.DataFrame:
@@ -347,31 +299,6 @@ def _qij_prototypes(res) -> pd.DataFrame:
     for j, o in enumerate(res.outputs):
         data[f'I_{o}'] = res.prototype_I[:, j]
     data['h'] = res.prototype_h
-    return pd.DataFrame(data)
-
-
-def _qij_bridge(res) -> pd.DataFrame:
-    """`bridge` for every `qij` draw under `pilot='affine'`: j, k, m_jk,
-    Delta_<o> per measured output (spec/QIJ_affine_pilot_spec.md 2.2, 4)."""
-    data = {'j': res.bridge_j, 'k': res.bridge_k, 'm_jk': res.bridge_m}
-    for j, o in enumerate(res.outputs):
-        data[f'Delta_{o}'] = res.bridge_delta[:, j]
-    return pd.DataFrame(data)
-
-
-def _qij_cells(res) -> pd.DataFrame:
-    """`cells` for every `qij` draw under `pilot='affine'`: j, p_j, mu_j
-    (one column per Z dimension), g_j per measured output (one column
-    per Z dimension) (spec/QIJ_affine_pilot_spec.md 2.1, 2.3, 4)."""
-    M = res.cell_p.shape[0]
-    mu = np.atleast_2d(np.asarray(res.cell_mu, dtype=float).reshape(M, -1))
-    data = {'j': np.arange(M), 'p_j': res.cell_p}
-    for d in range(mu.shape[1]):
-        data[f'mu_{d}'] = mu[:, d]
-    for j, o in enumerate(res.outputs):
-        g = res.cell_g[:, :, j]
-        for d in range(g.shape[1]):
-            data[f'g_{o}_{d}'] = g[:, d]
     return pd.DataFrame(data)
 
 
@@ -389,38 +316,31 @@ def _qij_sigma_points(res) -> pd.DataFrame:
 def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
             out_dir: str, eps: float, diag_draws: Optional[Iterable[int]], force: bool,
             workers: int = 1, gptrend: str = 'affine', gpwidth: str = 'global',
-            M_X: Optional[int] = None, ivqbins: str = 'marginal',
+            M_X: Optional[int] = None,
             survey: str = 'points', quantized_start: str = 'multistart',
-            refine_schedule: str = 'queue', pilot: str = 'affine',
-            sigma_points: bool = False, check_rule: str = 'predicted',
-            fit_weights: str = 'none', tree_rule: str = 'total',
+            sigma_points: bool = False,
+            fit_weights: str = 'none',
             tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
-    prototype survey (method_notes section 2), under `ivqbins='joint'`
-    the shared bins' full-data stencils, and under `refine_schedule=
-    'rounds'` (spec/QIJ_mods_waves.md A14) the marginal refinement's own
-    rounds run in parallel -- the rest of a draw is serial regardless of
-    `workers`. `survey` picks the prototype survey's receptive-field
-    representation (spec/method_notes.md section 2); `quantized_start`
-    picks theta_Q's starting point (spec/QIJ_mods_waves.md A9 item 5).
-    Every draw also writes a
-    `step_ratio` array (A9 item 4) and, under `ivqbins='marginal'`, a
-    `bin_U` array (spec/QIJ_mods_waves.md A14), neither gated behind
-    `--diag-draws` like `points`/`prototypes`/`bins` are. `pilot`
-    (spec/QIJ_affine_pilot_spec.md) picks stage 1's initial influence
-    estimate; under `'affine'`, every draw also writes the `bridge` and
-    `cells` array products (section 4). `sigma_points`
+    prototype survey (method_notes section 2) and the joint second
+    stage's own shared bins' full-data stencils run in parallel -- the
+    rest of a draw is serial regardless of `workers`. `survey` picks
+    the prototype survey's receptive-field representation
+    (spec/method_notes.md section 2); `quantized_start` picks theta_Q's
+    starting point (spec/QIJ_mods_waves.md A9 item 5). Every draw also
+    writes a `step_ratio` array (A9 item 4), not gated behind
+    `--diag-draws` like `points`/`prototypes`/`bins` are. `sigma_points`
     (spec/QIJ_sigma_points_spec.md), off by default, runs the optional
     sigma-points interval stage after refinement; when True, every draw
-    also writes the `sigma_points` array product. `check_rule`
-    (spec/QIJ_joint_check_measured_spec.md) picks the joint check's
-    continuation rule, inert under `ivqbins='marginal'`. `fit_weights`
-    (spec/QIJ_mass_weighted_fit_spec.md) picks the pilot's own
-    kernel-regression noise, unused under `pilot='affine'`. `tree_rule`
-    picks the joint tree's own growth/share rule, inert under
-    `ivqbins='marginal'`; `'total'` requires `ivqbins='joint'` and
-    `pilot='gp'`."""
+    also writes the `sigma_points` array product. `fit_weights`
+    (spec/QIJ_mass_weighted_fit_spec.md) picks the GP pilot's own
+    kernel-regression noise. A21 (spec/QIJ_mods_waves.md A21) removed
+    `ivqbins`/`pilot`/`refine_schedule`/`check_rule`/`tree_rule` as both
+    parameters and products: the joint second stage under the total-
+    share state-vector rule is the only method, so the `bridge`/
+    `cells` array products (the affine pilot) and the `bin_U` array
+    product (the marginal path's own per-output bins) no longer exist."""
     draws = list(draws)
     md = products.method_dir(out_dir, dataset, estimator, N, 'qij', tag)
     diag = set(diag_draws) if diag_draws is not None else set()
@@ -434,31 +354,19 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         dseed = seed + s
         X = case.draw(N, dseed)
         res = QIJ(eps=eps, seed=dseed, vq_transform=case.vq_transform,
-                  gptrend=gptrend, gpwidth=gpwidth, M_X=M_X, ivqbins=ivqbins,
+                  gptrend=gptrend, gpwidth=gpwidth, M_X=M_X,
                   survey=survey, quantized_start=quantized_start,
-                  refine_schedule=refine_schedule, pilot=pilot,
-                  sigma_points=sigma_points, check_rule=check_rule,
-                  fit_weights=fit_weights, tree_rule=tree_rule).fit(X, T, pool=pool)
+                  sigma_points=sigma_points,
+                  fit_weights=fit_weights).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res)}
-        # `bin_U` (A14) is its own product name, distinct from the
-        # joint path's `bins`, so it can be written every draw while
-        # `bins` stays diag-gated below -- the comparison layer's
-        # per-draw Cov_btw needs it whether or not the draw is a
-        # `--diag-draws` one.
-        if ivqbins == 'marginal':
-            arrays['bin_U'] = _qij_bin_U(res)
-        if pilot == 'affine':
-            arrays['bridge'] = _qij_bridge(res)
-            arrays['cells'] = _qij_cells(res)
         if res.sigma_points:
             arrays['sigma_points'] = _qij_sigma_points(res)
         if s in diag:
             arrays['points'] = _qij_points(res)
             arrays['prototypes'] = _qij_prototypes(res)
-            if ivqbins == 'joint':
-                arrays['bins'] = _qij_bins(res)
+            arrays['bins'] = _qij_bins(res)
         products.write_draw(md, s, row, arrays)
         written += 1
     if pool is not None:

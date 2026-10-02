@@ -1,29 +1,27 @@
 """
-The I-VQ: bins of the initial influence estimate psi0_c, one quantizer
-per estimand coordinate, and each bin's central-stencil measurement on
-the full data (spec/method_notes.md sections 1 and 4).
-
-`build_bins` runs 1-D k-means on the raw psi0_c values at the initial
-count M_init = min(ceil(sqrt(2.7/eps)), n_distinct). `bin_differences`
-measures the resulting bins on the full data, serially or as pool tasks
+The I-VQ bin machinery shared by the joint second stage and `ijfd`
+(spec/method_notes.md sections 1 and 4; spec/QIJ_mods_waves.md A21):
+`BinSet` holds one partition's full-data measurement, `bin_differences`
+measures a `BinSet`'s bins on the full data, serially or as pool tasks
 (method_notes section 4), giving each bin's finite-differenced
 influence U_k and its stencil curvature D2_k = d2T_k/t_k^2, t_k the
 stencil's own step (spec/QIJ_mods_waves.md A10). `between_terms`
 reduces U to V_btw; `bias_and_acceleration` reduces U/D2 to the ABC
-interval's bias and acceleration ingredients (A10). `kmeans_1d` lives
-here, not in `refine.py`, because `build_bins` and `refine.py`'s level
-split both use the same one-dimensional quantizer.
+interval's bias and acceleration ingredients (A10).
 
-A failed evaluation of an initial bin (spec section 5) makes the whole
-draw's QIJ result for this coordinate a write-off: `bin_differences`
-stops at the bin that failed and returns a `BinSet` with `failed=True`
-and `U`/`D2` all NaN; `refine.run_refinement` turns that into a NaN
-`CoordinateResult`.
+A21 removed this module's own quantizer (`kmeans_1d`, `build_bins`,
+`within_share`): both built the marginal path's per-coordinate initial
+partition (`refine.py`, removed in the same wave); the joint path's own
+partition is grown by `core.joint.grow` directly on psi0_all, never
+through this module.
+
+A failed evaluation of a bin (spec section 5) makes the whole draw's
+result a write-off: `bin_differences` stops at the bin that failed and
+returns a `BinSet` with `failed=True` and `U`/`D2` all NaN.
 """
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass, replace
 from typing import Tuple
@@ -34,8 +32,7 @@ from ..parallel import call_T
 from .differences import central_step, difference, perturbed_weights, step_parameter
 
 __all__ = [
-    "BinSet", "kmeans_1d", "within_share", "build_bins", "bin_differences",
-    "between_terms", "bias_and_acceleration",
+    "BinSet", "bin_differences", "between_terms", "bias_and_acceleration",
 ]
 
 
@@ -50,10 +47,10 @@ class BinSet:
     U         (M_used, q) centered bin influences, (M_used, 0) before
               `bin_differences` has run.
     centering_residual  (q,) the bin-mass-weighted residual sum_k p_k
-              U_k subtracted out of U; `refine.run_refinement` subtracts
-              this same residual from every split it measures, so a
-              split's U stays on the initial bins' centered scale.
-              zeros(0) before `bin_differences` has run.
+              U_k subtracted out of U; a later split (`core.joint`)
+              subtracts this same residual from every split it
+              measures, so a split's U stays on the initial bins'
+              centered scale. zeros(0) before `bin_differences` has run.
     D2        (M_used, q) each bin's stencil curvature d2T_k/t_k^2,
               d2T_k = T(+t) - 2*theta_hat + T(-t) the central-stencil
               second difference and t_k = differences.step_parameter(
@@ -82,116 +79,6 @@ class BinSet:
     def p(self) -> np.ndarray:
         """Bin masses n / N."""
         return self.n / self.labels.size
-
-
-def kmeans_1d(values: np.ndarray, M: int):
-    """
-    Lloyd's iteration on the sorted 1-D array `values`, M target
-    prototypes (spec/method_notes.md section 4; also `refine.py`'s
-    level split, at M=2).
-
-    Init: the M quantiles at levels (k+1/2)/M of the distinct sorted
-    values. Assignment: `searchsorted` against the midpoints between
-    consecutive prototypes (a boundary value goes to the lower
-    prototype; with one prototype the midpoint array is empty and
-    every point gets label 0). Update: each prototype becomes the mean
-    of its bin, via two `bincount`s (counts, sums); a prototype whose
-    bin is empty after an assignment is dropped and the rest
-    relabelled contiguously. Converges when the assignment is unchanged
-    from the previous iteration, or after 100 iterations.
-
-    Returns (labels, prototypes): labels (N,) int, contiguous
-    0..M_used-1, ordered by increasing prototype value; prototypes
-    (M_used,), strictly increasing.
-    """
-    v = np.asarray(values, dtype=float).ravel()
-    u = np.unique(v)
-    M = int(M)
-
-    prototypes = np.quantile(u, (np.arange(M) + 0.5) / M)
-
-    prev_labels = None
-    labels = None
-    for _ in range(100):
-        mids = (prototypes[:-1] + prototypes[1:]) / 2.0
-        labels = np.searchsorted(mids, v, side="left")
-
-        counts = np.bincount(labels, minlength=prototypes.size)
-        if not counts.all():
-            present = np.flatnonzero(counts)
-            remap = np.full(prototypes.size, -1, dtype=int)
-            remap[present] = np.arange(present.size)
-            labels = remap[labels]
-            prototypes = prototypes[present]
-            counts = counts[present]
-
-        converged = (
-            prev_labels is not None
-            and prev_labels.shape == labels.shape
-            and np.array_equal(prev_labels, labels)
-        )
-        if converged:
-            break
-        prev_labels = labels
-
-        # Every bin is non-empty here, so `counts` is strictly
-        # positive and no mean is undefined.
-        sums = np.bincount(labels, weights=v, minlength=prototypes.size)
-        prototypes = sums / counts
-
-    labels = labels.astype(int)
-    return labels, prototypes
-
-
-def within_share(values: np.ndarray, labels: np.ndarray) -> float:
-    """Share of the plain variance of `values` left inside the bins
-    defined by `labels`: sum_k sum_{i in k}(v_i-mean_k)^2 / sum_i(v_i-mean)^2.
-    0.0 for one bin or zero total variance. Two `bincount` passes
-    (counts, sums), not a per-group Python loop."""
-    v = np.asarray(values, dtype=float).ravel()
-    labels = np.asarray(labels)
-
-    total_var = float(np.sum((v - v.mean()) ** 2))
-    if np.unique(labels).size <= 1 or total_var == 0.0:
-        return 0.0
-
-    counts = np.bincount(labels)
-    sums = np.bincount(labels, weights=v)
-    within = float(np.sum(v ** 2) - np.sum(sums ** 2 / counts))
-    return within / total_var
-
-
-def build_bins(values: np.ndarray, eps: float) -> BinSet:
-    """
-    Build the I-VQ for one coordinate from the raw psi0_c(x_i) at all N
-    points, at the initial count M_init = min(ceil(sqrt(2.7/eps)),
-    n_distinct) (spec/method_notes.md section 4). No minimum bin size,
-    no merging: empty bins are dropped during `kmeans_1d`'s iteration
-    and M_used <= M_init is what the returned `BinSet` reports (the
-    INITIAL bins only; refinement may grow the count further). U comes
-    back (M_used, 0): `bin_differences` fills it in.
-    """
-    v = np.asarray(values, dtype=float).ravel()
-    N = v.size
-    D = int(np.unique(v).size)
-
-    m_ref = math.ceil(math.sqrt(2.7 / eps))
-    M_init = int(min(m_ref, D))
-
-    if M_init <= 1:
-        labels = np.zeros(N, dtype=int)
-        n = np.array([N], dtype=int)
-    else:
-        labels, _prototypes = kmeans_1d(v, M_init)
-        n = np.bincount(labels)
-
-    share = within_share(v, labels)
-    L = int(n.size)
-
-    return BinSet(
-        labels=labels, n=n, U=np.zeros((L, 0)), centering_residual=np.zeros(0),
-        D2=np.zeros((L, 0)), M_init=M_init, M_used=L, within_share=share, failed=False,
-    )
 
 
 def _bin_failed(binset: BinSet, M_used: int, q: int) -> BinSet:
@@ -238,7 +125,7 @@ def bin_differences(
     mass. A NaN in any U_k stops the loop at that bin, returning
     `failed=True` with U/centering_residual/D2 all NaN; otherwise U is
     centered by centering_residual = sum_k p_k U_k, kept on the `BinSet`
-    for `refine.run_refinement` to reuse; D2 = d2T/t_k^2 (spec A10) is
+    for a later split to reuse; D2 = d2T/t_k^2 (spec A10) is
     stored uncentered (a curvature needs no centering). `start` (A9)
     passes through unchanged to every evaluation below (`counter`/
     `call_T` gate it on `takes_start`); `start=None` reproduces today's
