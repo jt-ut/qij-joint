@@ -35,7 +35,18 @@ inert under `ivqbins='marginal'`, picks the joint tree's own growth/share
 rule: `'perbin'` (the default, today's behaviour, byte-identical) or
 `'total'` (`ivqbins='joint'` and `pilot='gp'` only -- a ValueError from
 `QIJ.__init__` otherwise). Both rules fill `QIJResult.joint_share_final`
-(the final V_win_hat/(V_btw+V_win_hat) per measured output).
+(the final V_win_hat/(V_btw+V_win_hat) per measured output). Under
+`'total'` (spec/QIJ_mods_waves.md A20, the method, no switch),
+`run_joint` carries a per-point state vector, rewritten in place after
+every measurement; `QIJResult.psi_hat` is that final vector (`rho` stays
+NaN), in place of the field+rho reconstruction `'perbin'` still builds,
+and `joint_n_update_scale`/`joint_n_update_shift`/
+`joint_n_update_negative`/`joint_pilot_err_btw` are its own products
+(0/NaN under `'perbin'`). A leaf's ranking (which bin to split next)
+reads its own measured error against the update's noise term, falling
+back to the current vector's own within-variance (A20 amendment, 2
+October); `joint_rank_rule` ('measured_error', 'n/a' under `'perbin'`)
+and `joint_bin_ebar` (each final bin's own error) record it.
 `quantized_start`
 (spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
 `'multistart'` (ported) fits theta_Q from scratch on the survey rows;
@@ -138,6 +149,11 @@ def _joint_defaults(N: int, q: int) -> dict:
         joint_bin_m=np.zeros((0, q)), joint_bin_flagged=np.zeros(0, dtype=bool),
         joint_bin_label=np.full(N, -1, dtype=int), joint_busy_delta=0.0,
         joint_share_final=np.full(q, np.nan),
+        # A20 (spec/QIJ_mods_waves.md): 0/NaN under 'marginal' or
+        # 'perbin', the same as every other joint-only product.
+        joint_n_update_scale=np.zeros(q, dtype=int), joint_n_update_shift=np.zeros(q, dtype=int),
+        joint_n_update_negative=np.zeros(q, dtype=int), joint_pilot_err_btw=np.full(q, np.nan),
+        joint_rank_rule='n/a', joint_bin_ebar=np.zeros((0, q)),
     )
 
 
@@ -565,16 +581,27 @@ class QIJ:
                 psi0_all = psi0_all * jr.a[None, :]
                 offset = offset * jr.a
                 sigma_all = sigma_all * jr.a[None, :]
-                # psi_hat/rho (spec/method_notes.md section 6): the
-                # marginal path's own per-coordinate field, evaluated on
-                # the joint path's shared final bins instead of a private
-                # partition per output; NaN (the `_marginal_defaults`
-                # above) when the draw failed, since `bin_label`/`bin_U`
-                # may then be unusable (`joint_psi_hat`'s own docstring).
-                psi_hat, rho = joint_psi_hat(psi0_all, offset, jr.bin_label, jr.bin_U,
-                                              jr.bin_mass, jr.V_btw)
-                second_stage_fields['psi_hat'] = psi_hat
-                second_stage_fields['rho'] = rho
+                if self.tree_rule == 'total':
+                    # A20 (spec/QIJ_mods_waves.md): under 'total' `jr.
+                    # state_psi_hat` IS the method's own per-point
+                    # estimate -- the A18 pilot, rewritten in place by
+                    # every measurement -- taken directly, exactly as
+                    # the seeded branch's own override does
+                    # (`archive/seeded-tree:src/qij_joint/qij.py`); rho
+                    # is NOT produced (stays the `_marginal_defaults`
+                    # NaN above), since there is no field+rho
+                    # reconstruction left to do.
+                    second_stage_fields['psi_hat'] = jr.state_psi_hat
+                else:
+                    # psi_hat/rho (spec/method_notes.md section 6): the
+                    # marginal path's own per-coordinate field, evaluated
+                    # on the joint path's shared final bins instead of a
+                    # private partition per output (tree_rule='perbin'
+                    # only, A20 SCOPE: untouched).
+                    psi_hat, rho = joint_psi_hat(psi0_all, offset, jr.bin_label, jr.bin_U,
+                                                  jr.bin_mass, jr.V_btw)
+                    second_stage_fields['psi_hat'] = psi_hat
+                    second_stage_fields['rho'] = rho
             joint_fields = dict(
                 joint_S_pred=jr.S_pred, joint_a=jr.a,
                 joint_S_pred_pre_lloyd=jr.S_pred_pre_lloyd,
@@ -589,6 +616,13 @@ class QIJ:
                 joint_bin_mass=jr.bin_mass, joint_bin_U=jr.bin_U, joint_bin_m=jr.bin_m,
                 joint_bin_flagged=jr.bin_flagged, joint_bin_label=jr.bin_label,
                 joint_busy_delta=jr.busy_delta, joint_share_final=jr.share_final,
+                # A20: 0/NaN under tree_rule='perbin' (`_run_total`'s
+                # only caller sets real values; `run_joint`'s perbin
+                # return sets q-length 0/NaN explicitly for this reason).
+                joint_n_update_scale=jr.n_update_scale, joint_n_update_shift=jr.n_update_shift,
+                joint_n_update_negative=jr.n_update_negative,
+                joint_pilot_err_btw=jr.pilot_err_btw,
+                joint_rank_rule=jr.rank_rule, joint_bin_ebar=jr.bin_ebar,
             )
         else:
             # One coordinate per MEASURED output only (its own cost is an

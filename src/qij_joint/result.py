@@ -65,7 +65,17 @@ joint tree's own growth/share rule: `'perbin'` (the default, today's
 behaviour, byte-identical) or `'total'` (`ivqbins='joint'` and
 `pilot='gp'` only). `joint_share_final` (the final
 V_win_hat/(V_btw+V_win_hat) per measured output) is populated under
-both rules on a draw that did not fail, NaN otherwise.
+both rules on a draw that did not fail, NaN otherwise. Under `'total'`
+(spec/QIJ_mods_waves.md A20, the method, no switch) `psi_hat` is a
+per-point STATE vector, rewritten in place after every measurement and
+reported as-is (`rho` stays NaN); `joint_n_update_scale`/
+`joint_n_update_shift`/`joint_n_update_negative`/`joint_pilot_err_btw`
+are its own products, 0/NaN under `'perbin'`, which never updates
+anything. Which bin is split next reads the bin's own measured error
+against the update's noise term, falling back to the current vector's
+within-variance (the A20 amendment, 2 October); `joint_rank_rule`
+('measured_error', 'n/a' under `'perbin'`) and `joint_bin_ebar` (each
+final bin's own error, beside `joint_bin_U`/`joint_bin_m`) record it.
 
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
@@ -177,6 +187,22 @@ class QIJResult:
     joint_busy_delta: float        # 0.0 under 'marginal'
     joint_share_final: np.ndarray  # (q,) final V_win_hat/(V_btw+V_win_hat) per measured
                                     # output; NaN under 'marginal' or a failed draw
+    joint_n_update_scale: np.ndarray     # (q,) int; A20 (spec/QIJ_mods_waves.md), tree_rule=
+                                          # 'total' only, 0 under 'marginal'/'perbin': bins
+                                          # whose state-vector update scaled (`core.joint.
+                                          # _apply_update`'s own count, every measured bin)
+    joint_n_update_shift: np.ndarray     # (q,) int; ditto, shifted instead of scaled
+    joint_n_update_negative: np.ndarray  # (q,) int; ditto, of n_update_scale, a negative ratio
+    joint_pilot_err_btw: np.ndarray      # (q,) A20: sum_k p_k*(U_k-m_k^pilot)^2/N over the
+                                          # stage-1 leaves (the between-leaf part of the
+                                          # pilot's error variance, V_btw's own O(1/N) scale);
+                                          # NaN under 'marginal'/'perbin' or a failed draw
+    joint_rank_rule: str                 # A20 amendment (2 October): 'measured_error' under
+                                          # tree_rule='total' (the method, no switch), 'n/a'
+                                          # under 'marginal'/'perbin'
+    joint_bin_ebar: np.ndarray           # (L,q) A20 amendment: each final bin's own measured
+                                          # error at creation, beside joint_bin_U/joint_bin_m;
+                                          # (0,q) under 'marginal'/'perbin'
     a: np.ndarray                  # (q,) ABC acceleration (spec/QIJ_mods_waves.md A10)
     b_hat: np.ndarray              # (q,) ABC second-order bias (A10)
     c_q: np.ndarray                # (q,) ABC curvature-along-influence, survey-row evaluated (A10)

@@ -172,10 +172,16 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     is recorded whether or not it is inert (`ivqbins='marginal'`), and
     `share_final_<o>` is its own per-output product (the final
     V_win_hat/(V_btw+V_win_hat), NaN under `ivqbins='marginal'` or a
-    failed draw)."""
+    failed draw). `rank_rule` (A20 amendment, spec/QIJ_mods_waves.md,
+    recorded whether or not inert) is `'measured_error'` under
+    `tree_rule='total'`, `'n/a'` otherwise; `n_update_scaled_<o>`/
+    `n_update_shifted_<o>`/`n_update_negative_<o>`/`pilot_err_btw_<o>`
+    (A20) are its own per-output products, 0/NaN under
+    `tree_rule='perbin'`, which never updates the state vector."""
     row = {'dataset': dataset, 'estimator': estimator, 'N': N,
            's': s, 'seed': seed, 'pilot': res.pilot, 'check_rule': res.check_rule,
            'fit_weights': res.fit_weights, 'tree_rule': res.tree_rule,
+           'rank_rule': res.joint_rank_rule,
            'gptrend': res.gptrend, 'gpwidth': res.gpwidth,
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'ivqbins': res.ivqbins, 'survey': res.survey,
@@ -246,6 +252,12 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
         row[f'sigma_bias_{o}'] = float(res.sigma_bias[j])
         row[f'lo_sigma_{o}'] = float(lo_sigma[j])
         row[f'hi_sigma_{o}'] = float(hi_sigma[j])
+        # A20 (spec/QIJ_mods_waves.md), tree_rule='total' only; 0/NaN
+        # under 'perbin', which never updates the state vector.
+        row[f'n_update_scaled_{o}'] = int(res.joint_n_update_scale[j])
+        row[f'n_update_shifted_{o}'] = int(res.joint_n_update_shift[j])
+        row[f'n_update_negative_{o}'] = int(res.joint_n_update_negative[j])
+        row[f'pilot_err_btw_{o}'] = float(res.joint_pilot_err_btw[j])
     return row
 
 
@@ -283,13 +295,19 @@ def _qij_points(res) -> pd.DataFrame:
 def _qij_bins(res) -> pd.DataFrame:
     """`bins` for `--diag-draws` under `ivqbins='joint'`: `k, bin_mass,
     bin_flagged, U_<o>, m_<o>`, the shared bin constituents of the joint
-    second stage (spec/method_notes.md section 6)."""
+    second stage (spec/method_notes.md section 6); under `tree_rule=
+    'total'` (A20 amendment, spec/QIJ_mods_waves.md) also `ebar_<o>`,
+    each final bin's own measured error at creation -- `joint_bin_ebar`
+    is (0,q) under `tree_rule='perbin'`, which never populates it, so
+    those columns are added only under `'total'`."""
     L = res.joint_bin_mass.shape[0]
     data = {'k': np.arange(L), 'bin_mass': res.joint_bin_mass,
             'bin_flagged': np.asarray(res.joint_bin_flagged, dtype=bool)}
     for j, o in enumerate(res.outputs):
         data[f'U_{o}'] = res.joint_bin_U[:, j]
         data[f'm_{o}'] = res.joint_bin_m[:, j]
+        if res.tree_rule == 'total':
+            data[f'ebar_{o}'] = res.joint_bin_ebar[:, j]
     return pd.DataFrame(data)
 
 
