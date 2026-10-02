@@ -19,17 +19,30 @@ survey's receptive-field representation, `'points'` (one row per
 prototype) or `'moments'` (spec/method_notes.md section 2), passed to
 `run_xvq`.
 
-Under A20/A21 (spec/QIJ_mods_waves.md, the method, no switch),
-`run_joint` carries psi_hat forward, rewritten in place after every
-measurement; `QIJResult.psi_hat` is that final vector (`rho` stays
-NaN, since there is no field+rho reconstruction left to build it from)
-and `joint_n_update_scale`/`joint_n_update_shift`/
-`joint_n_update_negative`/`joint_pilot_err_btw` are its own products. A
-leaf's ranking (which bin to split next) reads its own measured error
-against the update's noise term, falling back to the current vector's
-own within-variance (A20 amendment, 2 October); `joint_rank_rule`
-(always `'measured_error'`) and `joint_bin_ebar` (each final bin's own
-error) record it.
+Under the unified measured loop (spec/QIJ_unified_loop_spec.md,
+replacing A20/A21's growth/check split), `run_joint` carries psi_hat
+forward from one bin, rewritten in place after every measurement;
+`QIJResult.psi_hat` is that final vector (`rho` stays NaN, since there
+is no field+rho reconstruction left to build it from) and
+`joint_n_update_scale`/`joint_n_update_shift`/`joint_n_update_negative`
+are its own products. A18's separate survey-to-full-data scale step is
+gone: the correction now enters bin by bin through the first splits'
+own update (spec 4.0), so `psi0_all`/`offset`/`sigma_all` are never
+rebound here after the fact. A leaf's ranking (which leaf to split
+next) reads its own measured error against the update's noise term,
+falling back to the current vector's own within-variance (the A20
+ranking rule, kept verbatim); `joint_rank_rule` (always
+`'measured_error'`) and `joint_bin_ebar` (each final bin's own error)
+record it. The stop is calibrated by `kappa`/`se_kappa` (the ratio of
+realized to predicted gain over every split so far) and reported via
+`se_V_win`/`margin`, each a top-level `QIJResult` field beside
+`V_btw`/`V_win_hat`/`V_tot_hat`; `z` (the stop's margin against both
+sampling scatter and the within estimate's structural under-read --
+V_win_hat/true ~0.6-0.9 on draw 1, NOT a pure confidence level),
+`n_min` (splits required before the stop may fire) and `L_max` (the
+cap on leaves, default `M_X_used`) are QIJ arguments and CLI flags,
+recorded on `QIJResult` as given (z, n_min) or as resolved
+(`L_max`, never None there).
 
 `quantized_start`
 (spec/QIJ_mods_waves.md A9 item 5) picks theta_Q's starting point:
@@ -107,20 +120,27 @@ from .result import QIJResult
 
 def _joint_defaults(N: int, q: int) -> dict:
     """The `joint_*` `QIJResult` fields, used by a draw that failed
-    before stage 2 (`_failed_draw`)."""
+    before stage 2 (`_failed_draw`) -- the unified loop never ran, so
+    every count is zero/empty and `psi_hat` (populated here too, the
+    one exception to the `joint_` prefix) is NaN."""
     return dict(
-        joint_S_pred=np.full(q, np.nan), joint_a=np.full(q, np.nan),
-        joint_S_pred_pre_lloyd=np.full(q, np.nan),
-        joint_L0=0, joint_L=0, joint_n_growth_rounds=0, joint_growth_capped=False,
-        joint_n_check_rounds=0, joint_n_check_evals=0,
-        joint_n_level_splits=0, joint_check_capped=False,
+        joint_L=0, joint_n_splits=0, joint_n_rounds=0, joint_n_evals=0,
+        joint_capped=False, joint_stop_met=False,
         joint_failed=False, joint_bin_mass=np.zeros(0), joint_bin_U=np.zeros((0, q)),
-        joint_bin_m=np.zeros((0, q)),
+        joint_bin_m=np.zeros((0, q)), joint_bin_ebar=np.zeros((0, q)),
+        joint_bin_W=np.zeros((0, q)), joint_bin_n=np.zeros(0, dtype=int),
         joint_bin_label=np.full(N, -1, dtype=int), joint_busy_delta=0.0,
-        joint_share_final=np.full(q, np.nan),
+        joint_split_parent=np.zeros(0, dtype=int),
+        joint_split_child_a=np.zeros(0, dtype=int),
+        joint_split_child_b=np.zeros(0, dtype=int),
+        joint_split_G=np.zeros((0, q)), joint_split_D=np.zeros((0, q)),
+        joint_split_round=np.zeros(0, dtype=int),
+        joint_round_kappa=np.zeros((0, q)), joint_round_se_kappa=np.zeros((0, q)),
+        joint_round_V_win=np.zeros((0, q)), joint_round_margin=np.zeros((0, q)),
+        joint_round_n_splits=np.zeros(0, dtype=int),
         joint_n_update_scale=np.zeros(q, dtype=int), joint_n_update_shift=np.zeros(q, dtype=int),
-        joint_n_update_negative=np.zeros(q, dtype=int), joint_pilot_err_btw=np.full(q, np.nan),
-        joint_rank_rule='n/a', joint_bin_ebar=np.zeros((0, q)),
+        joint_n_update_negative=np.zeros(q, dtype=int),
+        joint_rank_rule='n/a',
         psi_hat=np.full((N, q), np.nan),
     )
 
@@ -167,7 +187,8 @@ def _theta_hat_task(T, case, X: np.ndarray, _task):
 
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, survey,
-                  sv, quantized_start, fit_weights, sigma_points) -> QIJResult:
+                  sv, quantized_start, fit_weights, sigma_points,
+                  z, n_min, L_max) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -176,9 +197,13 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
     interval's ingredients (`a`, `b_hat`, `c_q`, `c_q_one_sided`) and
     `eta_full` (spec/QIJ_mods_waves.md A15), which need stage 2 and the
     curvature/eta_full stages none of which ever ran, are NaN/False.
-    Stage 2 never ran, so every `joint_*` field is inert, and the
-    sigma-points stage (spec/QIJ_sigma_points_spec.md), which needs
-    stage 2's own refined influence, never ran either. `I_proto` and
+    The unified loop (spec/QIJ_unified_loop_spec.md) never ran, so
+    every `joint_*` field is inert and `se_V_win`/`kappa`/`se_kappa`/
+    `margin` are NaN, and the sigma-points stage (spec/QIJ_sigma_
+    points_spec.md), which needs the loop's own refined influence,
+    never ran either. `z`/`n_min` are recorded as given; `L_max` as
+    resolved by the caller (`xvq.M_used` when the argument was None,
+    since the loop itself never ran to resolve it). `I_proto` and
     `sv.step_ratio` are the full-width survey products; `measured`
     restricts them to the reported outputs, exactly as the successful
     path does (spec QIJ_mods_waves.md A11)."""
@@ -190,7 +215,8 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
     return QIJResult(
         outputs=outputs, N=N, theta_hat=nan_q,
         theta_hat_full=np.full(np.asarray(I_proto).shape[1], np.nan),
-        V_btw=nan_q, V_win_hat=nan_q, V_tot_hat=nan_q,
+        V_btw=nan_q, V_win_hat=nan_q, se_V_win=nan_q, V_tot_hat=nan_q,
+        kappa=nan_q, se_kappa=nan_q, margin=nan_q,
         ell=nan_q, lam=nan_q, ell_bound=false_q, lam_bound=false_q,
         gptrend=gptrend, gpwidth=gpwidth, c=nan_q, c_bound=false_q,
         M_X=xvq.M_used, M_X_source=M_X_source, n_failed=counter.failed,
@@ -210,6 +236,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, fit_weights=fit_weights,
         sigma_points=sigma_points,
+        z=z, n_min=n_min, L_max=(xvq.M_used if L_max is None else L_max),
         **_joint_defaults(N, q), **_sigma_defaults(q),
     )
 
@@ -220,7 +247,26 @@ class QIJ:
     def __init__(self, eps: float = 0.01, seed: int = 0, vq_transform=None,
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
                  survey: str = 'points', quantized_start: str = 'multistart',
-                 sigma_points: bool = False, fit_weights: str = 'none') -> None:
+                 sigma_points: bool = False, fit_weights: str = 'none',
+                 z: float = 2.0, n_min: int = 30, L_max: int = None) -> None:
+        """`z`, `n_min`, `L_max` are the unified loop's own user-exposed
+        levers (spec/QIJ_unified_loop_spec.md 0, 4.4, 5), passed straight
+        to `core.joint.run_joint`. `z` (default 2.0) is the stop's
+        margin against BOTH the within estimate's sampling scatter AND
+        its structural under-read (V_win_hat/true ~0.6-0.9 on draw 1)
+        -- NOT a pure confidence level: lowering it lowers that margin
+        too. `n_min` (default 30) is the minimum number of splits made
+        before the stop may fire (a ratio's standard error read from
+        fewer splits is itself unreliable). `L_max` (default None ->
+        `M_X_used`, resolved inside `run_joint`) caps the number of
+        leaves; `QIJResult.L_max` always records the resolved value,
+        never None."""
+        if not z > 0:
+            raise ValueError(f'z must be > 0 (got {z})')
+        if n_min < 1:
+            raise ValueError(f'n_min must be >= 1 (got {n_min})')
+        if L_max is not None and L_max < 2:
+            raise ValueError(f'L_max must be >= 2 or None (got {L_max})')
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -231,6 +277,9 @@ class QIJ:
         self.quantized_start = quantized_start
         self.sigma_points = sigma_points
         self.fit_weights = fit_weights
+        self.z = z
+        self.n_min = n_min
+        self.L_max = L_max
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -343,7 +392,8 @@ class QIJ:
             return _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                                  self.gptrend, self.gpwidth, M_X_source, workers,
                                  self.survey, sv, self.quantized_start,
-                                 self.fit_weights, self.sigma_points)
+                                 self.fit_weights, self.sigma_points,
+                                 self.z, self.n_min, self.L_max)
         # THE ARCHITECTURE RULE (spec/QIJ_mods_waves.md A20): `psi0_all`
         # is populated ONCE here, in survey units -- the GP's point
         # predictions -- and from this point on it IS the one per-point
@@ -419,76 +469,62 @@ class QIJ:
         t0 = time.perf_counter()
         # `psi0_all`/`model` are already the measured subset (this
         # call's own `fit_influence_model` above), so `run_joint`'s own
-        # psi0-driven fields (V_btw, V_win_hat, V_tot_hat, S_pred, the
-        # continuation's own scale `a`, the bin constituents) come back
-        # at that same measured width already, no further slicing.
-        # `B_hat`/`a_bca` are `ivq.bias_and_acceleration`'s result
-        # against the FULL `theta_hat` (one shared evaluation covers
-        # every output, as above), so they stay q_full wide and are
-        # restricted to `measured` here (spec/QIJ_mods_waves.md A11).
+        # psi0-driven fields (V_btw, V_win_hat, se_V_win, V_tot_hat,
+        # kappa, se_kappa, margin, the bin/split/round constituents)
+        # come back at that same measured width already, no further
+        # slicing. `B_hat`/`a_bca` are `ivq.bias_and_acceleration`'s
+        # result against the FULL `theta_hat` (one shared evaluation
+        # covers every output, as above), so they stay q_full wide and
+        # are restricted to `measured` here (spec/QIJ_mods_waves.md
+        # A11).
         jr = run_joint(X, counter, theta_hat, psi0_all, model, xvq, eta_full,
                        self.eps, offset, pool=pool, start=start_second_stage,
-                       measured=measured)
+                       measured=measured, z=self.z, n_min=self.n_min, L_max=self.L_max)
         # A failed output, or a failed initial bin measurement before
         # any continuation ran, voids every output's variance quantities.
         if jr.failed:
             jr = replace(jr, V_btw=np.full(q, np.nan), V_win_hat=np.full(q, np.nan),
-                          V_tot_hat=np.full(q, np.nan), B_hat=np.full(q_full, np.nan),
-                          a_bca=np.full(q_full, np.nan))
-        second_stage_evals = int(jr.n_check_evals)
+                          se_V_win=np.full(q, np.nan), V_tot_hat=np.full(q, np.nan),
+                          kappa=np.full(q, np.nan), se_kappa=np.full(q, np.nan),
+                          margin=np.full(q, np.nan),
+                          B_hat=np.full(q_full, np.nan), a_bca=np.full(q_full, np.nan))
+        second_stage_evals = int(jr.n_evals)
         second_stage_busy = float(jr.busy_delta)
         second_stage_fields = dict(V_btw=jr.V_btw, V_win_hat=jr.V_win_hat,
-                                    V_tot_hat=jr.V_tot_hat,
+                                    se_V_win=jr.se_V_win, V_tot_hat=jr.V_tot_hat,
+                                    kappa=jr.kappa, se_kappa=jr.se_kappa, margin=jr.margin,
                                     a=jr.a_bca[measured], b_hat=jr.B_hat[measured])
         if not jr.failed:
-            # A18 (spec/QIJ_mods_waves.md): `run_joint` applies its own
-            # a_c correction to a LOCAL rebinding of `psi0_all`/`offset`
-            # only (it must not write into `psi0_all` in place --
-            # `psi0_all` is `influence_model.psi0`'s own read-only cache
-            # -- so the correction never reaches this caller's own
-            # variables by itself). `jr.a` is the SAME a_c `run_joint`
-            # fitted and applied internally (`JointResult.a`, the check's
-            # scale factor; not `jr.a_bca`, the unrelated ABC bias/
-            # acceleration stored above as `second_stage_fields['a']`).
-            # Rebinding here, once, puts every reader of `psi0_all`/
-            # `offset` from this point on -- the stored `psi0=psi0_all`
-            # below -- on the same full-data units as the measured
-            # products (`V_btw`, `jr.bin_U`) it is compared against or
-            # combined with. `sigma_all` (the GP posterior sd, a
-            # survey-unit first moment like `psi0_all`, A21's stored
-            # survey diagnostic) is rebound the same way, by a_c (not
-            # a_c^2 -- it is an sd, not a variance); nothing inside
-            # `run_joint` itself ever reads `sigma_all` any more (THE
-            # ARCHITECTURE RULE, A21: it is never a per-point companion
-            # of psi_hat), so rebinding it here, once, is the one and
-            # only place it is scaled.
-            psi0_all = psi0_all * jr.a[None, :]
-            offset = offset * jr.a
-            sigma_all = sigma_all * jr.a[None, :]
-            # A20 (spec/QIJ_mods_waves.md): `jr.state_psi_hat` IS the
-            # method's own per-point estimate -- the A18 pilot,
-            # rewritten in place by every measurement -- taken directly;
-            # rho is NOT produced (stays NaN), since there is no
-            # field+rho reconstruction left to do (A21 removed it).
+            # spec/QIJ_unified_loop_spec.md 4.0: A18's separate survey-
+            # to-full-data scale step is GONE -- the correction now
+            # enters bin by bin through the first splits' own state
+            # update inside `run_joint`, so `psi0_all`/`offset`/
+            # `sigma_all` are never rebound here after the fact (unlike
+            # the old A18 a_c step this replaces). `jr.state_psi_hat`
+            # IS the method's own final per-point estimate -- the A18
+            # pilot, rewritten in place by every measurement -- taken
+            # directly; rho is NOT produced (stays NaN), since there is
+            # no field+rho reconstruction left to do (A21 removed it).
             second_stage_fields['psi_hat'] = jr.state_psi_hat
         else:
             second_stage_fields['psi_hat'] = np.full((N, q), np.nan)
         joint_fields = dict(
-            joint_S_pred=jr.S_pred, joint_a=jr.a,
-            joint_S_pred_pre_lloyd=jr.S_pred_pre_lloyd,
-            joint_L0=jr.L0, joint_L=jr.L, joint_n_growth_rounds=jr.n_growth_rounds,
-            joint_growth_capped=jr.growth_capped,
-            joint_n_check_rounds=jr.n_check_rounds, joint_n_check_evals=jr.n_check_evals,
-            joint_n_level_splits=jr.n_level_splits,
-            joint_check_capped=jr.check_capped,
+            joint_L=jr.L, joint_n_splits=jr.n_splits, joint_n_rounds=jr.n_rounds,
+            joint_n_evals=jr.n_evals, joint_capped=jr.capped, joint_stop_met=jr.stop_met,
             joint_failed=jr.failed,
             joint_bin_mass=jr.bin_mass, joint_bin_U=jr.bin_U, joint_bin_m=jr.bin_m,
+            joint_bin_ebar=jr.bin_ebar, joint_bin_W=jr.bin_W, joint_bin_n=jr.bin_n,
             joint_bin_label=jr.bin_label,
-            joint_busy_delta=jr.busy_delta, joint_share_final=jr.share_final,
+            joint_busy_delta=jr.busy_delta,
+            joint_split_parent=jr.split_parent, joint_split_child_a=jr.split_child_a,
+            joint_split_child_b=jr.split_child_b, joint_split_G=jr.split_G,
+            joint_split_D=jr.split_D, joint_split_round=jr.split_round,
+            joint_round_kappa=jr.round_kappa, joint_round_se_kappa=jr.round_se_kappa,
+            joint_round_V_win=jr.round_V_win, joint_round_margin=jr.round_margin,
+            joint_round_n_splits=jr.round_n_splits,
             joint_n_update_scale=jr.n_update_scale, joint_n_update_shift=jr.n_update_shift,
             joint_n_update_negative=jr.n_update_negative,
-            joint_pilot_err_btw=jr.pilot_err_btw,
-            joint_rank_rule=jr.rank_rule, joint_bin_ebar=jr.bin_ebar,
+            joint_rank_rule=jr.rank_rule,
         )
         wall_time_refinement = time.perf_counter() - t0
         ev3, rows3 = counter.snapshot()
@@ -574,6 +610,7 @@ class QIJ:
             survey=self.survey,
             c_q=c_q, c_q_one_sided=c_q_one_sided, eta_Q=sv.eta_Q, eta_full=float(eta_full),
             survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
+            z=jr.z, n_min=jr.n_min, L_max=jr.L_max,
             quantized_start=self.quantized_start,
             fit_weights=self.fit_weights,
             **second_stage_fields, **joint_fields, **sigma_fields,

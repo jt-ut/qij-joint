@@ -56,6 +56,16 @@ def main(argv=None) -> None:
     p.add_argument('--fit-weights', dest='fit_weights', choices=['none', 'mass'],
                     default='none',
                     help='qij: the GP pilot fit\'s kernel-regression noise')
+    p.add_argument('--z', type=float, default=2.0,
+                   help='qij: the unified loop\'s stop margin (default 2.0) -- z is the '
+                        'margin against both the estimate\'s scatter AND its structural '
+                        'under-read (V_win_hat/true ~0.6-0.9 on draw 1), not a pure '
+                        'confidence level')
+    p.add_argument('--n-min', dest='n_min', type=int, default=30,
+                   help='qij: minimum splits made before the unified loop\'s calibrated '
+                        'stop may fire (default 30)')
+    p.add_argument('--L-max', dest='L_max', type=int, default=None,
+                   help='qij: cap on the number of leaves (default: M_X_used)')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
@@ -73,7 +83,8 @@ def main(argv=None) -> None:
         config.update(eps=args.eps, gptrend=args.gptrend,
                       gpwidth=args.gpwidth, M_X=args.M_X,
                       survey=args.survey, quantized_start=args.quantized_start,
-                      sigma_points=args.sigma_points, fit_weights=args.fit_weights)
+                      sigma_points=args.sigma_points, fit_weights=args.fit_weights,
+                      z=args.z, n_min=args.n_min, L_max=args.L_max)
     elif args.method == 'boot':
         config['B'] = args.B
     elif args.method == 'ijfd':
@@ -110,14 +121,16 @@ def main(argv=None) -> None:
             if args.diag_draws else []
         params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
                       survey=args.survey, quantized_start=args.quantized_start,
-                      sigma_points=args.sigma_points, fit_weights=args.fit_weights)
+                      sigma_points=args.sigma_points, fit_weights=args.fit_weights,
+                      z=args.z, n_min=args.n_min, L_max=args.L_max)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
             workers=args.workers, gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
             survey=args.survey, quantized_start=args.quantized_start,
             sigma_points=args.sigma_points,
-            fit_weights=args.fit_weights, tag=tag)
+            fit_weights=args.fit_weights,
+            z=args.z, n_min=args.n_min, L_max=args.L_max, tag=tag)
     elif args.method == 'qijdt':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \

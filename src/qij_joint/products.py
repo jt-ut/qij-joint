@@ -31,8 +31,12 @@ def method_dir(out_dir: str, dataset: str, estimator: str, N: int, method: str,
 # `dir_tag` names only the settings that differ from these. A21 removed
 # `ivqbins`/`refine_schedule` (along with `pilot`/`check_rule`/
 # `tree_rule`) as config keys entirely, so they no longer appear here.
+# `z`/`n_min`/`L_max` (spec/QIJ_unified_loop_spec.md 0, 4.4, 5) are the
+# unified loop's own user-exposed levers, added here at their defaults
+# so the study's default run keeps today's folder name.
 QIJ_CANONICAL = dict(survey='moments', quantized_start='full-data', gptrend='quadratic',
-                      gpwidth='global', sigma_points=True, M_X=None)
+                      gpwidth='global', sigma_points=True, M_X=None,
+                      z=2.0, n_min=30, L_max=None)
 
 
 def _num(x) -> str:
@@ -50,14 +54,20 @@ def dir_tag(method: str, config: dict) -> str:
     right after `gpwidth`'s own, named only when `'mass'`, as
     `_massfit` -- so a `fit_weights='none'` run keeps today's folder
     name -- then `sigma_points` (named only when False, as `_nosigma`),
-    `M_X` (named only when not None, as `_MX<int>`). A21
+    `M_X` (named only when not None, as `_MX<int>`), then the unified
+    loop's own levers (spec/QIJ_unified_loop_spec.md 0, 4.4, 5):
+    `z` (named only when != 2, as `_z<z>`), `n_min` (named only when
+    != 30, as `_nmin<n>`), `L_max` (named only when given, i.e. not
+    None, as `_Lmax<L>`) -- so the study default (z=2, n_min=30,
+    L_max=None) keeps the folder name `qij_eps0.01_widthlocal_
+    massfit_nosigma`. A21
     (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
     `refine_schedule`/`check_rule`/`tree_rule` as both switches and
     config keys: a new run's folder name carries only the surviving
     settings (eps, gpwidth, fit_weights, sigma, survey, quantized_
-    start, gptrend, M_X source) -- the `<pilot>_` prefix, the `_bins
-    <ivqbins>`/`_sched<refine_schedule>`/`_measured`/`_total` suffixes
-    are no longer written. `boot`
+    start, gptrend, M_X source, z, n_min, L_max) -- the `<pilot>_`
+    prefix, the `_bins<ivqbins>`/`_sched<refine_schedule>`/
+    `_measured`/`_total` suffixes are no longer written. `boot`
     -> `''` (`B` is not in the name -- replicates are a deterministic
     prefix, so a smaller B is read from a larger run's folder; `B` is
     still recorded in config.json and so still guarded). `ijfd` -> `''`,
@@ -80,6 +90,12 @@ def dir_tag(method: str, config: dict) -> str:
             tag += '_nosigma'
         if config['M_X'] != QIJ_CANONICAL['M_X']:
             tag += f"_MX{int(config['M_X'])}"
+        if config['z'] != QIJ_CANONICAL['z']:
+            tag += f"_z{_num(config['z'])}"
+        if config['n_min'] != QIJ_CANONICAL['n_min']:
+            tag += f"_nmin{int(config['n_min'])}"
+        if config['L_max'] is not None:
+            tag += f"_Lmax{int(config['L_max'])}"
         return tag
     if method == 'boot':
         return ''
@@ -114,7 +130,13 @@ def ensure_config(md: str, config: dict) -> None:
     sets it) and is dropped from the comparison rather than registering
     as a mismatch, so a pre-removal folder still loads; `requested`
     itself never carries a removed key, so nothing of the kind is ever
-    written back out."""
+    written back out.
+
+    A stored config.json from before the unified loop (spec/QIJ_
+    unified_loop_spec.md) carries no `z`/`n_min`/`L_max` at all: read
+    as the loop's own defaults (2.0/30/None) below, so today's
+    default-levers runs still match it, exactly like the `fit_weights`
+    shim above."""
     os.makedirs(md, exist_ok=True)
     path = os.path.join(md, 'config.json')
     requested = json.loads(json.dumps(config))
@@ -131,6 +153,9 @@ def ensure_config(md: str, config: dict) -> None:
         # (spec/QIJ_mass_weighted_fit_spec.md 3): read as 'none', so
         # today's `fit_weights='none'` runs still match it.
         stored = dict(stored, fit_weights='none')
+    for key, default in (('z', 2.0), ('n_min', 30), ('L_max', None)):
+        if key in requested and key not in stored:
+            stored = dict(stored, **{key: default})
     # Ignore any stored key current code no longer knows (A21's own
     # removals among them): only keys `requested` could possibly carry
     # are compared.

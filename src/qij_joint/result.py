@@ -23,22 +23,59 @@ schedule), `bridge_j`/`bridge_k`/`bridge_m`/`bridge_delta`/`cell_p`/
 `joint_n_flagged`/`joint_n_adjacency_splits`/`joint_bin_flagged`/
 `joint_n_closed_unpaid`/`joint_n_closed_unflagged`/
 `joint_n_noise_floored`/`joint_sum_b_delta` (the per-bin check's own
-flag/pay bookkeeping). `V_btw`/`V_win_hat`/`V_tot_hat` are the one
-remaining second stage's own; `psi_hat` is that stage's final per-point
-STATE vector (THE ARCHITECTURE RULE, spec/QIJ_mods_waves.md A20),
-rewritten in place after every measurement; `joint_n_update_scale`/
-`joint_n_update_shift`/`joint_n_update_negative`/`joint_pilot_err_btw`
-are its own products. Which bin is split next reads the bin's own
-measured error against the update's noise term, falling back to the
-current vector's within-variance (the A20 amendment, 2 October);
-`joint_rank_rule` (always `'measured_error'`) and `joint_bin_ebar`
-(each final bin's own error, beside `joint_bin_U`/`joint_bin_m`) record
+flag/pay bookkeeping).
+
+The unified measured loop (spec/QIJ_unified_loop_spec.md) then replaced
+A20/A21's own growth/check second stage with one loop from one bin,
+every split measured: gone as both switch-era and growth/check-era
+fields are `joint_S_pred`/`joint_S_pred_pre_lloyd` (the growth stage's
+predicted within share), `joint_a` (A18's separate survey-to-full-data
+scale step -- the correction now enters bin by bin through the first
+splits' own update, spec 4.0, so `psi0`/`model.offset`/`sigma` are
+never rebound by `qij.py` after the fact any more), `joint_L0`/
+`joint_n_growth_rounds`/`joint_growth_capped` (growth's own counters),
+`joint_n_check_rounds`/`joint_n_check_evals`/`joint_n_level_splits`/
+`joint_check_capped` (the check continuation's own counters, replaced
+below by `joint_n_splits`/`joint_n_rounds`/`joint_n_evals`/
+`joint_capped`/`joint_stop_met`), `joint_share_final` (replaced by the
+calibrated stop's own `margin`) and `joint_pilot_err_btw` (the fixed-
+pilot diagnostic the old growth stage read; the unified loop has no
+fixed pilot to compare against once bin 0 is the whole cloud).
+
+`V_btw`/`V_win_hat`/`se_V_win`/`V_tot_hat`/`kappa`/`se_kappa`/`margin`
+are the loop's own report (spec 4.4, 4.5): `kappa`/`se_kappa` are the
+calibration ratio of realized to predicted gain over every split made
+so far; `se_V_win` is V_win_hat's own standard error (sampling scatter
+and the splits' chi-square variability -- NOT the structural under-
+read below the final leaves, which `kappa` cannot see, spec "On z");
+`margin` is the stop's excess X_c/(eps*V_tot) at termination, the
+binding output's value when per-output values differ. `z` (the stop's
+margin against both that scatter and the structural under-read),
+`n_min` (splits required before the stop may fire) and `L_max` (the
+cap on leaves, always resolved -- never None, spec 4.4) are the loop's
+own user-exposed levers, recorded here alongside `survey`/
+`quantized_start`/`fit_weights`. `psi_hat` is the loop's final
+per-point STATE vector (THE ARCHITECTURE RULE, spec/QIJ_mods_waves.md
+A20, kept verbatim by the unified loop), rewritten in place after
+every measurement; `joint_n_update_scale`/`joint_n_update_shift`/
+`joint_n_update_negative` are its own products. Which leaf is split
+next reads the leaf's own measured error against the update's noise
+term, falling back to the current vector's within-variance (the A20
+ranking rule, kept verbatim); `joint_rank_rule` (always
+`'measured_error'`) and `joint_bin_ebar` (each final leaf's own error,
+beside `joint_bin_U`/`joint_bin_m`/`joint_bin_W`/`joint_bin_n`) record
 it. `joint_bin_m` is the leaf's own m_pre (the state vector's mean over
 the leaf's points at measurement time), never a fixed copy of the
 pilot (THE ARCHITECTURE RULE again; A21's own fix, spec/QIJ_mods_
-waves.md A20's validation note). `joint_share_final` (the final
-V_win_hat/(V_btw+V_win_hat) per measured output) is populated on a
-draw that did not fail, NaN otherwise.
+waves.md A20's validation note). `joint_split_parent`/
+`joint_split_child_a`/`joint_split_child_b`/`joint_split_G`/
+`joint_split_D`/`joint_split_round` are the per-split record (spec 3,
+4.3: G the predicted gain, D the realized gain, both read before the
+children's own update) and `joint_round_kappa`/`joint_round_se_kappa`/
+`joint_round_V_win`/`joint_round_margin`/`joint_round_n_splits` are the
+per-round trajectory of the calibrated stop (spec 4.4), one row per
+completed round -- both populated on every draw, failed or not (empty
+on failure).
 
 `quantized_start` picks the quantized base fit theta_Q's starting point
 (spec/QIJ_mods_waves.md A9 item 5): `'multistart'` (ported) or
@@ -93,8 +130,17 @@ class QIJResult:
     theta_hat: np.ndarray          # (q,)
     theta_hat_full: np.ndarray     # (q_full,) every T output; the search audit's input
     V_btw: np.ndarray              # (q,)
-    V_win_hat: np.ndarray          # (q,) model quantity: the joint path's within-bin spread
+    V_win_hat: np.ndarray          # (q,) model quantity: kappa * sum of leaf within-bin W
+                                    # (spec/QIJ_unified_loop_spec.md 4.4)
+    se_V_win: np.ndarray           # (q,) V_win_hat's own standard error (sampling scatter and
+                                    # the splits' chi-square variability; NOT the structural
+                                    # under-read below the final leaves, spec "On z")
     V_tot_hat: np.ndarray          # (q,) model quantity: V_btw + V_win_hat
+    kappa: np.ndarray              # (q,) the calibration ratio, realized/predicted gain summed
+                                    # over every split so far (spec 4.4); 1.0 if no split yet
+    se_kappa: np.ndarray           # (q,) kappa's own sandwich standard error; 0.0 if no split yet
+    margin: np.ndarray             # (q,) the stop's excess X_c/(eps*V_tot) at termination
+                                    # (spec 4.4), the binding output's value
     ell: np.ndarray                # (q,); NaN under gpwidth='local'
     lam: np.ndarray                # (q,)
     ell_bound: np.ndarray          # (q,) bool; False under gpwidth='local'
@@ -123,17 +169,13 @@ class QIJResult:
     prototype_I: np.ndarray        # (M, q)
     prototype_h: np.ndarray        # (M,) local CONN spacing; NaN under gpwidth='global'
     survey: str                    # 'points' or 'moments' (method_notes section 2)
-    joint_S_pred: np.ndarray       # (q,) predicted within share at end of growth
-    joint_a: np.ndarray            # (q,) the A18 scale factor (spec/QIJ_mods_waves.md A18)
-    joint_S_pred_pre_lloyd: np.ndarray  # (q,); NaN when the Lloyd pass did not run
-    joint_L0: int                  # bins after growth
-    joint_L: int                   # final bin count after the continuation
-    joint_n_growth_rounds: int
-    joint_growth_capped: bool
-    joint_n_check_rounds: int
-    joint_n_check_evals: int
-    joint_n_level_splits: int
-    joint_check_capped: bool
+    joint_L: int                   # final leaf count (spec/QIJ_unified_loop_spec.md 4.4)
+    joint_n_splits: int             # total splits made
+    joint_n_rounds: int             # total rounds (one pool batch each, spec 4.2)
+    joint_n_evals: int               # total evaluations the loop itself spent (2 per split)
+    joint_capped: bool               # L_max bound (spec 4.4); reported whether it binds
+    joint_stop_met: bool             # the calibrated stop (4.4) actually fired, vs. the loop
+                                      # exhausting every candidate or hitting L_max first
     joint_failed: bool             # a failed output, or a failed initial bin measurement
                                     # before any continuation ran
     joint_bin_mass: np.ndarray     # (L,)
@@ -142,24 +184,35 @@ class QIJResult:
                                     # spec/QIJ_mods_waves.md A20/A21): psi_hat's mean over the
                                     # leaf's points at measurement time, never a fixed copy of
                                     # the pilot (A21's own fix to the A20 build)
+    joint_bin_ebar: np.ndarray           # (L,q) A20 amendment: each final leaf's own measured
+                                          # error at creation, beside joint_bin_U/joint_bin_m
+    joint_bin_W: np.ndarray               # (L,q) each final leaf's own within contribution
+                                           # W_l = p_l*Var_l(psi_hat)/N (spec 3)
+    joint_bin_n: np.ndarray               # (L,) int, each final leaf's own point count
     joint_bin_label: np.ndarray    # (N,) int
     joint_busy_delta: float
-    joint_share_final: np.ndarray  # (q,) final V_win_hat/(V_btw+V_win_hat) per measured
-                                    # output; NaN on a failed draw
+    joint_split_parent: np.ndarray        # (S,) int, the split's parent leaf id
+    joint_split_child_a: np.ndarray       # (S,) int, the smaller (measured) child's id
+    joint_split_child_b: np.ndarray       # (S,) int, the larger (conservation) child's id
+    joint_split_G: np.ndarray             # (S,q) the split's predicted gain (spec 3, 4.3)
+    joint_split_D: np.ndarray             # (S,q) the split's realized gain (spec 3, 4.3)
+    joint_split_round: np.ndarray         # (S,) int, the round the split was made in
+    joint_round_kappa: np.ndarray         # (R,q) kappa after each round (spec 4.4)
+    joint_round_se_kappa: np.ndarray      # (R,q) se(kappa) after each round
+    joint_round_V_win: np.ndarray         # (R,q) V_win_hat after each round
+    joint_round_margin: np.ndarray        # (R,q) the stop's margin after each round
+    joint_round_n_splits: np.ndarray      # (R,) int, cumulative splits after each round
     joint_n_update_scale: np.ndarray     # (q,) int; A20 (spec/QIJ_mods_waves.md): bins whose
                                           # state-vector update scaled (`core.joint.
                                           # _apply_update`'s own count, every measured bin)
     joint_n_update_shift: np.ndarray     # (q,) int; ditto, shifted instead of scaled
     joint_n_update_negative: np.ndarray  # (q,) int; ditto, of n_update_scale, a negative ratio
-    joint_pilot_err_btw: np.ndarray      # (q,) A20: sum_k p_k*(U_k-m_k^pilot)^2/N over the
-                                          # stage-1 leaves (the between-leaf part of the
-                                          # PILOT's own error variance, V_btw's own O(1/N)
-                                          # scale, deliberately read from the fixed pilot mean
-                                          # -- unrelated to joint_bin_m); NaN on a failed draw
     joint_rank_rule: str                 # A20 amendment (2 October): always 'measured_error'
                                           # (the method, no switch); 'n/a' on a failed draw
-    joint_bin_ebar: np.ndarray           # (L,q) A20 amendment: each final bin's own measured
-                                          # error at creation, beside joint_bin_U/joint_bin_m
+    z: float                       # the stop's margin (spec 0, 4.4); user-exposed, default 2.0
+    n_min: int                     # splits required before the stop may fire; default 30
+    L_max: int                     # the cap on leaves, always resolved (never None); default
+                                    # M_X_used
     a: np.ndarray                  # (q,) ABC acceleration (spec/QIJ_mods_waves.md A10)
     b_hat: np.ndarray              # (q,) ABC second-order bias (A10)
     c_q: np.ndarray                # (q,) ABC curvature-along-influence, survey-row evaluated (A10)
