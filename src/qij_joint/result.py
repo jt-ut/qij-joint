@@ -172,7 +172,8 @@ class QIJResult:
     joint_L: int                   # final leaf count (spec/QIJ_unified_loop_spec.md 4.4)
     joint_n_splits: int             # total splits made
     joint_n_rounds: int             # total rounds (one pool batch each, spec 4.2)
-    joint_n_evals: int               # total evaluations the loop itself spent (2 per split)
+    joint_n_evals: int               # total evaluations the loop itself spent (2 per split
+                                      # ATTEMPT, successful or not)
     joint_capped: bool               # L_max bound (spec 4.4); reported whether it binds
     joint_stop_met: bool             # the calibrated stop (4.4) actually fired, vs. the loop
                                       # exhausting every candidate or hitting L_max first
@@ -208,7 +209,8 @@ class QIJResult:
     joint_n_update_shift: np.ndarray     # (q,) int; ditto, shifted instead of scaled
     joint_n_update_negative: np.ndarray  # (q,) int; ditto, of n_update_scale, a negative ratio
     joint_rank_rule: str                 # A20 amendment (2 October): always 'measured_error'
-                                          # (the method, no switch); 'n/a' on a failed draw
+                                          # (the method, no switch) -- including a failed draw,
+                                          # consistent with `core.joint._failed_result`
     z: float                       # the stop's margin (spec 0, 4.4); user-exposed, default 2.0
     n_min: int                     # splits required before the stop may fire; default 30
     L_max: int                     # the cap on leaves, always resolved (never None); default

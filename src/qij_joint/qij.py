@@ -140,7 +140,7 @@ def _joint_defaults(N: int, q: int) -> dict:
         joint_round_n_splits=np.zeros(0, dtype=int),
         joint_n_update_scale=np.zeros(q, dtype=int), joint_n_update_shift=np.zeros(q, dtype=int),
         joint_n_update_negative=np.zeros(q, dtype=int),
-        joint_rank_rule='n/a',
+        joint_rank_rule='measured_error',
         psi_hat=np.full((N, q), np.nan),
     )
 
@@ -300,7 +300,6 @@ class QIJ:
         # a no-op and the draw is bit-identical to before A11.
         measured = list(getattr(T, 'measured', range(len(outputs_full))))
         outputs = tuple(outputs_full[i] for i in measured)
-        q_full = len(outputs_full)
         q = len(measured)
         workers = pool.workers if pool is not None else 1
 
@@ -472,11 +471,12 @@ class QIJ:
         # psi0-driven fields (V_btw, V_win_hat, se_V_win, V_tot_hat,
         # kappa, se_kappa, margin, the bin/split/round constituents)
         # come back at that same measured width already, no further
-        # slicing. `B_hat`/`a_bca` are `ivq.bias_and_acceleration`'s
-        # result against the FULL `theta_hat` (one shared evaluation
-        # covers every output, as above), so they stay q_full wide and
-        # are restricted to `measured` here (spec/QIJ_mods_waves.md
-        # A11).
+        # slicing. `B_hat`/`a_bca` (spec/QIJ_unified_loop_spec.md 4.5,
+        # the reviewer's ruling, 2 October 2026) come back at that same
+        # MEASURED width too now -- `a_bca` formed over the final
+        # leaves' own (already measured-width) U, `B_hat` NaN on every
+        # output always -- so neither is sliced by `measured` here any
+        # more (`core.joint` module docstring).
         jr = run_joint(X, counter, theta_hat, psi0_all, model, xvq, eta_full,
                        self.eps, offset, pool=pool, start=start_second_stage,
                        measured=measured, z=self.z, n_min=self.n_min, L_max=self.L_max)
@@ -487,13 +487,13 @@ class QIJ:
                           se_V_win=np.full(q, np.nan), V_tot_hat=np.full(q, np.nan),
                           kappa=np.full(q, np.nan), se_kappa=np.full(q, np.nan),
                           margin=np.full(q, np.nan),
-                          B_hat=np.full(q_full, np.nan), a_bca=np.full(q_full, np.nan))
+                          B_hat=np.full(q, np.nan), a_bca=np.full(q, np.nan))
         second_stage_evals = int(jr.n_evals)
         second_stage_busy = float(jr.busy_delta)
         second_stage_fields = dict(V_btw=jr.V_btw, V_win_hat=jr.V_win_hat,
                                     se_V_win=jr.se_V_win, V_tot_hat=jr.V_tot_hat,
                                     kappa=jr.kappa, se_kappa=jr.se_kappa, margin=jr.margin,
-                                    a=jr.a_bca[measured], b_hat=jr.B_hat[measured])
+                                    a=jr.a_bca, b_hat=jr.B_hat)
         if not jr.failed:
             # spec/QIJ_unified_loop_spec.md 4.0: A18's separate survey-
             # to-full-data scale step is GONE -- the correction now

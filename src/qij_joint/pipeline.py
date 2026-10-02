@@ -156,7 +156,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     `eta_full` (A15), the ABC interval's ingredients (`a`, `b_hat`,
     `c_q`, `c_q_one_sided`, `eta_Q`, spec/QIJ_mods_waves.md A10) and the
     unified loop's own scalars (spec/QIJ_unified_loop_spec.md 4.4, 4.5):
-    `L`, `n_splits`, `n_rounds`, `n_evals`, `capped`, `stop_met`, and
+    `L`, `n_splits`, `n_rounds`, `n_evals` (two per split ATTEMPT,
+    successful or not), `capped`, `stop_met`, and
     the loop's own user-exposed levers `z`, `n_min`, `L_max` (`L_max`
     always resolved, never None). Per output: `V_win_hat_<o>` (as
     before), plus the calibrated stop's own `se_V_win_<o>`, `kappa_<o>`,

@@ -56,12 +56,24 @@ consumes these units; this module supplies them.
 `JointResult.state_psi_hat` carries the final vector out; `qij.py`
 takes it directly as the method's own `psi_hat` (no field+rho
 reconstruction). `B_hat`/`a_bca` (the ABC interval's bias/acceleration
-ingredients, spec A10) are NOT in the unified-loop spec text; this
-module computes them from every split's own small-child central pair,
-AT FULL OUTPUT WIDTH (q_full, not `measured`-restricted) -- exactly
-today's `ivq.bias_and_acceleration` convention, which `qij.py` expects
-(it slices `jr.a_bca[measured]`/`jr.B_hat[measured]` itself) -- a
-judgement call where the spec is silent (reported with the build).
+ingredients, spec A10) are ruled by the spec's section 4.5 (the
+reviewer's audit, 2 October 2026), not left to this module's own
+judgement: `a_bca` is formed over the FINAL LEAVES -- a true
+partition, every leaf carrying a U (measured or by conservation,
+`bin_mass`/`bin_U` below) -- with exactly `ivq.bias_and_acceleration`'s
+own `a` formula; `B_hat` is NaN on every output always (its summand,
+a central pair's second difference, exists only for a measured small
+child and is not conservable to the large child, so no partition of
+the final leaves carries it -- the ABC bias stays parked by the
+author's standing ruling, normal intervals only). Both are now at
+MEASURED width (q, matching `bin_U`/`bin_mass`), not `theta_hat`'s
+full q_full: the final leaves' own U is already measured-width (A11
+restricts `psi0_all`/`model` before this module ever sees them), so
+carrying `a_bca` at that same width is the simpler of the spec's two
+options and `qij.py` no longer slices `jr.a_bca`/`jr.B_hat` by
+`measured` -- it takes them as given (a judgement call, reported with
+the build). The old per-split small-child accumulation over every
+depth (double-counting nested regions, Sigma p != 1) is removed.
 """
 
 from __future__ import annotations
@@ -88,7 +100,10 @@ class JointResult:
     V_btw, V_win_hat, se_V_win, V_tot_hat (= V_btw + V_win_hat), kappa,
     se_kappa, margin (X_c/(eps*V_tot_hat) at termination): the stop's
     own report (spec 4.4/4.5). B_hat, a_bca: the ABC interval's
-    ingredients, AT FULL OUTPUT WIDTH -- see module docstring.
+    ingredients, AT MEASURED WIDTH (q) -- see module docstring. B_hat
+    is NaN on every output always; a_bca is formed over the final
+    leaves (bin_mass, bin_U below), NaN where the leaf-level
+    denominator is 0.
 
     L (final leaf count), n_splits, n_rounds, n_evals (== 2*the number
     of split attempts, successful or not), capped (L_max bound),
@@ -267,17 +282,18 @@ def _central_task(T, case, X: np.ndarray, task):
     return leaf_id, t, result, failed, time.perf_counter() - t0
 
 
-def _failed_result(N: int, q: int, q_full: int, z: float, n_min: int, L_max: int,
+def _failed_result(N: int, q: int, z: float, n_min: int, L_max: int,
                     busy_delta: float = 0.0) -> JointResult:
     """A failed draw: the shared constant-path pre-check failed before
     any evaluation. Every variance/leaf/split/round quantity is void;
     `qij.py` NaNs the per-output fields it reads directly, so the exact
-    fill here matters only for shape."""
+    fill here matters only for shape. `B_hat`/`a_bca` are now at
+    MEASURED width (q), same as every other per-output field here --
+    module docstring."""
     nan_q = np.full(q, np.nan)
-    nan_q_full = np.full(q_full, np.nan)
     return JointResult(
         V_btw=nan_q, V_win_hat=nan_q, se_V_win=nan_q, V_tot_hat=nan_q,
-        kappa=nan_q, se_kappa=nan_q, margin=nan_q, B_hat=nan_q_full, a_bca=nan_q_full,
+        kappa=nan_q, se_kappa=nan_q, margin=nan_q, B_hat=nan_q, a_bca=nan_q,
         L=0, n_splits=0, n_rounds=0, n_evals=0, capped=False, stop_met=False, failed=True,
         bin_mass=np.zeros(0), bin_U=np.zeros((0, q)), bin_m=np.zeros((0, q)),
         bin_ebar=np.zeros((0, q)), bin_W=np.zeros((0, q)), bin_n=np.zeros(0, dtype=int),
@@ -305,8 +321,12 @@ def run_joint(
     spec.md sections 0, 4). `psi0_all` (N, q) is the GP pilot's point
     predictions, survey units, already restricted to `measured`'s
     columns by the caller (as `model` is); `theta_hat` stays FULL width
-    (q_full), the base full-data fit every central pair measures
-    against. `offset` (q,) is `psi0_all`'s own centering constant
+    (q_full) as passed, for interface compatibility with `qij.py`'s
+    existing convention, but this module reads only `theta_hat[measured]`
+    (`theta_abs`, below) -- no evaluation here is measured against the
+    full base fit any more (`B_hat`'s old full-width central-pair second
+    difference is gone, module docstring). `offset` (q,) is `psi0_all`'s
+    own centering constant
     (`model.offset`): subtracted here, then immediately superseded by
     the root's own centring shift below (spec 4.0) -- any constant
     subtracted before an unconditional mean-subtraction cancels in the
@@ -333,13 +353,12 @@ def run_joint(
         measured = list(range(q))
     measured = np.asarray(measured, dtype=int)
     theta_hat = np.asarray(theta_hat, dtype=float)
-    q_full = theta_hat.size
     M_X_used = xvq.M_used
     if L_max is None:
         L_max = M_X_used
 
     if np.any(model.constant_path):
-        return _failed_result(N, q, q_full, z, n_min, L_max)
+        return _failed_result(N, q, z, n_min, L_max)
 
     # std0 (spec 4.2): the per-output std of the POPULATED vector over
     # the whole cloud, a unit fixed once, at population -- every cut's
@@ -382,9 +401,6 @@ def run_joint(
     round_V_win: list = []
     round_margin: list = []
     round_n_splits: list = []
-    abc_p: list = []
-    abc_U_full: list = []
-    abc_D2_full: list = []
 
     n_evals = 0
     capped = False
@@ -553,7 +569,6 @@ def run_joint(
             n_large = info['n_large']
 
             U_small_full = (val_plus - val_minus) / (2.0 * t_small)
-            D2_small_full = (val_plus - 2.0 * theta_hat + val_minus) / t_small ** 2
             U_small = U_small_full[measured]
 
             leaf = leaves.pop(leaf_id)
@@ -570,10 +585,6 @@ def run_joint(
             split_child_a.append(next_id)
             split_child_b.append(next_id + 1)
             split_round.append(round_idx)
-
-            abc_p.append(p_small)
-            abc_U_full.append(U_small_full)
-            abc_D2_full.append(D2_small_full)
 
             m_pre_small = info['U_small_pred']
             m_pre_large = info['U_large_pred']
@@ -612,19 +623,24 @@ def run_joint(
         bin_label[leaves[old_id]['indices']] = new_id
 
     n_splits_total = len(split_D)
-    if n_splits_total == 0:
-        B_hat = np.full(q_full, np.nan)
-        a_bca_out = np.full(q_full, np.nan)
-    else:
-        abc_p_arr = np.array(abc_p)
-        abc_U_arr = np.array(abc_U_full)
-        abc_D2_arr = np.array(abc_D2_full)
-        B_hat = np.sum(abc_p_arr[:, None] * abc_D2_arr, axis=0) / (2.0 * N)
-        num = np.sum(abc_p_arr[:, None] * abc_U_arr ** 3, axis=0)
-        den = np.sum(abc_p_arr[:, None] * abc_U_arr ** 2, axis=0)
-        a_bca_out = np.full(q_full, np.nan)
-        valid = den > 0.0
-        a_bca_out[valid] = num[valid] / (6.0 * np.sqrt(N) * den[valid] ** 1.5)
+
+    # ABC ingredients (spec/QIJ_unified_loop_spec.md 4.5, the reviewer's
+    # ruling, 2 October 2026; module docstring): B_hat is NaN on every
+    # output, always -- its summand (a central pair's second difference)
+    # is not conservable to a large child, so no partition of the final
+    # leaves carries it, and the old per-split small-child accumulation
+    # over every depth (double-counting nested regions, Sigma p != 1) is
+    # removed entirely. a_bca is formed over the FINAL LEAVES
+    # (bin_mass, bin_U above) -- a true partition, every leaf measured
+    # or by conservation -- with exactly `ivq.bias_and_acceleration`'s
+    # own `a` formula, AT MEASURED WIDTH (q): NaN where the
+    # leaf-level denominator is 0 (the root-only, zero-split case included).
+    B_hat = np.full(q, np.nan)
+    abc_num = np.sum(bin_mass[:, None] * bin_U ** 3, axis=0)
+    abc_den = np.sum(bin_mass[:, None] * bin_U ** 2, axis=0)
+    a_bca_out = np.full(q, np.nan)
+    valid = abc_den > 0.0
+    a_bca_out[valid] = abc_num[valid] / (6.0 * np.sqrt(N) * abc_den[valid] ** 1.5)
 
     return JointResult(
         V_btw=V_btw, V_win_hat=V_win, se_V_win=se_V_win, V_tot_hat=V_tot,
