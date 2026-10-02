@@ -1,171 +1,183 @@
 """
-The joint second stage (spec/method_notes.md section 6; spec/QIJ_mods_
-waves.md A20/A21): `grow` builds one shared partition of the N points
-from psi0_all to the tolerance, growing one bin at a time against
-whichever measured output's own TOTAL within share S_c =
-V_win_hat_c/(V_btw_c+V_win_hat_c) is currently worst; `run_joint`
-measures that partition on the full data through `ivq.bin_differences`,
-then carries the per-point state vector psi_hat forward, splitting
-leaves the same way, until every S_c clears `eps`. Growth runs in-
-process numpy only; the initial measurement and every later round's
-evaluations run through `pool`.
+The unified measured loop (spec/QIJ_unified_loop_spec.md; spec/QIJ_mods_
+waves.md A20's state vector/update rule, A21's one-path removals): ONE
+tree, grown from ONE leaf holding every point, every split measured,
+one per-point state vector psi_hat, one calibrated stop. This replaces
+everything this module used to do between the pilot and the report --
+stage-1 growth (`grow`), the stencil pass over growth bins
+(`ivq.bin_differences`), A18's `a`/`_fit_scale` step, and `_run_total`'s
+pilot-share stop -- with a single loop (`run_joint`) that:
 
-A21 (spec/QIJ_mods_waves.md A21, "one path: the removals") removed the
-per-bin joint second stage this module used to offer beside the total-
-share one (`grow`'s own per-bin growth and the check's flag/pay/split-
-kind machinery, `tree_rule`/`pilot`/`check_rule` as switches): the
-total-share rule, under THE ARCHITECTURE RULE's one per-point vector
-psi_hat (A20), is now the only method. What A20 called `grow_total`/
-`_run_total` is this module's only growth and continuation; what A20
-called `tree_rule='perbin'` no longer exists anywhere in this file.
+  * starts from one leaf (the root, all N points); the root needs NO
+    evaluation (U_root == 0 exactly: influences sum to zero over the
+    data) -- its own "update" is the CENTRING shift psi_hat <- psi_hat
+    - mean(psi_hat), applied once, unconditionally (spec 4.0);
+  * every later split measures its SMALL child by a CENTRAL pair at the
+    child's own step (`differences.central_step`/`step_parameter`,
+    exactly the stencils' own form), the large child by conservation;
+  * ranks open leaves by measured error against the update's own noise
+    term (A20's amendment, `calibrate.rank_scores`), falls back to the
+    leaf's own within contribution W;
+  * sizes a round by the EXPECTED gain of each candidate's own cut
+    (f_l*W_l*kappa == G_l*kappa algebraically, spec 4.2) against the
+    stop's excess on the binding output (`calibrate.round_prefix`);
+  * closes a leaf whose cut is infeasible, or whose expected gain is
+    below the split's own noise floor n_Delta + b_Delta on every
+    output (spec 4.1, the measured-check spec's terms, "as today");
+  * stops when `calibrate.stop_test` says so (kappa-calibrated within,
+    its own standard error, both margined by `z`, against `eps` of the
+    total, with at least `n_min` splits made); caps at `L_max` leaves.
 
 THE ARCHITECTURE RULE (spec/QIJ_mods_waves.md A20, governs this module):
-ONE per-point vector psi_hat exists. It is populated once, in survey
-units, by the GP pilot (`qij.py`); growth below reads that populated
-vector (growth is invariant to a per-output scale, so the partition is
-identical whether or not the vector is yet a_c-corrected); the FIRST
-measurement-driven update, after the stage-1 stencils, is the global
-x a_c correction (A18) applied to the whole vector by `run_joint`
-before `_run_total` is ever called, followed immediately by the per-
-leaf `_apply_update` pass; every later reader -- the ranking, a cut,
-V_win_hat, E, the leaf's own `ebar`, the end-of-run per-point estimate
--- reads that one vector, never a fixed copy of the pilot. Two sites
-that still read something else were A21's own removals: `bin_m` now
-reads the leaf's own `ebar`-moment reference value m_pre (the vector's
-mean over the leaf's points at measurement time), not the fixed pilot
-mean; `sd_hat`, the GP posterior sd carried alongside psi_hat purely
-because `archive/seeded-tree`'s `_apply_update` wrote it, fed no
-decision and is dropped from `_apply_update`'s own signature and the
-state entirely (the GP posterior sd survives only as `QIJResult.sigma`,
-a stored survey diagnostic `qij.py` builds on its own, never read back
-in here).
+ONE per-point vector psi_hat exists. It starts as the pilot (`psi0_all`,
+survey units, centred by `offset` then by its own mean -- the root's
+update, spec 4.0); every measurement -- a split's two children -- then
+rewrites it in place (`_apply_update`, VERBATIM from `archive/seeded-
+tree:core/seed.py`, A20). Every later reader -- the ranking, a leaf's
+own W, a cut, V_win, the noise floor, the end-of-run estimate -- reads
+that one vector, never a fixed copy of anything else. `bin_m` is the
+leaf's own `ebar`-moment reference value m_pre (psi_hat's mean over the
+leaf's points at measurement time, before its own update), the same
+quantity `ebar` is built from.
 
-`run_joint`'s own A18 correction: `a` (`_fit_scale`) is the least-
-squares scale between each measured output's survey-unit pilot mean
-and its measured bin derivative, fitted once against the growth bins
-and applied to `psi0_all`/`offset`/the growth bins' own `m0`/`V_hat`
-before `_run_total` ever runs -- the gap between survey units and
-full-data units on each output axis (spec/QIJ_mods_waves.md A18).
-`B_hat`/`a_bca` (`ivq.bias_and_acceleration`'s ABC bias/acceleration,
-spec A10) are fitted from the same growth bins, unaffected by A20/A21.
+A18's survey-to-full-data scale is NOT a separate step any more (the
+old `_fit_scale`/`a` is gone, spec 4.0): it enters bin by bin, through
+the ordinary update rule, the moment the first splits' children are
+measured and `_apply_update` rewrites them onto the full-data scale.
+
+Units (spec section 3): W_lc = p_l*Var_l(psi_hat)/N; D_sc (realized)
+and G_sc (predicted) = (n_a*(U_a-U_k)**2 + n_b*(U_b-U_k)**2)/N**2, G
+from psi_hat's own pre-update child means, D from the measured ones;
+V_btw = 0 at the root, += D_s per split (today's V_btw, exactly, with
+every leaf measured). `core/calibrate.py` (Agent B's module, imported
+below) carries every estimator/stop/ranking/round-sizing formula that
+consumes these units; this module supplies them.
 
 `JointResult.state_psi_hat` carries the final vector out; `qij.py`
-takes it directly as the method's own `psi_hat` (there is no field+rho
-reconstruction left to build it from). `n_update_scale`/
-`n_update_shift`/`n_update_negative` and `pilot_err_btw` (the stage-1
-leaves' own between-leaf pilot-error variance) are its own products.
+takes it directly as the method's own `psi_hat` (no field+rho
+reconstruction). `B_hat`/`a_bca` (the ABC interval's bias/acceleration
+ingredients, spec A10) are NOT in the unified-loop spec text; this
+module computes them from every split's own small-child central pair,
+AT FULL OUTPUT WIDTH (q_full, not `measured`-restricted) -- exactly
+today's `ivq.bias_and_acceleration` convention, which `qij.py` expects
+(it slices `jr.a_bca[measured]`/`jr.B_hat[measured]` itself) -- a
+judgement call where the spec is silent (reported with the build).
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
 from ..parallel import call_T
-from .differences import central_step, forward_step, perturbed_weights, step_parameter
-from .ivq import BinSet, between_terms, bias_and_acceleration, bin_differences
+from .calibrate import kappa_hat, rank_scores, round_prefix, stop_test, vwin_hat
+from .differences import central_step, perturbed_weights, step_parameter
 
-__all__ = ["Growth", "JointResult", "grow", "run_joint", "two_means_split"]
-
-_CHUNK = 2048  # row chunk for the full-partition Lloyd reassignment: bounds memory
-
-
-@dataclass
-class Growth:
-    """The shared partition built by growth, before any evaluation.
-    labels (N,) bin index per point, contiguous 0..L0-1; L0 the bin
-    count after growth and its Lloyd pass; std (q,) = sqrt(V_hat), so
-    that Ψ̃ = psi0_all/std throughout; S_pred, S_pred_pre_lloyd (q,) the
-    predicted within share after / before the Lloyd pass."""
-
-    labels: np.ndarray
-    L0: int
-    n_growth_rounds: int
-    growth_capped: bool
-    S_pred: np.ndarray
-    S_pred_pre_lloyd: np.ndarray
-    std: np.ndarray
+__all__ = ["JointResult", "run_joint", "two_means_split"]
 
 
 @dataclass
 class JointResult:
-    """The joint second stage's complete result (spec/method_notes.md
-    section 6; spec/QIJ_mods_waves.md A20/A21). Per output (q,): V_btw,
-    V_win_hat, V_tot_hat, S_pred, a (the A18 scale factor), B_hat and
-    a_bca (`ivq.bias_and_acceleration`'s ABC bias/acceleration, spec
-    A10, from the growth bins as measured before any continuation
-    split). Shared: L0, L (final), n_growth_rounds, growth_capped,
-    S_pred_pre_lloyd (q,), n_check_rounds, n_check_evals,
-    n_level_splits, check_capped, failed (a failed output, or a failed
-    initial measurement before any continuation ran, voids every
-    output). Bin constituents: bin_mass (L,), bin_U (L,q, the measured
-    bin mean), bin_m (L,q, the leaf's own ebar reference value m_pre --
-    THE ARCHITECTURE RULE, module docstring -- not the fixed pilot
-    mean); bin_label (N,); busy_delta as the other pool stages report
-    it. share_final (q,) the final V_win_hat/(V_btw+V_win_hat) per
-    measured output (NaN on a failed draw).
+    """The unified loop's complete result (spec/QIJ_unified_loop_spec.md
+    section 4.5; interface spec/QIJ_mods_waves.md A20/A21). Every array
+    is per measured output unless noted.
 
-    n_update_scale, n_update_shift, n_update_negative (q,) int,
-    `_apply_update`'s own per-output counts over every measured bin
-    (stage-1 leaves plus every split's two children); pilot_err_btw
-    (q,) = sum_k p_k*(U_k-m_k^pilot)^2/N over the stage-1 leaves only
-    (the measured, between-leaf part of the PILOT's own error
-    variance -- a diagnostic contrasting the pilot against the state
-    vector, deliberately read from the fixed pilot mean, unlike
-    bin_m); state_psi_hat (N,q) the final state vector psi_hat,
-    `qij.py`'s own `psi_hat` -- (0,0) on a failed draw, never read
-    there. rank_rule: 'measured_error' always (the method, no switch).
-    bin_ebar (L,q): each FINAL leaf's own ebar_c = U_c - (psi_hat's
-    mean over the leaf's points just before that leaf's own update) at
-    the moment the leaf was created -- the ranking's own per-leaf
-    diagnostic, beside bin_U/bin_m."""
+    V_btw, V_win_hat, se_V_win, V_tot_hat (= V_btw + V_win_hat), kappa,
+    se_kappa, margin (X_c/(eps*V_tot_hat) at termination): the stop's
+    own report (spec 4.4/4.5). B_hat, a_bca: the ABC interval's
+    ingredients, AT FULL OUTPUT WIDTH -- see module docstring.
+
+    L (final leaf count), n_splits, n_rounds, n_evals (== 2*the number
+    of split attempts, successful or not), capped (L_max bound),
+    stop_met (the loop ended because `calibrate.stop_test` said so, as
+    opposed to the cap or nothing left to split), failed (the shared
+    constant-path pre-check failed; every variance quantity here is
+    void, as `qij.py` itself NaNs them out).
+
+    Bin constituents, one row per FINAL leaf: bin_mass (n/N), bin_n,
+    bin_U (measured mean), bin_m (= m_pre, psi_hat's mean over the
+    leaf's points just before its own update -- THE ARCHITECTURE RULE,
+    module docstring), bin_ebar (= bin_U - bin_m, the ranking's own
+    diagnostic), bin_W (p*Var(psi_hat)/N, the leaf's own within
+    contribution); bin_label (N,) the point->leaf map.
+
+    Split constituents, one row per split (successful only): the
+    parent id, both children's ids, G (predicted) and D (realized),
+    and the round it was made in.
+
+    Round constituents, one row per round attempted: kappa/se_kappa/
+    V_win/margin as computed at that round's own start (what sized and
+    gated it), and the number of splits that round actually completed.
+
+    n_update_scale/shift/negative: `_apply_update`'s own running counts
+    over every measured bin (both children of every split; the root's
+    own centring shift is NOT one of `_apply_update`'s calls and is not
+    counted here -- see `run_joint`). state_psi_hat: the final vector,
+    `qij.py`'s own psi_hat. rank_rule: 'measured_error' always (the
+    method, no switch). z, n_min, L_max: the levers this run used
+    (L_max resolved to M_X_used when the caller passed None).
+    busy_delta: as the other pool stages report it.
+    """
 
     V_btw: np.ndarray
     V_win_hat: np.ndarray
+    se_V_win: np.ndarray
     V_tot_hat: np.ndarray
-    S_pred: np.ndarray
-    a: np.ndarray
+    kappa: np.ndarray
+    se_kappa: np.ndarray
+    margin: np.ndarray
     B_hat: np.ndarray
     a_bca: np.ndarray
-    L0: int
     L: int
-    n_growth_rounds: int
-    growth_capped: bool
-    S_pred_pre_lloyd: np.ndarray
-    n_check_rounds: int
-    n_check_evals: int
-    n_level_splits: int
-    check_capped: bool
+    n_splits: int
+    n_rounds: int
+    n_evals: int
+    capped: bool
+    stop_met: bool
     failed: bool
     bin_mass: np.ndarray
     bin_U: np.ndarray
     bin_m: np.ndarray
+    bin_ebar: np.ndarray
+    bin_W: np.ndarray
+    bin_n: np.ndarray
     bin_label: np.ndarray
+    split_parent: np.ndarray
+    split_child_a: np.ndarray
+    split_child_b: np.ndarray
+    split_G: np.ndarray
+    split_D: np.ndarray
+    split_round: np.ndarray
+    round_kappa: np.ndarray
+    round_se_kappa: np.ndarray
+    round_V_win: np.ndarray
+    round_margin: np.ndarray
+    round_n_splits: np.ndarray
+    n_update_scale: np.ndarray
+    n_update_shift: np.ndarray
+    n_update_negative: np.ndarray
+    state_psi_hat: np.ndarray
+    rank_rule: str
+    z: float
+    n_min: int
+    L_max: int
     busy_delta: float
-    share_final: np.ndarray = field(default_factory=lambda: np.full(0, np.nan))
-    n_update_scale: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
-    n_update_shift: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
-    n_update_negative: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
-    pilot_err_btw: np.ndarray = field(default_factory=lambda: np.full(0, np.nan))
-    state_psi_hat: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
-    rank_rule: str = 'n/a'
-    bin_ebar: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
 
 
 def two_means_split(rows: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Deterministic two-means on `rows` (n, q), the split rule shared
-    by growth and a continuation round (spec/method_notes.md section
-    6): initial centroids are the means of the two halves of `rows`
-    split at the median of the projection onto the first principal axis
-    (an eigh of the rows' own q x q covariance, q the output count,
-    never a prototype-sized array), then Lloyd iterations (nearest
-    centroid, ties to the lower one) until assignments stop changing or
-    100 iterations. None if `rows` holds fewer than two distinct rows,
-    or a Lloyd update would empty one side. Returns local (idx_a,
-    idx_b) into `rows`' own 0..n-1."""
+    """Deterministic two-means on `rows` (n, q), the split rule the loop
+    uses at every round (spec/QIJ_unified_loop_spec.md 4.2): initial
+    centroids are the means of the two halves of `rows` split at the
+    median of the projection onto the first principal axis (an eigh of
+    the rows' own q x q covariance, q the output count, never a
+    prototype-sized array), then Lloyd iterations (nearest centroid,
+    ties to the lower one) until assignments stop changing or 100
+    iterations. None if `rows` holds fewer than two distinct rows, or a
+    Lloyd update would empty one side. Returns local (idx_a, idx_b)
+    into `rows`' own 0..n-1."""
     n = rows.shape[0]
     if np.unique(rows, axis=0).shape[0] < 2:
         return None
@@ -193,164 +205,15 @@ def two_means_split(rows: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]
     return np.where(labels == 0)[0], np.where(labels == 1)[0]
 
 
-def _bin_stats(psi0_all: np.ndarray, labels: np.ndarray, L: int):
-    """Per-bin count, mean and population variance of every output over
-    the FULL labelling, via two `bincount` passes per output: the
-    loop is over q (outputs), never over bins or points."""
-    q = psi0_all.shape[1]
-    counts = np.bincount(labels, minlength=L).astype(float)
-    means = np.empty((L, q))
-    var = np.empty((L, q))
-    for c in range(q):
-        col = psi0_all[:, c]
-        s1 = np.bincount(labels, weights=col, minlength=L)
-        s2 = np.bincount(labels, weights=col ** 2, minlength=L)
-        means[:, c] = s1 / counts
-        var[:, c] = np.maximum(s2 / counts - means[:, c] ** 2, 0.0)
-    return counts, means, var
-
-
-def _predicted_share(psi0_all: np.ndarray, V_hat: np.ndarray, labels: np.ndarray, L: int):
-    """A growth round's predicted within share: w_kc = p_k*Var_k(psi0_c)/V_hat_c
-    per bin and output, and S_c = sum_k w_kc, the total predicted within
-    share for output c."""
-    N = psi0_all.shape[0]
-    counts, _, var = _bin_stats(psi0_all, labels, L)
-    w = (counts[:, None] / N) * var / V_hat[None, :]
-    return w, w.sum(axis=0)
-
-
-def _reassign(rows: np.ndarray, centroids: np.ndarray) -> np.ndarray:
-    """Nearest centroid per row, chunked over N (E4: an N x L array, L
-    the bin count, is exactly the prototype-sized shape E4 forbids);
-    ties go to the lower centroid id (`argmin`'s own rule)."""
-    N = rows.shape[0]
-    csq = np.sum(centroids ** 2, axis=1)
-    out = np.empty(N, dtype=int)
-    for start in range(0, N, _CHUNK):
-        sl = slice(start, start + _CHUNK)
-        block = rows[sl]
-        d2 = np.sum(block ** 2, axis=1)[:, None] + csq[None, :] - 2.0 * block @ centroids.T
-        out[sl] = np.argmin(d2, axis=1)
-    return out
-
-
-def _lloyd_all(psi_tilde: np.ndarray, labels: np.ndarray, L: int):
-    """One full Lloyd run of all L centroids over every row, growth's
-    optional refinement pass: centroid = per-bin mean of psi_tilde, reassignment
-    by `_reassign`, repeated until assignments stop changing or 100
-    iterations; an emptied centroid is dropped and the rest relabelled
-    (as `ivq.kmeans_1d`'s own empty-bin handling did before A21 removed
-    that quantizer)."""
-    q = psi_tilde.shape[1]
-    labels = labels.copy()
-    for _ in range(100):
-        counts = np.bincount(labels, minlength=L).astype(float)
-        centroids = np.empty((L, q))
-        for c in range(q):
-            centroids[:, c] = np.bincount(labels, weights=psi_tilde[:, c], minlength=L) / counts
-        new_labels = _reassign(psi_tilde, centroids)
-        counts = np.bincount(new_labels, minlength=L)
-        if not counts.all():
-            present = np.flatnonzero(counts)
-            remap = np.full(L, -1, dtype=int)
-            remap[present] = np.arange(present.size)
-            new_labels = remap[new_labels]
-            L = present.size
-        converged = new_labels.shape == labels.shape and np.array_equal(new_labels, labels)
-        labels = new_labels
-        if converged:
-            break
-    return labels, L
-
-
-def grow(psi0_all: np.ndarray, eps: float, M_X_used: int) -> Growth:
-    """
-    Grow one shared partition of the N points from a single bin
-    (spec/QIJ_mods_waves.md A20's `grow_total`, the method under A21,
-    no switch): one bin is split per round, the one that does the most
-    for whichever output's predicted TOTAL within share S_c =
-    sum_k w_kc is currently worst against `eps`, rather than every
-    over-threshold bin at once against its own per-bin slice of the
-    tolerance. A round: if every S_c <= eps, stop; if L has reached
-    `M_X_used`, stop (growth_capped); otherwise c* = argmax_c S_c/eps
-    (eps is one scalar across outputs, so this is argmax_c S_c; written
-    as the ratio to match the tolerance it is tested against), and the
-    bin with the largest w_kc* is split by `two_means_split` on its own
-    Ψ̃ rows (ties -> the lowest bin id). A bin whose split comes back
-    infeasible is skipped rather than split, and never tried again
-    (nothing about the data changes by skipping it, so it would
-    otherwise be picked again every round); if every remaining bin is
-    infeasible, growth stops there (nothing splittable remains, not
-    `growth_capped`). Each split adds exactly one bin, counted into
-    `n_growth_rounds`. Then one `_lloyd_all` pass of all L centroids
-    over every row; S_pred is taken after that pass, S_pred_pre_lloyd
-    before.
-    """
-    N, q = psi0_all.shape
-    std = np.std(psi0_all, axis=0)
-    V_hat = std ** 2
-    psi_tilde = psi0_all / std
-    labels = np.zeros(N, dtype=int)
-    L = 1
-    n_rounds = 0
-    growth_capped = False
-    infeasible: set = set()
-
-    while True:
-        w, S = _predicted_share(psi0_all, V_hat, labels, L)
-        if np.all(S <= eps):
-            break
-        if L >= M_X_used:
-            growth_capped = True
-            break
-        c_star = int(np.argmax(S / eps))
-        order = sorted((k for k in range(L) if k not in infeasible),
-                        key=lambda k: (-w[k, c_star], k))
-        chosen = None
-        for k in order:
-            idx = np.where(labels == k)[0]
-            split = two_means_split(psi_tilde[idx])
-            if split is None:
-                infeasible.add(k)
-                continue
-            chosen = (idx, split)
-            break
-        if chosen is None:
-            break  # every remaining bin is infeasible: nothing splittable remains
-        idx, (idx_a, idx_b) = chosen
-        labels = labels.copy()
-        labels[idx[idx_b]] = L
-        L += 1
-        n_rounds += 1
-
-    S_pre = S
-    labels, L = _lloyd_all(psi_tilde, labels, L)
-    _, S = _predicted_share(psi0_all, V_hat, labels, L)
-
-    return Growth(labels=labels, L0=L, n_growth_rounds=n_rounds, growth_capped=growth_capped,
-                  S_pred=S, S_pred_pre_lloyd=S_pre, std=std)
-
-
-def _fit_scale(p: np.ndarray, U: np.ndarray, m: np.ndarray) -> np.ndarray:
-    """a_c = sum_k p_k*U_kc*m_kc / sum_k p_k*m_kc^2: the least-squares
-    scale of the measured derivative on the predicted mean, fitted once
-    and held fixed through the continuation so a uniform scale error in
-    the model does not itself register as disagreement."""
-    num = np.sum(p[:, None] * U * m, axis=0)
-    den = np.sum(p[:, None] * m ** 2, axis=0)
-    return num / den
-
-
 # A20 (spec/QIJ_mods_waves.md), amended by A21's architecture rule:
 # `_apply_update` was copied VERBATIM from `archive/seeded-tree:
 # src/qij_joint/core/seed.py` for A20's build, including its `sd_hat`
 # parameter -- the GP posterior sd, carried alongside psi_hat and fed
-# no decision. A21's architecture rule (module docstring) drops that
-# second vector from the state entirely, so `sd_hat` is removed from
-# this signature and body; the GP posterior sd survives only as
-# `QIJResult.sigma`, a stored survey diagnostic `qij.py` builds on its
-# own. `_run_total` is this function's only caller here.
+# no decision. A21's architecture rule drops that second vector from
+# the state entirely, so `sd_hat` is removed from this signature and
+# body; the GP posterior sd survives only as `QIJResult.sigma`. `
+# run_joint` is this function's only caller here; kept module-level and
+# verbatim across the unified-loop rewrite (interface spec, item A).
 def _apply_update(psi_hat: np.ndarray, idx: np.ndarray, U: np.ndarray,
                    t_k: float, eta_full: float, theta_abs: np.ndarray,
                    n_scale: np.ndarray, n_shift: np.ndarray, n_neg: np.ndarray) -> None:
@@ -379,448 +242,409 @@ def _apply_update(psi_hat: np.ndarray, idx: np.ndarray, U: np.ndarray,
             n_shift[c] += 1
 
 
-def _split_task(T, case, X: np.ndarray, task):
-    """One continuation round's one-shot forward evaluation, the
-    same failure boundary as `ivq._bin_task`: `task` is (split id,
-    signed step t, member mask, start); `call_T` applies the
-    estimator's prepared state and the start-continuation rule (A9).
-    Returns (id, evaluation, failure flag, this call's own wall time)."""
-    sid, t, mask, start = task
+def _central_task(T, case, X: np.ndarray, task):
+    """One round's one-shot central-pair evaluation, on the pool (the
+    same failure boundary as `ivq._bin_task`'s pool path -- module
+    docstring, "the central-stencil machinery and its pool batching"):
+    `task` is (leaf id, signed step t, member mask, start, eta);
+    `call_T` applies the estimator's prepared state, the start-
+    continuation rule (A9) and the per-call eta override (A15). Two
+    calls per leaf (+t, -t) go into the SAME pool batch as every other
+    chosen leaf's pair, in task order, so pairing by position
+    (`run_joint`'s own `2*i`/`2*i+1`) is bit-identical across worker
+    counts. Returns (leaf id, signed t, evaluation, failure flag, this
+    call's own wall time)."""
+    leaf_id, t, mask, start, eta = task
     omega = perturbed_weights(np.ones(len(X)), mask, t)
     t0 = time.perf_counter()
     try:
-        result = call_T(T, X, omega, start)
+        result = call_T(T, X, omega, start, eta)
         result = np.asarray(result, dtype=float)
         failed = bool(np.any(np.isnan(result)))
     except Exception:
         result = np.full(len(T.outputs), np.nan)
         failed = True
-    return sid, result, failed, time.perf_counter() - t0
+    return leaf_id, t, result, failed, time.perf_counter() - t0
 
 
-def _failed_result(N: int, q: int, growth: Optional[Growth] = None, busy_delta: float = 0.0) -> JointResult:
-    """A failed draw: either the influence model's shared constant-path
-    rule fails an output before growth ever runs, or the bin stencil's
-    initial full-data measurement fails after a valid growth. Every
-    variance quantity is void; growth's own products (needing no
-    evaluation) are kept when growth ran."""
+def _failed_result(N: int, q: int, q_full: int, z: float, n_min: int, L_max: int,
+                    busy_delta: float = 0.0) -> JointResult:
+    """A failed draw: the shared constant-path pre-check failed before
+    any evaluation. Every variance/leaf/split/round quantity is void;
+    `qij.py` NaNs the per-output fields it reads directly, so the exact
+    fill here matters only for shape."""
     nan_q = np.full(q, np.nan)
-    if growth is None:
-        L0, labels = 0, np.full(N, -1, dtype=int)
-        n_rounds, capped, S_pred, S_pre = 0, False, nan_q, nan_q
-        mass = np.zeros(0)
-    else:
-        L0, labels = growth.L0, growth.labels
-        n_rounds, capped = growth.n_growth_rounds, growth.growth_capped
-        S_pred, S_pre = growth.S_pred, growth.S_pred_pre_lloyd
-        mass = np.bincount(labels, minlength=L0).astype(float) / N
+    nan_q_full = np.full(q_full, np.nan)
     return JointResult(
-        V_btw=nan_q, V_win_hat=nan_q, V_tot_hat=nan_q, S_pred=S_pred, a=nan_q,
-        B_hat=nan_q, a_bca=nan_q,
-        L0=L0, L=L0, n_growth_rounds=n_rounds, growth_capped=capped, S_pred_pre_lloyd=S_pre,
-        n_check_rounds=0, n_check_evals=0, n_level_splits=0, check_capped=False, failed=True,
-        bin_mass=mass, bin_U=np.full((L0, q), np.nan), bin_m=np.full((L0, q), np.nan),
-        bin_label=labels, busy_delta=busy_delta, share_final=nan_q,
+        V_btw=nan_q, V_win_hat=nan_q, se_V_win=nan_q, V_tot_hat=nan_q,
+        kappa=nan_q, se_kappa=nan_q, margin=nan_q, B_hat=nan_q_full, a_bca=nan_q_full,
+        L=0, n_splits=0, n_rounds=0, n_evals=0, capped=False, stop_met=False, failed=True,
+        bin_mass=np.zeros(0), bin_U=np.zeros((0, q)), bin_m=np.zeros((0, q)),
+        bin_ebar=np.zeros((0, q)), bin_W=np.zeros((0, q)), bin_n=np.zeros(0, dtype=int),
+        bin_label=np.full(N, -1, dtype=int),
+        split_parent=np.zeros(0, dtype=int), split_child_a=np.zeros(0, dtype=int),
+        split_child_b=np.zeros(0, dtype=int), split_G=np.zeros((0, q)),
+        split_D=np.zeros((0, q)), split_round=np.zeros(0, dtype=int),
+        round_kappa=np.zeros((0, q)), round_se_kappa=np.zeros((0, q)),
+        round_V_win=np.zeros((0, q)), round_margin=np.zeros((0, q)),
+        round_n_splits=np.zeros(0, dtype=int),
         n_update_scale=np.zeros(q, dtype=int), n_update_shift=np.zeros(q, dtype=int),
-        n_update_negative=np.zeros(q, dtype=int), pilot_err_btw=nan_q,
-        state_psi_hat=np.full((N, q), np.nan),
-    )
-
-
-def _run_total(
-    N: int, q: int, X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
-    offset: np.ndarray, measured: Sequence[int], pool, start: Optional[np.ndarray],
-    eta: float, eps: float, M_X_used: int, growth: Growth, bins: BinSet, V_btw: np.ndarray,
-    groups0: Sequence[np.ndarray], U0: np.ndarray, m0: np.ndarray,
-    B_hat: np.ndarray, a_bca: np.ndarray, a: np.ndarray, busy_delta: float,
-) -> JointResult:
-    """
-    `run_joint`'s continuation (spec/QIJ_mods_waves.md A20's
-    `_run_total`, the method under A21, no switch): every round splits
-    whichever open leaf (or group of leaves) does the most to bring the
-    currently worst measured output's own TOTAL within share S_c =
-    V_win_hat_c/(V_btw_c+V_win_hat_c) back under `eps`, measured exactly
-    as a forward evaluation of the small child at its own step
-    (`U_large` by conservation, `Delta` on `V_btw`'s own scale), all of
-    a round's evaluations in one pool batch through `_split_task`.
-
-    THE STATE VECTOR (module docstring). `psi_hat` (N,q) is the
-    per-point STATE the method reports and reads from here on: it
-    starts as the A18-corrected pilot, centred (`psi0_all - offset`,
-    both already in full-data units -- `run_joint`'s own correction
-    runs before this function is called). Right after the stage-1
-    stencils, one update pass applies `_apply_update` to every stage-1
-    leaf (`groups0[k]`, `U0[k]`, at that leaf's own central-stencil step
-    `t_k`); after every later split, both children (small from its own
-    forward evaluation, large from conservation) get their own
-    `_apply_update` call, at their own step. `theta_abs` (the update's
-    own noise floor, `eta*|theta_hat|/t_k`) is `|theta_hat[measured]|`
-    floored at machine eps, fixed for the whole continuation.
-    `n_update_scale`/`n_update_shift`/`n_update_negative` (q,) are
-    `_apply_update`'s own running counts.
-
-    Every decision below reads `psi_hat`, never a fixed copy of the
-    pilot: a leaf's own `var_hat` (population variance of `psi_hat`
-    over the leaf's points, recomputed fresh the moment the leaf is
-    created -- stage 1, or a split's own child -- and cached from then
-    on, since nothing touches those points again until the leaf is
-    itself split) drives `win_hat`/`E`; a split's own cut is
-    `two_means_split` on `psi_hat[idx] / std_growth`, `std_growth =
-    growth.std * a` stage 1's own FIXED, A18-scaled per-output std (a
-    unit set once, never the current vector's own spread, so every
-    bin's cut reads the measured values in the same units) --
-    `two_means_split` demeans its own input, so the result is the same
-    whether or not `psi_hat` is itself already centred. `bin_m`
-    (`JointResult`'s own product) is the leaf's own m_pre -- `psi_hat`'s
-    mean over the leaf's points at the moment it was measured, before
-    its own update -- the SAME quantity `ebar` is computed from, never
-    the fixed pilot's mean: THE ARCHITECTURE RULE (module docstring)
-    leaves no fixed copy of the pilot for any reader, bin_m included.
-
-    Ranking (spec/QIJ_mods_waves.md A20, amended 2 October -- the
-    author's ruling, after an offline test that found the measured
-    error recovers the within error up to 3x faster per evaluation
-    than the pilot's own W): a leaf's `ebar` (q,), set once at the
-    leaf's own creation (stage 1, or a split's own child), is its
-    measured mean minus `psi_hat`'s mean over its own points at that
-    moment, BEFORE the update below applies (`m_pre`); `delta_U` (q,),
-    set at the same time, is the update's own noise term `eta*
-    theta_abs/t_k` at the leaf's own step t_k. `rank_score(leaf, c)` is
-    `(leaf['n']/N)*ebar[c]**2/N` when `abs(ebar[c]) > delta_U[c]`, else
-    `(leaf['n']/N)*var_hat[c]/N` (== W_kc, the current vector's own
-    contribution to V_win_hat,c) -- both forms divided by N so a
-    leaf's score is in `win_hat`'s own units regardless of which
-    branch fires.
-
-    A round: V_win_hat is (1/N) sum_{k: n_k>1} p_k Var_k(psi_hat) over
-    the CURRENT leaves; if every S_c <= eps, stop. If the evaluation
-    cap (`1 + M_X_used`) is spent, stop (`check_capped`). Otherwise c* =
-    argmax_c S_c/eps (eps is one scalar across outputs, kept as the
-    ratio to match what it is tested against) is the binding output,
-    and E = V_win_hat_c* - eps/(1-eps)*V_btw_c* is the within that must
-    come off it for S_c* to clear `eps`. Open leaves (n_k > 1,
-    rank_score(leaf, c*) > 0; a leaf with neither is never ranked,
-    since it cannot change S_c* and cannot be split either) are ranked
-    by `rank_score(leaf, c*)`, descending, ties to the lowest id; the
-    smallest prefix whose summed score reaches E (at least one leaf,
-    the whole ranked list if E is never reached) is proposed for the
-    cut above. A leaf whose split comes back infeasible is closed
-    (kept, excluded from every later round's ranking -- the data under
-    it does not change, so it would otherwise be picked again); a leaf
-    whose evaluation fails is closed the same way, with no second
-    chance. If nothing is proposed (every open leaf already closed, or
-    ranking finds nothing with positive score), the continuation stops
-    there, same as growth's own "nothing splittable remains".
-    `rank_rule` = 'measured_error' always (the method, no switch);
-    `bin_ebar` (L,q) is every FINAL leaf's own `ebar`, beside `bin_U`/
-    `bin_m`.
-
-    `V_btw` is carried in from `run_joint`'s own full-data measurement
-    of the growth bins and updated by `+= Delta` each successful split.
-    `a` (`_fit_scale`), `B_hat`/`a_bca` (`bias_and_acceleration`) are
-    passed through unchanged, fitted once against the growth bins
-    before any continuation round, as in `run_joint`.
-
-    `pilot_err_btw` (q,) = sum_k p_k*(U0_k-m0_k)^2/N over the stage-1
-    leaves only (`bins.p`, `U0`, `m0`, all already A18-corrected): the
-    measured, between-leaf part of the PILOT's own error variance, on
-    V_btw's own O(1/N) scale -- a diagnostic read from the fixed pilot
-    mean `m0` deliberately (it measures the pilot's own error, not the
-    state vector's), unrelated to `bin_m`, which the ARCHITECTURE RULE
-    requires read from the state vector instead (spec/QIJ_mods_waves.md
-    A20 writes the sum with no explicit 1/N; this function divides by N
-    to match V_btw's convention and the quantity it is compared
-    against -- see the spec-vs-code note filed with the A20 build).
-    """
-    L0 = growth.L0
-    centering_residual = bins.centering_residual[measured]
-    delta_f = forward_step(eta)
-    delta_c = central_step(eta)
-    evals_cap = 1 + M_X_used
-    n_check_rounds = n_check_evals = n_level_splits = 0
-    check_capped = False
-    next_id = L0
-    closed: set = set()
-
-    # THE STATE VECTOR (module docstring): starts as the A18-corrected
-    # pilot, centred (`psi0_all`/`offset` are already a_c-corrected by
-    # `run_joint` before this function is called). No second vector
-    # (`sd_hat`) is carried alongside it (A21's architecture rule).
-    psi_hat = psi0_all - offset[None, :]
-    std_growth = growth.std * a  # stage 1's FIXED, A18-scaled growth std (a unit, set once)
-    theta_abs = np.maximum(np.abs(theta_hat[measured]), np.finfo(float).eps)
-    n_update_scale = np.zeros(q, dtype=int)
-    n_update_shift = np.zeros(q, dtype=int)
-    n_update_negative = np.zeros(q, dtype=int)
-
-    # The stage-1 leaves' own between-leaf pilot-error variance (spec
-    # "Products, added"), from the fixed pilot mean `m0` against the
-    # stage-1 stencils' own `U0` -- computed once, before the update
-    # pass below changes anything, since it is the PILOT's error, not
-    # the state vector's.
-    pilot_err_btw = np.sum(bins.p[:, None] * (U0 - m0) ** 2, axis=0) / N
-
-    leaves: Dict[int, dict] = {
-        k: dict(indices=groups0[k], n=int(bins.n[k]), U=U0[k].copy())
-        for k in range(L0)
-    }
-    # One update pass over every stage-1 leaf (spec: "one batch, one
-    # update pass"): order among leaves does not matter, each leaf's
-    # own points are disjoint from every other leaf's. `ebar`/`delta_U`
-    # are captured from the PRE-update mean (`m_pre`), for the ranking
-    # amendment below, and ALSO become this leaf's `bin_m` -- THE
-    # ARCHITECTURE RULE's own fix (module docstring): `_apply_update`
-    # recomputes its own mean fresh and is not told `m_pre` (it is
-    # `_apply_update`'s own local `m`, verbatim from the archive -- not
-    # threaded through as a parameter).
-    for k in range(L0):
-        idx = groups0[k]
-        t_k = step_parameter(delta_c, float(bins.p[k]))
-        m_pre = psi_hat[idx].mean(axis=0)
-        leaves[k]['m'] = m_pre
-        leaves[k]['ebar'] = U0[k] - m_pre
-        leaves[k]['delta_U'] = eta * theta_abs / t_k
-        _apply_update(psi_hat, idx, U0[k], t_k, eta, theta_abs,
-                      n_update_scale, n_update_shift, n_update_negative)
-        leaves[k]['var_hat'] = psi_hat[idx].var(axis=0)
-
-    def win_hat() -> np.ndarray:
-        out = np.zeros(q)
-        for leaf in leaves.values():
-            if leaf['n'] > 1:
-                out += (leaf['n'] / N) * leaf['var_hat']
-        return out / N  # (1/N) sum_k p_k Var_k(psi_hat), no v (method_notes section 6)
-
-    def rank_score(leaf: dict, c: int) -> float:
-        """A20's ranking amendment (2 October): the leaf's own measured
-        error when it exceeds the update's noise term, else W_kc on the
-        current vector -- both in `win_hat`'s own units (divided by N)."""
-        if abs(leaf['ebar'][c]) > leaf['delta_U'][c]:
-            return (leaf['n'] / N) * leaf['ebar'][c] ** 2 / N
-        return (leaf['n'] / N) * leaf['var_hat'][c] / N
-
-    while True:
-        V_win_hat = win_hat()
-        S = V_win_hat / (V_btw + V_win_hat)
-        if np.all(S <= eps):
-            break
-        if n_check_evals >= evals_cap:
-            check_capped = True
-            break
-        c_star = int(np.argmax(S / eps))
-        E = V_win_hat[c_star] - (eps / (1.0 - eps)) * V_btw[c_star]
-        # Ranking amendment (A20, 2 October): rank_score falls back to
-        # W_kc (== the old (leaf['n']/N)*var_hat[c_star]/N) when the
-        # leaf's own measured error is at noise level, so a leaf that
-        # was a candidate before still is; one that only has a large
-        # ebar (e.g. a homogeneous leaf a SCALE update left at var_hat
-        # == 0, its mean still visibly off) is now a candidate too --
-        # filtering on `rank_score > 0` rather than `var_hat > 0`
-        # (spec-vs-code note filed with the A20 build).
-        candidates = []
-        for k, leaf in sorted(leaves.items()):
-            if k in closed or leaf['n'] <= 1:
-                continue
-            score = rank_score(leaf, c_star)
-            if score > 0.0:
-                candidates.append((k, score))
-        candidates.sort(key=lambda t: (-t[1], t[0]))
-        chosen = []
-        cum = 0.0
-        for k, contrib in candidates:
-            chosen.append(k)
-            cum += contrib
-            if cum >= E:
-                break
-        if not chosen:
-            break  # nothing left can move S_c*: nothing splittable remains
-
-        n_check_rounds += 1
-        proposals = {}
-        for k in chosen:
-            idx = leaves[k]['indices']
-            split = two_means_split(psi_hat[idx] / std_growth)
-            if split is None:
-                closed.add(k)
-                continue
-            idx_a, idx_b = idx[split[0]], idx[split[1]]
-            idx_small, idx_large = (idx_a, idx_b) if idx_a.size <= idx_b.size else (idx_b, idx_a)
-            p_small = idx_small.size / N
-            p_large = idx_large.size / N
-            t_small = step_parameter(delta_f, p_small)
-            t_large = step_parameter(delta_f, p_large)
-            mask = np.zeros(N, dtype=bool)
-            mask[idx_small] = True
-            proposals[k] = dict(idx_small=idx_small, idx_large=idx_large,
-                                 p_small=p_small, p_large=p_large, t_small=t_small,
-                                 t_large=t_large, mask=mask)
-        if not proposals:
-            continue
-
-        tasks = [(k, meta['t_small'], meta['mask'], start) for k, meta in proposals.items()]
-        if pool is None:
-            evaluated = []
-            for k, t, mask, _start in tasks:
-                val = np.asarray(counter(X, perturbed_weights(np.ones(N), mask, t), start=_start),
-                                  dtype=float)
-                evaluated.append((k, val, bool(np.any(np.isnan(val)))))
-        else:
-            t_map0 = time.perf_counter()
-            raw = pool.map(_split_task, tasks)
-            busy_delta += sum(r[3] for r in raw) - (time.perf_counter() - t_map0)
-            evaluated = [(k, val, failed) for k, val, failed, _ in raw]
-            for _, _, failed in evaluated:
-                counter.add(1, N, int(failed))
-        n_check_evals += len(tasks)
-
-        for k, val, failed in evaluated:
-            if failed:
-                closed.add(k)  # cancelled: the parent stays as a final bin, closed
-                continue
-            meta = proposals[k]
-            leaf = leaves.pop(k)
-            p_parent = leaf['n'] / N
-            U_small = (val[measured] - theta_hat[measured]) / meta['t_small'] - centering_residual
-            U_large = (p_parent * leaf['U'] - meta['p_small'] * U_small) / meta['p_large']
-            Delta = (meta['p_small'] * U_small ** 2 + meta['p_large'] * U_large ** 2
-                     - p_parent * leaf['U'] ** 2) / N
-            V_btw += Delta
-            n_level_splits += 1
-            # ebar/delta_U/m (ranking amendment, and bin_m -- THE
-            # ARCHITECTURE RULE): the child's own measured mean against
-            # psi_hat's mean over its own points BEFORE its update, at
-            # its own step -- captured before `_apply_update` touches
-            # those points; this SAME m_pre is the child's `bin_m`.
-            m_pre_small = psi_hat[meta['idx_small']].mean(axis=0)
-            m_pre_large = psi_hat[meta['idx_large']].mean(axis=0)
-            ebar_small = U_small - m_pre_small
-            ebar_large = U_large - m_pre_large
-            delta_U_small = eta * theta_abs / meta['t_small']
-            delta_U_large = eta * theta_abs / meta['t_large']
-            _apply_update(psi_hat, meta['idx_small'], U_small, meta['t_small'], eta,
-                          theta_abs, n_update_scale, n_update_shift, n_update_negative)
-            _apply_update(psi_hat, meta['idx_large'], U_large, meta['t_large'], eta,
-                          theta_abs, n_update_scale, n_update_shift, n_update_negative)
-            leaves[next_id] = dict(indices=meta['idx_small'], n=meta['idx_small'].size,
-                                    U=U_small, m=m_pre_small, ebar=ebar_small,
-                                    delta_U=delta_U_small,
-                                    var_hat=psi_hat[meta['idx_small']].var(axis=0))
-            leaves[next_id + 1] = dict(indices=meta['idx_large'], n=meta['idx_large'].size,
-                                        U=U_large, m=m_pre_large, ebar=ebar_large,
-                                        delta_U=delta_U_large,
-                                        var_hat=psi_hat[meta['idx_large']].var(axis=0))
-            next_id += 2
-
-    ordered_ids = sorted(leaves.keys())
-    L_final = len(ordered_ids)
-    bin_mass = np.array([leaves[i]['n'] for i in ordered_ids], dtype=float) / N
-    bin_U = np.array([leaves[i]['U'] for i in ordered_ids])
-    bin_m = np.array([leaves[i]['m'] for i in ordered_ids])
-    # Ranking amendment's own per-leaf diagnostic, beside bin_U/bin_m:
-    # each FINAL leaf's own ebar at the moment it was created.
-    bin_ebar = np.array([leaves[i]['ebar'] for i in ordered_ids])
-    bin_label = np.empty(N, dtype=int)
-    for new_id, old_id in enumerate(ordered_ids):
-        bin_label[leaves[old_id]['indices']] = new_id
-
-    V_win_hat = win_hat()
-    V_tot_hat = V_btw + V_win_hat
-    share_final = V_win_hat / V_tot_hat
-
-    return JointResult(
-        V_btw=V_btw, V_win_hat=V_win_hat, V_tot_hat=V_tot_hat,
-        S_pred=growth.S_pred, a=a, B_hat=B_hat, a_bca=a_bca,
-        L0=L0, L=L_final, n_growth_rounds=growth.n_growth_rounds,
-        growth_capped=growth.growth_capped, S_pred_pre_lloyd=growth.S_pred_pre_lloyd,
-        n_check_rounds=n_check_rounds, n_check_evals=n_check_evals,
-        n_level_splits=n_level_splits, check_capped=check_capped, failed=False,
-        bin_mass=bin_mass, bin_U=bin_U, bin_m=bin_m,
-        bin_label=bin_label, busy_delta=busy_delta, share_final=share_final,
-        n_update_scale=n_update_scale, n_update_shift=n_update_shift,
-        n_update_negative=n_update_negative, pilot_err_btw=pilot_err_btw,
-        state_psi_hat=psi_hat, rank_rule='measured_error', bin_ebar=bin_ebar,
+        n_update_negative=np.zeros(q, dtype=int), state_psi_hat=np.full((N, q), np.nan),
+        rank_rule='measured_error', z=z, n_min=n_min, L_max=L_max, busy_delta=busy_delta,
     )
 
 
 def run_joint(
     X: np.ndarray, counter, theta_hat: np.ndarray, psi0_all: np.ndarray,
     model, xvq, eta: float, eps: float, offset: np.ndarray, pool=None,
-    start: np.ndarray = None, measured: Optional[Sequence[int]] = None,
+    start: np.ndarray = None, measured: Optional[Sequence[int]] = None, *,
+    z: float = 2.0, n_min: int = 30, L_max: Optional[int] = None,
 ) -> JointResult:
     """
-    The joint second stage (spec/method_notes.md section 6;
-    spec/QIJ_mods_waves.md A20/A21): grow a shared partition (`grow`),
-    measure every bin through `ivq.bin_differences`, then a continuation
-    that splits whichever leaf does the most for the currently worst
-    output's total within share, carrying the per-point state vector
-    forward throughout (module docstring), all a round's evaluations on
-    `pool`. `start` (A9's continuation rule, spec/QIJ_mods_waves.md A9)
-    is passed to every full-data evaluation here -- the initial bin
-    measurement and every continuation split; None reproduces today's
-    evaluations bit for bit. `measured` (spec/QIJ_mods_waves.md A11) is
-    the absolute indices, into T's full output, that `psi0_all`/`model`
-    already carry; `theta_hat`, and every raw evaluation this function
-    makes (`bin_differences`'s stencils, a split's own `val`), stay
-    full width, one evaluation reporting every output at no extra cost,
-    and are cut down to `measured`'s columns wherever they meet a
-    psi0-driven quantity -- `bias_and_acceleration`'s `B_hat`/`a_bca`
-    are the one exception, read from the full bins and restricted to
-    `measured` by the caller instead (`qij.py`). `measured=None`
-    defaults to identity (0..q-1), reproducing today's evaluations bit
-    for bit.
+    The unified measured loop (module docstring; spec/QIJ_unified_loop_
+    spec.md sections 0, 4). `psi0_all` (N, q) is the GP pilot's point
+    predictions, survey units, already restricted to `measured`'s
+    columns by the caller (as `model` is); `theta_hat` stays FULL width
+    (q_full), the base full-data fit every central pair measures
+    against. `offset` (q,) is `psi0_all`'s own centering constant
+    (`model.offset`): subtracted here, then immediately superseded by
+    the root's own centring shift below (spec 4.0) -- any constant
+    subtracted before an unconditional mean-subtraction cancels in the
+    result, so `offset`'s value does not change `psi_hat`; it is kept
+    as a parameter for interface compatibility with `qij.py`'s existing
+    convention, not because it still does anything (a judgement call,
+    reported with the build).
 
-    `offset` (q,) is `psi0_all`'s own centering constant
-    (`model.offset`, `qij.py`'s local copy), read here rather than
-    `model.offset` directly so the correction below never needs to
-    touch `model` itself.
+    `measured` (spec/QIJ_mods_waves.md A11) is the absolute indices,
+    into T's full output, that `psi0_all`/`model` already carry;
+    `measured=None` defaults to identity (0..q-1). `z`/`n_min`/`L_max`
+    are the three user-exposed levers (spec section 5); `L_max=None`
+    resolves to `xvq.M_used` (the survey's own prototype count, spec's
+    ruling for the cap's default).
+
+    `start` (A9) passes through unchanged to every evaluation this
+    function makes; `start=None` reproduces today's evaluations bit for
+    bit. All of one round's evaluations run in a single `pool.map` call
+    (spec 4.2/4.3), bit-identical across worker counts (module
+    docstring, `_central_task`).
     """
     N, q = psi0_all.shape
     if measured is None:
         measured = list(range(q))
+    measured = np.asarray(measured, dtype=int)
+    theta_hat = np.asarray(theta_hat, dtype=float)
+    q_full = theta_hat.size
     M_X_used = xvq.M_used
+    if L_max is None:
+        L_max = M_X_used
 
     if np.any(model.constant_path):
-        return _failed_result(N, q)
+        return _failed_result(N, q, q_full, z, n_min, L_max)
 
-    growth = grow(psi0_all, eps, M_X_used)
-    L0 = growth.L0
-    binset0 = BinSet(labels=growth.labels, n=np.bincount(growth.labels, minlength=L0),
-                      U=np.zeros((L0, 0)), centering_residual=np.zeros(0), D2=np.zeros((L0, 0)),
-                      M_init=L0, M_used=L0, within_share=0.0, failed=False)
-    bins, busy_delta = bin_differences(X, counter, theta_hat, binset0, eta, pool, start=start)
-    if bins.failed:
-        return _failed_result(N, q, growth=growth, busy_delta=busy_delta)
+    # std0 (spec 4.2): the per-output std of the POPULATED vector over
+    # the whole cloud, a unit fixed once, at population -- every cut's
+    # own standardization throughout the loop, replacing the old
+    # growth-stage `growth.std*a` (A18's separate scale step is gone).
+    std0 = np.std(psi0_all, axis=0)
+    theta_abs = np.maximum(np.abs(theta_hat[measured]), np.finfo(float).eps)
+    delta = central_step(eta)
 
-    B_hat, a_bca = bias_and_acceleration(bins, N)
-    V_btw = np.array([between_terms(bins, c) for c in measured])
-    U0 = bins.U[:, measured]
-    _, m0, _ = _bin_stats(psi0_all, bins.labels, L0)
-    a = _fit_scale(bins.p, U0, m0)
+    # THE STATE VECTOR (module docstring). The root's own update (spec
+    # 4.0): `offset` is subtracted, then the CENTRING shift -- an
+    # unconditional mean subtraction, NOT one of `_apply_update`'s
+    # scale/shift branches (there is no step t_root: the root is never
+    # evaluated, spec 4.0), so it is not counted in n_update_scale/
+    # shift/negative.
+    psi_hat = psi0_all - offset[None, :]
+    m_pre_root = psi_hat.mean(axis=0)
+    psi_hat = psi_hat - m_pre_root[None, :]
 
-    # A18 (spec/QIJ_mods_waves.md): a_c is the gap between SURVEY units
-    # and FULL-DATA units on each output axis, applied once here, right
-    # after `a` is fitted. Every survey-unit quantity read from this
-    # point on -- `psi0_all` itself, `offset`, the growth-bin means
-    # `m0` (the pilot's own error diagnostic, `pilot_err_btw`) -- is
-    # rebound to a NEW local array in its a_c-corrected units, never
-    # written in place: `psi0_all` is `influence_model.psi0`'s own
-    # cache ("THE RETURNED ARRAY IS THE CACHE, not a copy: callers must
-    # not write into it"), and `offset` may alias `model.offset`;
-    # `a[None, :] * x` always allocates a fresh array, so the
-    # cached/aliased object itself is untouched. `psi_tilde` (used only
-    # by `grow` above, already run) and `growth.std` were already fixed
-    # before this correction, from the PRE-correction `psi0_all` --
-    # `_run_total`'s own cuts read `growth.std * a` (`std_growth`),
-    # never a recomputation from the now-corrected `psi0_all`, since
-    # scaling `psi0_all` and `growth.std` by the same `a_c` and then
-    # dividing is NOT bit-identical, in floating point, to the
-    # pre-correction ratio.
-    psi0_all = psi0_all * a[None, :]
-    offset = offset * a
-    m0 = m0 * a[None, :]
+    next_id = 1
+    leaves: Dict[int, dict] = {
+        0: dict(indices=np.arange(N), n=N, U=np.zeros(q), m=m_pre_root,
+                ebar=-m_pre_root, delta_U=np.zeros(q), var_hat=psi_hat.var(axis=0)),
+    }
+    closed: set = set()
 
-    groups0 = [np.where(bins.labels == k)[0] for k in range(L0)]
+    n_update_scale = np.zeros(q, dtype=int)
+    n_update_shift = np.zeros(q, dtype=int)
+    n_update_negative = np.zeros(q, dtype=int)
 
-    return _run_total(N, q, X, counter, theta_hat, psi0_all, offset, measured,
-                       pool, start, eta, eps, M_X_used, growth, bins, V_btw, groups0, U0, m0,
-                       B_hat, a_bca, a, busy_delta)
+    V_btw = np.zeros(q)
+    split_D: list = []
+    split_G: list = []
+    split_parent: list = []
+    split_child_a: list = []
+    split_child_b: list = []
+    split_round: list = []
+    round_kappa: list = []
+    round_se_kappa: list = []
+    round_V_win: list = []
+    round_margin: list = []
+    round_n_splits: list = []
+    abc_p: list = []
+    abc_U_full: list = []
+    abc_D2_full: list = []
+
+    n_evals = 0
+    capped = False
+    stop_met = False
+    busy_delta = 0.0
+    round_idx = 0
+
+    # Loop invariants read fresh every iteration (never cached across
+    # rounds): `ids`/`L` the current leaf set, `kappa`/`V_win`/`X`/
+    # `margin`/`c_star` the stop's own report AFTER every round made so
+    # far (spec 4.4; kappa === 1, se === 0 before any split,
+    # `calibrate.kappa_hat`'s own S == 0 branch).
+    kappa = se_kappa = V_win = se_V_win = margin = None
+    V_tot = None
+    while True:
+        ids = sorted(leaves.keys())
+        L = len(ids)
+        n_arr_all = np.array([leaves[i]['n'] for i in ids], dtype=float)
+        var_all = np.array([leaves[i]['var_hat'] for i in ids])
+        W_all = (n_arr_all[:, None] / N) * var_all / N
+
+        D_arr = np.array(split_D) if split_D else np.zeros((0, q))
+        G_arr = np.array(split_G) if split_G else np.zeros((0, q))
+        kappa, se_kappa = kappa_hat(D_arr, G_arr)
+        V_win, se_V_win = vwin_hat(W_all, n_arr_all, kappa, se_kappa)
+        n_splits_so_far = len(split_D)
+        stop, X_vec, margin, c_star = stop_test(V_btw, V_win, se_V_win, eps, z,
+                                                 n_splits_so_far, n_min)
+        V_tot = V_btw + V_win
+        if stop:
+            stop_met = True
+            break
+        if L >= L_max:
+            capped = True
+            break
+
+        cand_ids = [i for i in ids if i not in closed and leaves[i]['n'] > 1]
+        if not cand_ids:
+            break  # nothing splittable remains
+
+        p_cand = np.array([leaves[i]['n'] / N for i in cand_ids])
+        n_cand = np.array([leaves[i]['n'] for i in cand_ids], dtype=float)
+        ebar_cand = np.array([leaves[i]['ebar'] for i in cand_ids])
+        delta_U_cand = np.array([leaves[i]['delta_U'] for i in cand_ids])
+        var_cand = np.array([leaves[i]['var_hat'] for i in cand_ids])
+        W_cand = (n_cand[:, None] / N) * var_cand / N
+        r = rank_scores(p_cand, ebar_cand, delta_U_cand, W_cand, N)
+        order = sorted(range(len(cand_ids)), key=lambda j: (-r[j, c_star], cand_ids[j]))
+
+        # Walk the ranked list once (spec 4.1/4.2): form every
+        # candidate's own cut, apply the closing test (infeasible cut,
+        # or expected gain G_l*kappa below the noise floor n_Delta +
+        # b_Delta on every output -- f_l*W_l*kappa == G_l*kappa
+        # algebraically, since f_l = G_l/W_l by definition, so neither
+        # f_l nor W_l needs computing separately); a survivor's
+        # expected gain on the binding output c* becomes its entry in
+        # `calibrate.round_prefix`'s own input array. A judgement call
+        # (spec silent on the exact walk order): every open, non-closed
+        # leaf is evaluated this way every round, not just a prefix cut
+        # short once the running sum reaches the excess -- recomputing
+        # an unused cut next round is cheap and this keeps the pass
+        # simple and unambiguous; `round_prefix` still sizes the round
+        # to the smallest prefix of SURVIVORS.
+        survivors: list = []
+        for j in order:
+            k = cand_ids[j]
+            leaf = leaves[k]
+            idx = leaf['indices']
+            cut = two_means_split(psi_hat[idx] / std0)
+            if cut is None:
+                closed.add(k)
+                continue
+            idx_a, idx_b = idx[cut[0]], idx[cut[1]]
+            if idx_a.size <= idx_b.size:
+                idx_small, idx_large = idx_a, idx_b
+            else:
+                idx_small, idx_large = idx_b, idx_a
+            n_small, n_large = int(idx_small.size), int(idx_large.size)
+            p_small, p_large = n_small / N, n_large / N
+            U_small_pred = psi_hat[idx_small].mean(axis=0)
+            U_large_pred = psi_hat[idx_large].mean(axis=0)
+            U_k = leaf['U']
+            G_l = (n_small * (U_small_pred - U_k) ** 2
+                   + n_large * (U_large_pred - U_k) ** 2) / N ** 2
+            t_small = step_parameter(delta, p_small)
+            t_large = step_parameter(delta, p_large)
+            delta_U_small = eta * theta_abs / t_small
+            # n_Delta/b_Delta (spec 4.1, "the noise floor for closing";
+            # the measured-check spec's terms, spec/
+            # QIJ_joint_check_measured_spec.md section 4 -- "as today",
+            # spec section 5): evaluated here PRE-measurement, so
+            # U_small/U_large are the predicted (psi_hat) values, the
+            # same substitution G_l already makes; delta_U at the small
+            # child's own step (another judgement call, spec silent on
+            # which step feeds a priori floor terms).
+            n_delta = ((2.0 * p_small / N) * (np.abs(U_small_pred) + np.abs(U_large_pred))
+                       * delta_U_small)
+            b_delta = (p_small / N) * (1.0 + p_small / p_large) * delta_U_small ** 2
+            floor = n_delta + b_delta
+            expected_gain = G_l * kappa
+            if np.all(expected_gain < floor):
+                closed.add(k)
+                continue
+            survivors.append((k, float(expected_gain[c_star]), dict(
+                idx_small=idx_small, idx_large=idx_large, n_small=n_small, n_large=n_large,
+                p_small=p_small, p_large=p_large, t_small=t_small, t_large=t_large,
+                U_small_pred=U_small_pred, U_large_pred=U_large_pred, G_l=G_l,
+            )))
+
+        if not survivors:
+            break  # every candidate closed: nothing splittable remains
+
+        gains = np.array([s[1] for s in survivors])
+        k_prefix = round_prefix(gains, float(X_vec[c_star]))
+        chosen = survivors[:k_prefix]
+
+        # The leaf cap (spec 4.4, the author's ruling): L <= L_max.
+        remaining_budget = L_max - L
+        if len(chosen) > remaining_budget:
+            chosen = chosen[:remaining_budget]
+            capped = True
+
+        round_idx += 1
+        round_kappa.append(kappa)
+        round_se_kappa.append(se_kappa)
+        round_V_win.append(V_win)
+        round_margin.append(margin)
+
+        pool_tasks = []
+        for leaf_id, _, info in chosen:
+            mask = np.zeros(N, dtype=bool)
+            mask[info['idx_small']] = True
+            t_small = info['t_small']
+            pool_tasks.append((leaf_id, t_small, mask, start, eta))
+            pool_tasks.append((leaf_id, -t_small, mask, start, eta))
+        n_evals += len(pool_tasks)
+
+        if pool is None:
+            raw_results = []
+            for leaf_id, t_signed, mask, s, e in pool_tasks:
+                omega = perturbed_weights(np.ones(N), mask, t_signed)
+                val = np.asarray(counter(X, omega, start=s, eta=e), dtype=float)
+                failed = bool(np.any(np.isnan(val)))
+                raw_results.append((leaf_id, t_signed, val, failed, 0.0))
+        else:
+            t_map0 = time.perf_counter()
+            raw_results = pool.map(_central_task, pool_tasks)
+            busy_delta += sum(r[4] for r in raw_results) - (time.perf_counter() - t_map0)
+            for _, _, _, failed, _ in raw_results:
+                counter.add(1, N, int(failed))
+
+        this_round_splits = 0
+        for i, (leaf_id, _, info) in enumerate(chosen):
+            _, _, val_plus, failed_p, _ = raw_results[2 * i]
+            _, _, val_minus, failed_m, _ = raw_results[2 * i + 1]
+            if failed_p or failed_m:
+                closed.add(leaf_id)  # cancelled: the parent stays as a final bin, closed
+                continue
+            t_small = info['t_small']
+            t_large = info['t_large']
+            idx_small = info['idx_small']
+            idx_large = info['idx_large']
+            p_small = info['p_small']
+            p_large = info['p_large']
+            n_small = info['n_small']
+            n_large = info['n_large']
+
+            U_small_full = (val_plus - val_minus) / (2.0 * t_small)
+            D2_small_full = (val_plus - 2.0 * theta_hat + val_minus) / t_small ** 2
+            U_small = U_small_full[measured]
+
+            leaf = leaves.pop(leaf_id)
+            U_k = leaf['U']
+            p_parent = leaf['n'] / N
+            U_large = (p_parent * U_k - p_small * U_small) / p_large
+            D_s = (n_small * (U_small - U_k) ** 2 + n_large * (U_large - U_k) ** 2) / N ** 2
+            G_s = info['G_l']
+            V_btw = V_btw + D_s
+
+            split_D.append(D_s)
+            split_G.append(G_s)
+            split_parent.append(leaf_id)
+            split_child_a.append(next_id)
+            split_child_b.append(next_id + 1)
+            split_round.append(round_idx)
+
+            abc_p.append(p_small)
+            abc_U_full.append(U_small_full)
+            abc_D2_full.append(D2_small_full)
+
+            m_pre_small = info['U_small_pred']
+            m_pre_large = info['U_large_pred']
+            ebar_small = U_small - m_pre_small
+            ebar_large = U_large - m_pre_large
+            delta_U_small_vec = eta * theta_abs / t_small
+            delta_U_large_vec = eta * theta_abs / t_large
+
+            _apply_update(psi_hat, idx_small, U_small, t_small, eta, theta_abs,
+                          n_update_scale, n_update_shift, n_update_negative)
+            _apply_update(psi_hat, idx_large, U_large, t_large, eta, theta_abs,
+                          n_update_scale, n_update_shift, n_update_negative)
+
+            leaves[next_id] = dict(indices=idx_small, n=n_small, U=U_small, m=m_pre_small,
+                                    ebar=ebar_small, delta_U=delta_U_small_vec,
+                                    var_hat=psi_hat[idx_small].var(axis=0))
+            leaves[next_id + 1] = dict(indices=idx_large, n=n_large, U=U_large, m=m_pre_large,
+                                        ebar=ebar_large, delta_U=delta_U_large_vec,
+                                        var_hat=psi_hat[idx_large].var(axis=0))
+            next_id += 2
+            this_round_splits += 1
+
+        round_n_splits.append(this_round_splits)
+
+    ordered_ids = sorted(leaves.keys())
+    L_final = len(ordered_ids)
+    bin_n = np.array([leaves[i]['n'] for i in ordered_ids], dtype=int)
+    bin_mass = bin_n.astype(float) / N
+    bin_U = np.array([leaves[i]['U'] for i in ordered_ids])
+    bin_m = np.array([leaves[i]['m'] for i in ordered_ids])
+    bin_ebar = np.array([leaves[i]['ebar'] for i in ordered_ids])
+    var_final = np.array([leaves[i]['var_hat'] for i in ordered_ids])
+    bin_W = (bin_n[:, None].astype(float) / N) * var_final / N
+    bin_label = np.empty(N, dtype=int)
+    for new_id, old_id in enumerate(ordered_ids):
+        bin_label[leaves[old_id]['indices']] = new_id
+
+    n_splits_total = len(split_D)
+    if n_splits_total == 0:
+        B_hat = np.full(q_full, np.nan)
+        a_bca_out = np.full(q_full, np.nan)
+    else:
+        abc_p_arr = np.array(abc_p)
+        abc_U_arr = np.array(abc_U_full)
+        abc_D2_arr = np.array(abc_D2_full)
+        B_hat = np.sum(abc_p_arr[:, None] * abc_D2_arr, axis=0) / (2.0 * N)
+        num = np.sum(abc_p_arr[:, None] * abc_U_arr ** 3, axis=0)
+        den = np.sum(abc_p_arr[:, None] * abc_U_arr ** 2, axis=0)
+        a_bca_out = np.full(q_full, np.nan)
+        valid = den > 0.0
+        a_bca_out[valid] = num[valid] / (6.0 * np.sqrt(N) * den[valid] ** 1.5)
+
+    return JointResult(
+        V_btw=V_btw, V_win_hat=V_win, se_V_win=se_V_win, V_tot_hat=V_tot,
+        kappa=kappa, se_kappa=se_kappa, margin=margin, B_hat=B_hat, a_bca=a_bca_out,
+        L=L_final, n_splits=n_splits_total, n_rounds=round_idx, n_evals=n_evals,
+        capped=capped, stop_met=stop_met, failed=False,
+        bin_mass=bin_mass, bin_U=bin_U, bin_m=bin_m, bin_ebar=bin_ebar, bin_W=bin_W,
+        bin_n=bin_n, bin_label=bin_label,
+        split_parent=np.array(split_parent, dtype=int),
+        split_child_a=np.array(split_child_a, dtype=int),
+        split_child_b=np.array(split_child_b, dtype=int),
+        split_G=np.array(split_G) if split_G else np.zeros((0, q)),
+        split_D=np.array(split_D) if split_D else np.zeros((0, q)),
+        split_round=np.array(split_round, dtype=int),
+        round_kappa=np.array(round_kappa) if round_kappa else np.zeros((0, q)),
+        round_se_kappa=np.array(round_se_kappa) if round_se_kappa else np.zeros((0, q)),
+        round_V_win=np.array(round_V_win) if round_V_win else np.zeros((0, q)),
+        round_margin=np.array(round_margin) if round_margin else np.zeros((0, q)),
+        round_n_splits=np.array(round_n_splits, dtype=int),
+        n_update_scale=n_update_scale, n_update_shift=n_update_shift,
+        n_update_negative=n_update_negative, state_psi_hat=psi_hat,
+        rank_rule='measured_error', z=z, n_min=n_min, L_max=L_max, busy_delta=busy_delta,
+    )
