@@ -819,6 +819,14 @@ def _refine_candidates(prep, w, pen, Kg_cur, theta_cur, logf_old, eligible,
     pen_existing = sm._penalty_value(Kg_cur, theta_cur, Scov)
     M = eligible.shape[0]
 
+    # FIX (A): GMM2D's own feature-matrix pattern (gmm._build_features/
+    # _log_density_coeffs) -- QX built ONCE for this call; every
+    # candidate's log N(x|mu_j,cov_j) across all N rows becomes the one
+    # matmul QX @ C below, and the weighted second moments become the
+    # one matmul wr.T @ XP, replacing the (N, m, 2) diff/diff2 arrays and
+    # the einsum this function used to build every iteration.
+    QX, XP = gmm._build_features(X)
+
     new_w = np.where(eligible, np.maximum(wsum / W, _MIN_INSERT_SHARE / W), np.nan)
     new_mu = mean.copy()
     new_cov = np.empty((M, 2, 2))
@@ -828,6 +836,7 @@ def _refine_candidates(prep, w, pen, Kg_cur, theta_cur, logf_old, eligible,
 
     ll_trial = np.full(M, -np.inf)
     ll_prev = np.full(M, np.nan)
+    ll_prev2 = np.full(M, np.nan)
     active = eligible.copy()
 
     iter_cap = _EM_ITER_CAP_FACTOR * sm.n_params(Kg_cur + 1)
@@ -851,12 +860,9 @@ def _refine_candidates(prep, w, pen, Kg_cur, theta_cur, logf_old, eligible,
                 continue
 
         inv00, inv01, inv11 = c_ / det, -b_ / det, a_ / det
-        diff = X[:, None, :] - mu_j[None, :, :]  # (N, m, 2)
-        quad = (inv00 * diff[:, :, 0] ** 2
-                + 2.0 * inv01 * diff[:, :, 0] * diff[:, :, 1]
-                + inv11 * diff[:, :, 1] ** 2)
         logdet = np.log(det)
-        logN = -sm._LOG2PI - 0.5 * logdet - 0.5 * quad  # (N, m)
+        C = gmm._log_density_coeffs(np.ones(idx.size), mu_j, a_, b_, c_, det)
+        logN = QX @ C  # (N, m), one matmul in place of the old (N, m, 2) quad form
         a_term = np.log1p(-w_j) + logf_old[:, None]
         b_term = np.log(w_j) + logN
         hi = np.maximum(a_term, b_term)
@@ -868,30 +874,62 @@ def _refine_candidates(prep, w, pen, Kg_cur, theta_cur, logf_old, eligible,
         ll_now = (w @ logf_tr) / Wtot - a_pen * (pen_existing + pen_cand) / Wtot
 
         prev = ll_prev[idx]
+        prev2 = ll_prev2[idx]
         converged_now = (np.isfinite(prev)
                           & (np.abs(ll_now - prev) <= eta * np.maximum(np.abs(ll_now), 1.0)))
         ll_trial[idx] = ll_now
+        ll_prev2[idx] = prev
         ll_prev[idx] = ll_now
         active[idx[converged_now]] = False
 
-        still = ~converged_now
+        # FIX (B): racing via GMM2D's own Aitken projection
+        # (gmm._aitken_screen, reused unchanged). Once a still-active
+        # candidate has three recorded ll values, project its limit;
+        # drop (freeze at its current ll, the score it keeps) any whose
+        # projected limit cannot beat the leader's CURRENT ll (the best
+        # ll among every candidate scored so far, active or already
+        # frozen) -- it cannot win the gain race, so no further
+        # partial-EM spend on it is needed.
+        not_converged = ~converged_now
+        has_hist = np.isfinite(prev2)
+        check = not_converged & has_hist
+        if check.any():
+            leader_ll = np.max(ll_trial[np.isfinite(ll_trial)])
+            check_pos = np.nonzero(check)[0]
+            ell_inf = np.array([gmm._aitken_screen(prev2[k], prev[k], ll_now[k])[0]
+                                 for k in check_pos])
+            drop_idx = idx[check_pos[ell_inf < leader_ll]]
+            if drop_idx.size:
+                active[drop_idx] = False
+
+        still = active[idx]
         if still.any():
+            idx_still = idx[still]
             wr = w[:, None] * r[:, still]
             nk = wr.sum(axis=0)
             ok = np.isfinite(nk) & (nk > 0.0)
-            idx_still = idx[still]
             upd_idx = idx_still[ok]
             if upd_idx.size:
                 wr_ok = wr[:, ok]
                 nk_ok = nk[ok]
-                mu_upd = (wr_ok.T @ X) / nk_ok[:, None]
-                diff2 = X[:, None, :] - mu_upd[None, :, :]
-                Craw = np.einsum('nm,nmi,nmj->mij', wr_ok, diff2, diff2) / nk_ok[:, None, None]
-                cov_upd = ((nk_ok[:, None, None] * Craw + 2.0 * a_pen * Scov[None, :, :])
-                           / (nk_ok[:, None, None] + 2.0 * a_pen))
+                M5 = wr_ok.T @ XP  # (m_upd, 5): sum w*[x,y,x^2,xy,y^2]
+                mux = M5[:, 0] / nk_ok
+                muy = M5[:, 1] / nk_ok
+                Exx = M5[:, 2] / nk_ok
+                Exy = M5[:, 3] / nk_ok
+                Eyy = M5[:, 4] / nk_ok
+                S11_raw = Exx - mux * mux
+                S12_raw = Exy - mux * muy
+                S22_raw = Eyy - muy * muy
+                denom_pen = nk_ok + 2.0 * a_pen
+                S11 = (nk_ok * S11_raw + 2.0 * a_pen * Scov[0, 0]) / denom_pen
+                S12 = (nk_ok * S12_raw + 2.0 * a_pen * Scov[0, 1]) / denom_pen
+                S22 = (nk_ok * S22_raw + 2.0 * a_pen * Scov[1, 1]) / denom_pen
                 new_w[upd_idx] = nk_ok / Wtot
-                new_mu[upd_idx] = mu_upd
-                new_cov[upd_idx] = cov_upd
+                new_mu[upd_idx] = np.stack([mux, muy], axis=-1)
+                new_cov[upd_idx, 0, 0] = S11
+                new_cov[upd_idx, 0, 1] = new_cov[upd_idx, 1, 0] = S12
+                new_cov[upd_idx, 1, 1] = S22
             dead_idx = idx_still[~ok]
             if dead_idx.size:
                 ll_trial[dead_idx] = -np.inf
