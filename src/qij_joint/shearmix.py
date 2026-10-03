@@ -50,10 +50,11 @@ instead of (pis, mus, Ss) tuples, since `shearmix_model.feasible`/
 `to_u`/`from_u` all take the single packed layout); the trust-region
 Newton finish (mirrors `gmm._fit`'s section-7 loop exactly -- same
 acceptance rule, same radius update, same convergence/stall tests --
-but forms `H_u` by CENTRAL FINITE DIFFERENCE of the u-gradient
-`jac_u(u).T @ grad(theta(u))`, per the build interface, rather than
-`gmm_param.chain`'s closed-form curvature correction, which this
-module's parametrization does not supply); and the cold search (below),
+and forms `H_u` analytically, `shearmix_model.hessian`'s own Louis's-
+identity Hessian pushed through `shearmix_model.chain`'s closed-form
+curvature correction (that module's own mirror of `gmm_param.chain`);
+the earlier central-finite-difference construction survives as
+`_hess_u_fd`, for the validation check only); and the cold search (below),
 which has no `GMM2D` analogue at all.
 
 THE FAILURE this redesign fixes (measured on a TACC oracle run,
@@ -513,7 +514,9 @@ def _g_u_at(prep, w, pen, Kg, u):
 def _hess_u_fd(prep, w, pen, Kg, u, rel_step=_HESS_REL_STEP):
     """H_u (p,p) = d(jac_u(u).T @ grad(theta(u))) / du, central
     differences, step h_j = rel_step * max(1, |u_j|) (shearmix_model.info's
-    own step rule), symmetrized."""
+    own step rule), symmetrized. SUPERSEDED in the Newton finish by the
+    analytic `_hess_u_analytic` (below); kept only for the validation
+    check against it."""
     p = len(u)
     H = np.empty((p, p))
     for j in range(p):
@@ -526,6 +529,18 @@ def _hess_u_fd(prep, w, pen, Kg, u, rel_step=_HESS_REL_STEP):
         gm = _g_u_at(prep, w, pen, Kg, um)
         H[:, j] = (gp - gm) / (2.0 * h)
     return 0.5 * (H + H.T)
+
+
+def _hess_u_analytic(prep, w, pen, Kg, u, g_theta, theta):
+    """H_u via `shearmix_model.hessian`'s analytic Louis's-identity
+    Hessian, pushed through `shearmix_model.chain` (mirrors
+    `gmm_param.chain`'s own curvature-correction term). Replaces
+    `_hess_u_fd` (~2p gradient evaluations per call) with one `hessian`
+    call. `g_theta`, `theta` are the caller's own (already computed at
+    this `u`), so no redundant `grad`/`from_u` evaluation."""
+    H_theta = sm.hessian(prep, w, Kg, theta, pen)
+    _, H_u = sm.chain(Kg, u, g_theta, H_theta)
+    return H_u
 
 
 def _finish(prep, w, pen, Kg, theta_em, last_step_u, eta):
@@ -554,7 +569,7 @@ def _finish(prep, w, pen, Kg, theta_em, last_step_u, eta):
             g_theta = sm.grad(prep, w, Kg, theta, pen)
             J = sm.jac_u(Kg, u)
             g_u = J.T @ g_theta
-            H_u = _hess_u_fd(prep, w, pen, Kg, u)
+            H_u = _hess_u_analytic(prep, w, pen, Kg, u, g_theta, theta)
             cache['key'] = key
             cache['val'] = dict(theta=theta, ll=ll, g_u=g_u, H_u=H_u)
         return cache['val']

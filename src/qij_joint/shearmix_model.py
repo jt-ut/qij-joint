@@ -45,9 +45,11 @@ confirmed against `gmm.py`'s own code and method_notes.md section 5
 (`ell_p / sum(w)`)", with `ell_p` itself at the Chen-Tan TOTAL
 (unnormalized) scale, `ell_p = ell - a*P`, `a = 1/sum(w)`).
 
-`info` is NOT Louis's identity here: per the build interface, `A` is
-the negative Jacobian of this module's own analytic `grad`, by central
-finite differences (no analytic Hessian is implemented), symmetrized.
+`info` IS Louis's identity here, exactly as GMM2D's own `A` (see
+`hessian`, below): `A = -hessian(...)`. The earlier central-finite-
+difference construction (~60 gradient evaluations per call) survives
+only as `_info_fd`, for the validation check against the analytic
+version.
 
 A note on `score_rows` and the "weighted mean == grad" contract some
 reports else where expect of an M-estimator's per-row score: this
@@ -450,11 +452,224 @@ def score_rows(prep: Prep, w: np.ndarray, Kg: int, theta: np.ndarray, pen: Pen) 
     return psi_raw + extra
 
 
-def info(prep: Prep, w: np.ndarray, Kg: int, theta: np.ndarray, pen: Pen,
-         rel_step: float = 1e-5) -> np.ndarray:
-    """A = -(d grad / d theta), central finite differences of the
-    analytic `grad`, step h_j = rel_step * max(1, |theta_j|),
-    symmetrized."""
+_D = {
+    'S11': np.array([[1.0, 0.0], [0.0, 0.0]]),
+    'S12': np.array([[0.0, 1.0], [1.0, 0.0]]),
+    'S22': np.array([[0.0, 0.0], [0.0, 1.0]]),
+}
+_STYPES = ('S11', 'S12', 'S22')
+
+
+def _penalty_hess(Kg: int, theta: np.ndarray, Scov: np.ndarray, a_pen: float) -> np.ndarray:
+    """H (p,p) = d^2(-a_pen * P(theta)) / d theta^2: block-diagonal
+    across the Kg Gaussian covariance blocks (`gmm._penalty_terms`'s own
+    formula, verbatim), plus the filament's two scalar (s2x, s2p)
+    diagonal entries (the 1-D Chen-Tan analog: `_penalty_grad`'s
+    `Gs2x = 1/s2x - Scov[0,0]/s2x**2`, `g[fs2x] = -a_pen*Gs2x`, so
+    `H[fs2x,fs2x] = -a_pen * dGs2x/ds2x = a_pen*(1/s2x**2 -
+    2*Scov[0,0]/s2x**3)`, same for s2p). Zero elsewhere (pi, mu, fil_m,
+    fil_b0/b1/b2 are untouched by the penalty)."""
+    Kg = int(Kg)
+    p = n_params(Kg)
+    pis_g, pi_f, mus, covs, fil = unpack(Kg, theta)
+    H = np.zeros((p, p))
+    for k in range(Kg):
+        a, b, c = covs[k, 0, 0], covs[k, 0, 1], covs[k, 1, 1]
+        det = a * c - b * b
+        Pk = np.array([[c, -b], [-b, a]]) / det
+        PS = Pk @ Scov
+        s11, s12, s22 = _idx_S(Kg, k)
+        idxs = (s11, s12, s22)
+        for bi, btype in enumerate(_STYPES):
+            Db = _D[btype]
+            PDPb = Pk @ Db @ Pk
+            Mb = -PDPb + PDPb @ Scov @ Pk + Pk @ Scov @ PDPb
+            for ai, atype in enumerate(_STYPES):
+                if atype == 'S11':
+                    val = Mb[0, 0]
+                elif atype == 'S22':
+                    val = Mb[1, 1]
+                else:
+                    val = Mb[0, 1] + Mb[1, 0]
+                H[idxs[ai], idxs[bi]] = -a_pen * val
+    m, s2x, b0, b1, b2, s2p = fil
+    fm, fs2x, fb0, fb1, fb2, fs2p = _idx_fil(Kg)
+    H[fs2x, fs2x] = a_pen * (1.0 / (s2x * s2x) - 2.0 * Scov[0, 0] / (s2x ** 3))
+    H[fs2p, fs2p] = a_pen * (1.0 / (s2p * s2p) - 2.0 * Scov[1, 1] / (s2p ** 3))
+    return H
+
+
+def hessian(prep: Prep, w: np.ndarray, Kg: int, theta: np.ndarray, pen: Pen) -> np.ndarray:
+    """H_theta = d^2 ell_p/d theta^2 (the Hessian ITSELF, not the
+    information -- `info` below returns `-hessian(...)`), by Louis's
+    (1982) identity exactly as `gmm._score_info`/`_score_info_penalized`
+    build GMM2D's own `A` (spec/method_notes.md section 5), reindexed
+    for `Kg` explicit Gaussian weights with `pi_f` implied -- the
+    filament plays the role of GMM2D's own reference component (index
+    `Kg` here, `K-1` there) -- plus the filament's own closed-form
+    complete-data second derivatives: `f_fil`'s complete-data log-
+    density `-log(2pi) - 0.5*log(s2x) - 0.5*log(s2p) - 0.5*ex**2/s2x -
+    0.5*ey**2/s2p` (`ex = x - m`, `ey = y - h(x)`, `h` LINEAR in
+    `b = (b0, b1, b2)`) is a sum of two independent univariate Gaussian
+    log-densities, one in `(m, s2x)`, one in `(b, s2p)`, with no cross
+    terms between the two -- so its second derivatives are closed form,
+    the same way GMM2D's own Gaussian blocks are. Vectorised over rows
+    throughout (one (N,Kg+5) or (N,Kg+6) matmul per component, mirroring
+    `gmm._score_info`'s own `Fk`/`block` construction); no per-row
+    Python loop. Raises np.linalg.LinAlgError if any Sigma_k is not PD
+    (via `e_step`/`unpack`'s own feasibility, same as `grad`)."""
+    Kg = int(Kg)
+    X, Bx = prep.X, prep.Bx
+    N = X.shape[0]
+    W, a_pen, Scov = pen
+    p = n_params(Kg)
+
+    R, _ = e_step(prep, Kg, theta)
+    pis_g, pi_f, mus, covs, fil = unpack(Kg, theta)
+
+    term1 = np.zeros((p, p))
+    term2 = np.zeros((p, p))
+    n_k_arr = np.empty(Kg + 1)
+
+    # ---- Gaussian components: mirrors gmm._score_info's own loop,
+    # reindexed (pi-block has Kg stored entries, no "last stored
+    # component" special case -- that role belongs to the filament,
+    # handled separately below). ----
+    for k in range(Kg):
+        a, b, c = covs[k, 0, 0], covs[k, 0, 1], covs[k, 1, 1]
+        det = a * c - b * b
+        Pk = np.array([[c, -b], [-b, a]]) / det
+        res = X - mus[k]
+        u = res @ Pk
+
+        wr_k = w * R[:, k]
+        nk = wr_k.sum()
+        n_k_arr[k] = nk
+
+        G00 = 0.5 * (u[:, 0] ** 2 - Pk[0, 0])
+        G11 = 0.5 * (u[:, 1] ** 2 - Pk[1, 1])
+        G01 = 0.5 * (u[:, 0] * u[:, 1] - Pk[0, 1])
+
+        if nk > 0.0:
+            rbar = (wr_k @ res) / nk
+            R2 = (res * wr_k[:, None]).T @ res / nk
+        else:
+            rbar = np.zeros(2)
+            R2 = np.zeros((2, 2))
+
+        pdpk = {st: Pk @ _D[st] @ Pk for st in _STYPES}
+        wbar = {st: rbar @ pdpk[st] for st in _STYPES}
+        Z = {st: pdpk[st] @ R2 @ Pk for st in _STYPES}
+
+        five_bar = np.empty((5, 5))
+        five_bar[0, 0], five_bar[0, 1] = Pk[0, 0], Pk[0, 1]
+        five_bar[1, 0], five_bar[1, 1] = Pk[0, 1], Pk[1, 1]
+        for bi, btype in enumerate(_STYPES):
+            col = 2 + bi
+            wb = wbar[btype]
+            five_bar[0, col] = wb[0]
+            five_bar[col, 0] = wb[0]
+            five_bar[1, col] = wb[1]
+            five_bar[col, 1] = wb[1]
+        for ai, atype in enumerate(_STYPES):
+            for bi, btype in enumerate(_STYPES):
+                Zb = Z[btype]
+                PDPb = pdpk[btype]
+                if atype == 'S11':
+                    val = Zb[0, 0] - 0.5 * PDPb[0, 0]
+                elif atype == 'S22':
+                    val = Zb[1, 1] - 0.5 * PDPb[1, 1]
+                else:
+                    val = Zb[0, 1] + Zb[1, 0] - PDPb[0, 1]
+                five_bar[2 + ai, 2 + bi] = val
+
+        mx, my = _idx_mu(Kg, k)
+        s11, s12, s22 = _idx_S(Kg, k)
+        bidx = [mx, my, s11, s12, s22]
+        term1[np.ix_(bidx, bidx)] += nk * five_bar
+
+        Fk = np.empty((N, Kg + 5))
+        Fk[:, :Kg] = 0.0
+        Fk[:, k] = 1.0 / pis_g[k]
+        Fk[:, Kg + 0] = u[:, 0]
+        Fk[:, Kg + 1] = u[:, 1]
+        Fk[:, Kg + 2] = G00
+        Fk[:, Kg + 3] = 2.0 * G01
+        Fk[:, Kg + 4] = G11
+        block = (Fk * wr_k[:, None]).T @ Fk
+        idx_full = list(range(Kg)) + bidx
+        term2[np.ix_(idx_full, idx_full)] += block
+
+    # ---- Filament component (the pi-block reference category): closed-
+    # form complete-data second derivatives, (m, s2x) and (b, s2p)
+    # blocks independent (module docstring). ----
+    m, s2x, b0, b1, b2, s2p = fil
+    fm, fs2x, fb0, fb1, fb2, fs2p = _idx_fil(Kg)
+    rf = R[:, Kg]
+    wrf = w * rf
+    nf = wrf.sum()
+    n_k_arr[Kg] = nf
+
+    ex = X[:, 0] - m
+    hx = Bx @ np.array([b0, b1, b2])
+    ey = X[:, 1] - hx
+
+    sum_wex = wrf @ ex
+    sum_wex2 = wrf @ (ex * ex)
+    sum_wey2 = wrf @ (ey * ey)
+    BtWB = Bx.T @ (wrf[:, None] * Bx)
+    sum_wey_Bx = Bx.T @ (wrf * ey)
+
+    fil_idx = [fm, fs2x, fb0, fb1, fb2, fs2p]
+    T1f = np.zeros((6, 6))
+    T1f[0, 0] = nf / s2x
+    T1f[0, 1] = T1f[1, 0] = sum_wex / (s2x * s2x)
+    T1f[1, 1] = -0.5 * nf / (s2x * s2x) + sum_wex2 / (s2x ** 3)
+    T1f[2:5, 2:5] = BtWB / s2p
+    T1f[2:5, 5] = sum_wey_Bx / (s2p * s2p)
+    T1f[5, 2:5] = sum_wey_Bx / (s2p * s2p)
+    T1f[5, 5] = -0.5 * nf / (s2p * s2p) + sum_wey2 / (s2p ** 3)
+    term1[np.ix_(fil_idx, fil_idx)] += T1f
+
+    Ffil = np.empty((N, Kg + 6))
+    Ffil[:, :Kg] = -1.0 / pi_f
+    Ffil[:, Kg + 0] = ex / s2x
+    Ffil[:, Kg + 1] = -0.5 / s2x + 0.5 * ex * ex / (s2x * s2x)
+    Ffil[:, Kg + 2] = ey / s2p * Bx[:, 0]
+    Ffil[:, Kg + 3] = ey / s2p * Bx[:, 1]
+    Ffil[:, Kg + 4] = ey / s2p * Bx[:, 2]
+    Ffil[:, Kg + 5] = -0.5 / s2p + 0.5 * ey * ey / (s2p * s2p)
+    block_fil = (Ffil * wrf[:, None]).T @ Ffil
+    idx_full_fil = list(range(Kg)) + fil_idx
+    term2[np.ix_(idx_full_fil, idx_full_fil)] += block_fil
+
+    if Kg > 0:
+        term1[:Kg, :Kg] += np.diag(n_k_arr[:Kg] / pis_g ** 2)
+        term1[:Kg, :Kg] += n_k_arr[Kg] / pi_f ** 2
+
+    psi_raw = _raw_score_rows(prep, Kg, theta, R)
+    term3 = (w[:, None] * psi_raw).T @ psi_raw
+
+    A_raw = (term1 - term2 + term3) / W
+    H_raw = -A_raw
+    H_pen = _penalty_hess(Kg, theta, Scov, a_pen)
+    return H_raw + H_pen / W
+
+
+def info(prep: Prep, w: np.ndarray, Kg: int, theta: np.ndarray, pen: Pen) -> np.ndarray:
+    """A = -hessian(...), the analytic observed information via Louis's
+    identity (module docstring, `hessian`). Replaces the old central-
+    finite-difference construction (kept below as `_info_fd`, for the
+    validation check only)."""
+    return -hessian(prep, w, int(Kg), theta, pen)
+
+
+def _info_fd(prep: Prep, w: np.ndarray, Kg: int, theta: np.ndarray, pen: Pen,
+             rel_step: float = 1e-5) -> np.ndarray:
+    """The ORIGINAL `info`: A = -(d grad / d theta), central finite
+    differences of the analytic `grad`, step h_j = rel_step * max(1,
+    |theta_j|), symmetrized. Kept for the `hessian` validation check
+    only -- no longer used by `ShearMix2D`."""
     Kg = int(Kg)
     theta = np.asarray(theta, dtype=float)
     p = n_params(Kg)
@@ -582,6 +797,74 @@ def jac_u(Kg: int, u: np.ndarray) -> np.ndarray:
     J[fb2, fb2] = 1.0
     J[fs2p, fs2p] = np.exp(u[fs2p])
     return J
+
+
+def chain(Kg: int, u: np.ndarray, g_theta: np.ndarray, H_theta: np.ndarray):
+    """(g_u, H_u): this module's own mirror of `gmm_param.chain` (that
+    module's docstring for the derivation) -- g_u = J^T g_theta;
+    H_u = J^T H_theta J + sum_i g_theta[i] * d^2 theta_i/du du^T, the
+    map's own curvature, closed form and block-local (zero wherever
+    `to_u`/`from_u` is affine: means, fil_m, fil_b0/b1/b2).
+
+    Weight block (`Kg` stored softmax logits against the pinned
+    reference `pi_f`): the SAME reduced-softmax map as `gmm_param`'s own
+    weight block with `Kg` playing the role of that module's `K-1`, so
+    the identical correction formula applies verbatim.
+
+    Covariance block, per Gaussian component: identical to
+    `gmm_param.chain`'s own per-component Cholesky correction (the same
+    map, `to_u`/`from_u` here reproducing `gmm_param.to_unconstrained`/
+    `from_unconstrained` exactly for this block).
+
+    Filament block: `fil_s2x`, `fil_s2p` are log maps (theta = exp(u)),
+    so d^2 theta/du^2 = theta itself, giving the one-line diagonal
+    correction `g_theta[idx] * theta[idx]`; `fil_m`, `fil_b0/b1/b2` are
+    identity maps, no correction."""
+    Kg = int(Kg)
+    u = np.asarray(u, dtype=float)
+    g_theta = np.asarray(g_theta, dtype=float)
+    H_theta = np.asarray(H_theta, dtype=float)
+
+    J = jac_u(Kg, u)
+    g_u = J.T @ g_theta
+    H_u = J.T @ H_theta @ J
+
+    if Kg > 0:
+        pi = _weight_pi(Kg, u)
+        gw = g_theta[:Kg]
+        gwpi = gw * pi
+        s = float(np.dot(gw, pi))
+        corr = (np.diag(gwpi) - np.outer(gwpi, pi) - np.outer(pi, gwpi)
+                - np.diag(pi) * s + 2.0 * s * np.outer(pi, pi))
+        H_u[:Kg, :Kg] += corr
+
+    for k in range(Kg):
+        s11, s12, s22 = _idx_S(Kg, k)
+        l11 = np.exp(u[s11])
+        l21 = u[s12]
+        l22 = np.exp(u[s22])
+        S11 = l11 * l11
+        S12 = l11 * l21
+        gS11, gS12, gS22 = g_theta[s11], g_theta[s12], g_theta[s22]
+
+        corr = np.zeros((3, 3))
+        corr[0, 0] += gS11 * 4.0 * S11
+        corr[0, 0] += gS12 * S12
+        corr[0, 1] += gS12 * l11
+        corr[1, 0] += gS12 * l11
+        corr[1, 1] += gS22 * 2.0
+        corr[2, 2] += gS22 * 4.0 * l22 * l22
+
+        idxs = (s11, s12, s22)
+        for ii, ai in enumerate(idxs):
+            for jj, bj in enumerate(idxs):
+                H_u[ai, bj] += corr[ii, jj]
+
+    fm, fs2x, fb0, fb1, fb2, fs2p = _idx_fil(Kg)
+    H_u[fs2x, fs2x] += g_theta[fs2x] * np.exp(u[fs2x])
+    H_u[fs2p, fs2p] += g_theta[fs2p] * np.exp(u[fs2p])
+
+    return g_u, H_u
 
 
 def coordinate_scales(Kg: int, Scov: np.ndarray) -> np.ndarray:
