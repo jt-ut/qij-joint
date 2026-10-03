@@ -1,13 +1,16 @@
 """The four paper draws (pareto, mvt, fp, imf), the MVT VQ transform, the
-`mix11` demo mixture (spec/method_notes.md section 5), and the
-`cloudfil_G_B6_P3_v1` demo (spec/QIJ_mods_waves.md A11); neither demo is
-one of the paper's four.
+`mix11` demo mixture (spec/method_notes.md section 5), the
+`cloudfil_G_B6_P3_v1` demo (spec/QIJ_mods_waves.md A11) and its
+`cloudfil_G_U_P3_v1` sibling (spec/QIJ_shearmix_interface.md section 5,
+one smooth sheared-Gaussian filament in place of the six beads); none of
+these demos is one of the paper's four.
 
-Parametric draws (`pareto`, `mvt`, `mix11`, `cloudfil_G_B6_P3_v1`) sample
-the named law directly. Population draws (`fp`, `imf`) resample with
-replacement from the pool files shipped under `data/`, loaded once per
-process (E5's named exception for constant data read from the package's
-own files) and never re-read per draw.
+Parametric draws (`pareto`, `mvt`, `mix11`, `cloudfil_G_B6_P3_v1`,
+`cloudfil_G_U_P3_v1`) sample the named law directly. Population draws
+(`fp`, `imf`) resample with replacement from the pool files shipped
+under `data/`, loaded once per process (E5's named exception for
+constant data read from the package's own files) and never re-read per
+draw.
 """
 
 import functools
@@ -98,6 +101,55 @@ def cloudfil_G_B6_P3_v1(N: int, seed: int) -> np.ndarray:
             continue
         X[start:start + n_k] = rng.multivariate_normal(pop['means'][k], pop['covs'][k], size=n_k)
         start += n_k
+    return X
+
+
+@functools.lru_cache(maxsize=1)
+def _cloudfil_G_U_P3_v1_pop() -> dict:
+    """The packaged `cloudfil_G_U_P3_v1.npz` (weights (5,): 4 Gaussians
+    then the filament, means (4,2), covs (4,2,2), fil (6,), omega),
+    loaded once per process (E5's named exception for constant data
+    read from the package's own files)."""
+    with np.load(_DATA_DIR / 'cloudfil_G_U_P3_v1.npz', allow_pickle=True) as data:
+        return dict(weights=data['weights'].astype(float),
+                    means=data['means'].astype(float),
+                    covs=data['covs'].astype(float),
+                    fil=data['fil'].astype(float),
+                    omega=float(data['omega']))
+
+
+def cloudfil_G_U_P3_v1(N: int, seed: int) -> np.ndarray:
+    """N draws from the `cloudfil_G_U_P3_v1` mixture
+    (spec/QIJ_shearmix_interface.md section 5): a multinomial component
+    count from the file's weights (the 4 Gaussians then the filament, in
+    file order), then a multivariate normal draw per Gaussian, and for
+    the filament x ~ N(m, s2x), y = h(x) + sqrt(s2p) * eps -- mirroring
+    `cloudfil_G_B6_P3_v1`'s own RNG use exactly (one `default_rng(seed)`,
+    the multinomial drawn first, then one sequential draw per component
+    in file order from that same rng). Returns (N, 2)."""
+    rng = np.random.default_rng(seed)
+    pop = _cloudfil_G_U_P3_v1_pop()
+    weights, means, covs, fil, omega = (pop['weights'], pop['means'], pop['covs'],
+                                         pop['fil'], pop['omega'])
+    Kg = means.shape[0]
+    counts = rng.multinomial(N, weights)
+    X = np.empty((N, 2))
+    start = 0
+    for k in range(Kg):
+        n_k = counts[k]
+        if n_k == 0:
+            continue
+        X[start:start + n_k] = rng.multivariate_normal(means[k], covs[k], size=n_k)
+        start += n_k
+    n_f = counts[Kg]
+    if n_f > 0:
+        m, s2x, b0, b1, b2, s2p = fil
+        x = rng.normal(m, np.sqrt(s2x), size=n_f)
+        hx = b0 + b1 * np.sin(omega * x) + b2 * np.cos(omega * x)
+        y = hx + rng.normal(0.0, np.sqrt(s2p), size=n_f)
+        X[start:start + n_f, 0] = x
+        X[start:start + n_f, 1] = y
+        start += n_f
     return X
 
 

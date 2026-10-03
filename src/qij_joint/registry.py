@@ -2,12 +2,14 @@
 
 `Case` bundles what a draw needs: the data-generating function, a
 factory for a fresh estimator instance, and the VQ transform (if any)
-QIJ should quantize in. Nine cases: the paper's six, matching
+QIJ should quantize in. Eleven cases: the paper's six, matching
 `datasets.py`'s four draws -- pareto (shape, tail), mvt (nu, tail), fp
-(all), imf (all, Chabrier) -- plus three demo mixtures: mix11 (all,
-`GMM2D`, spec/method_notes.md section 5) and cloudfil's two subject
-cores, p2 (`P2Mixture`) and p1 (`P1Mixture`) (spec/QIJ_mods_waves.md
-A11).
+(all), imf (all, Chabrier) -- plus five demo mixtures: mix11 (all,
+`GMM2D`, spec/method_notes.md section 5), cloudfil's two subject cores,
+p2 (`P2Mixture`) and p1 (`P1Mixture`) (spec/QIJ_mods_waves.md A11), and
+cloudfil_u's two subject cores -- the same demo rebuilt on a single
+well-specified sheared-Gaussian filament -- p2 (`P2ShearMixture`) and p1
+(`P1ShearMixture`) (spec/QIJ_shearmix_interface.md section 5).
 """
 
 import json
@@ -16,7 +18,7 @@ from typing import Callable, NamedTuple, Optional
 
 import numpy as np
 
-from . import cloudfil, datasets, estimators, gmm
+from . import cloudfil, cloudfil_u, datasets, estimators, gmm
 
 _TRUTH_DIR = pathlib.Path(__file__).parent / 'data' / 'truth'
 
@@ -51,6 +53,10 @@ _CASES = {
                               lambda: cloudfil.P2Mixture(), None),
     ('cloudfil', 'p1'): Case('cloudfil', 'p1', datasets.cloudfil_G_B6_P3_v1,
                               lambda: cloudfil.P1Mixture(), None),
+    ('cloudfil_u', 'p2'): Case('cloudfil_u', 'p2', datasets.cloudfil_G_U_P3_v1,
+                                lambda: cloudfil_u.P2ShearMixture(), None),
+    ('cloudfil_u', 'p1'): Case('cloudfil_u', 'p1', datasets.cloudfil_G_U_P3_v1,
+                               lambda: cloudfil_u.P1ShearMixture(), None),
 }
 
 
