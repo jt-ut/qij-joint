@@ -311,10 +311,12 @@ def _qij_splits(res) -> pd.DataFrame:
     S = res.joint_split_parent.shape[0]
     data = {'id': np.arange(S), 'parent': res.joint_split_parent,
             'child_a': res.joint_split_child_a, 'child_b': res.joint_split_child_b,
-            'round': res.joint_split_round}
+            'round': res.joint_split_round, 'n_parent': res.joint_split_n_parent}
     for j, o in enumerate(res.outputs):
         data[f'G_{o}'] = res.joint_split_G[:, j]
         data[f'D_{o}'] = res.joint_split_D[:, j]
+        data[f'W_parent_{o}'] = res.joint_split_W_parent[:, j]
+        data[f'floor_{o}'] = res.joint_split_floor[:, j]
     return pd.DataFrame(data)
 
 

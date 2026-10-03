@@ -198,6 +198,9 @@ class QIJResult:
     joint_split_G: np.ndarray             # (S,q) the split's predicted gain (spec 3, 4.3)
     joint_split_D: np.ndarray             # (S,q) the split's realized gain (spec 3, 4.3)
     joint_split_round: np.ndarray         # (S,) int, the round the split was made in
+    joint_split_W_parent: np.ndarray      # (S,q) the parent's W at its split (diagnostic)
+    joint_split_n_parent: np.ndarray      # (S,) int, the parent's point count
+    joint_split_floor: np.ndarray         # (S,q) the split's noise floor n_Delta + b_Delta (diagnostic)
     joint_round_kappa: np.ndarray         # (R,q) kappa after each round (spec 4.4)
     joint_round_se_kappa: np.ndarray      # (R,q) se(kappa) after each round
     joint_round_V_win: np.ndarray         # (R,q) V_win_hat after each round

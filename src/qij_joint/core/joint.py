@@ -166,6 +166,9 @@ class JointResult:
     split_G: np.ndarray
     split_D: np.ndarray
     split_round: np.ndarray
+    split_W_parent: np.ndarray   # (S,q) the parent's W at the moment of its split (diagnostic)
+    split_n_parent: np.ndarray   # (S,) the parent's point count
+    split_floor: np.ndarray      # (S,q) the split's noise floor n_Delta + b_Delta (diagnostic)
     round_kappa: np.ndarray
     round_se_kappa: np.ndarray
     round_V_win: np.ndarray
@@ -301,6 +304,8 @@ def _failed_result(N: int, q: int, z: float, n_min: int, L_max: int,
         split_parent=np.zeros(0, dtype=int), split_child_a=np.zeros(0, dtype=int),
         split_child_b=np.zeros(0, dtype=int), split_G=np.zeros((0, q)),
         split_D=np.zeros((0, q)), split_round=np.zeros(0, dtype=int),
+        split_W_parent=np.zeros((0, q)), split_n_parent=np.zeros(0, dtype=int),
+        split_floor=np.zeros((0, q)),
         round_kappa=np.zeros((0, q)), round_se_kappa=np.zeros((0, q)),
         round_V_win=np.zeros((0, q)), round_margin=np.zeros((0, q)),
         round_n_splits=np.zeros(0, dtype=int),
@@ -396,6 +401,9 @@ def run_joint(
     split_child_a: list = []
     split_child_b: list = []
     split_round: list = []
+    split_W_parent: list = []
+    split_n_parent: list = []
+    split_floor: list = []
     round_kappa: list = []
     round_se_kappa: list = []
     round_V_win: list = []
@@ -507,7 +515,7 @@ def run_joint(
             survivors.append((k, float(expected_gain[c_star]), dict(
                 idx_small=idx_small, idx_large=idx_large, n_small=n_small, n_large=n_large,
                 p_small=p_small, p_large=p_large, t_small=t_small, t_large=t_large,
-                U_small_pred=U_small_pred, U_large_pred=U_large_pred, G_l=G_l,
+                U_small_pred=U_small_pred, U_large_pred=U_large_pred, G_l=G_l, floor=floor,
             )))
 
         if not survivors:
@@ -585,6 +593,11 @@ def run_joint(
             split_child_a.append(next_id)
             split_child_b.append(next_id + 1)
             split_round.append(round_idx)
+            # diagnostic only: the parent's W in the vector state at this moment, the
+            # same formula as W_all (before the children's update; nothing reads it)
+            split_W_parent.append((leaf['n'] / N) * leaf['var_hat'] / N)
+            split_n_parent.append(int(leaf['n']))
+            split_floor.append(info['floor'])
 
             m_pre_small = info['U_small_pred']
             m_pre_large = info['U_large_pred']
@@ -655,6 +668,9 @@ def run_joint(
         split_G=np.array(split_G) if split_G else np.zeros((0, q)),
         split_D=np.array(split_D) if split_D else np.zeros((0, q)),
         split_round=np.array(split_round, dtype=int),
+        split_W_parent=np.array(split_W_parent) if split_W_parent else np.zeros((0, q)),
+        split_n_parent=np.array(split_n_parent, dtype=int),
+        split_floor=np.array(split_floor) if split_floor else np.zeros((0, q)),
         round_kappa=np.array(round_kappa) if round_kappa else np.zeros((0, q)),
         round_se_kappa=np.array(round_se_kappa) if round_se_kappa else np.zeros((0, q)),
         round_V_win=np.array(round_V_win) if round_V_win else np.zeros((0, q)),
