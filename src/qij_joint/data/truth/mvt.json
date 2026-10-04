@@ -8,5 +8,10 @@
     "outputs": ["P_tail"],
     "values": [0.01],
     "source": "specified by the data-generating process"
+  },
+  "all": {
+    "outputs": ["nu", "P_tail"],
+    "values": [5.0, 0.01],
+    "source": "specified by the data-generating process"
   }
 }

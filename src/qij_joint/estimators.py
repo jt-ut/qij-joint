@@ -1,4 +1,5 @@
-"""The paper's estimators: pareto shape/tail, mvt nu/tail, fp, Chabrier.
+"""The paper's estimators: pareto shape/tail/all, mvt nu/tail/all, fp,
+Chabrier.
 
 Every estimator is a callable `T(X, w) -> ndarray(q)` carrying `name`,
 `outputs`, `eta`, and an analytic `T.influence(X, w) -> ndarray(N, q)`.
@@ -17,9 +18,13 @@ and returns bit-identical results.
 Closed forms (`pareto_shape`, `pareto_tail`, `mvt_tail`) are exact
 algebraic evaluations, so `eta` is machine precision. `mvt_nu` is a
 solved scalar and `fp` a vector closed form; each declares the
-precision of its own solve. `Chabrier` is a lognormal-below/power-law-
-above fit, C0-joined at a fixed break mass, by a bounded trust-constr
-search supplied its own exact gradient and Hessian.
+precision of its own solve. `pareto_all` and `mvt_all` are each the
+joint (q=2) version of their two separate estimators -- one pass over
+a shared `prepare`, never a call to the separate estimators -- so a
+caller wanting both outputs pays for one evaluation, not two.
+`Chabrier` is a lognormal-below/power-law-above fit, C0-joined at a
+fixed break mass, by a bounded trust-constr search supplied its own
+exact gradient and Hessian.
 """
 
 from math import exp, log, pi, sqrt
@@ -134,6 +139,49 @@ pareto_tail.prepare = _pareto_tail_prepare
 pareto_tail.influence = _pareto_tail_influence
 
 
+def _pareto_all_prepare(X: np.ndarray) -> dict:
+    x = np.asarray(X, dtype=float).reshape(-1)
+    return dict(log_ratio=np.log(x / PARETO_X_MIN),
+                indicator=(x > PARETO_TAIL_C).astype(float))
+
+
+@estimator(outputs=('alpha', 'P_tail'), eta=EPS, name='all')
+def pareto_all(X: np.ndarray, w: np.ndarray, prep: dict = None) -> np.ndarray:
+    """alpha and P_tail from one pass over X: shares `log_ratio` and
+    `indicator` (the two separate estimators' own preps) rather than
+    calling `pareto_shape`/`pareto_tail`, which would recompute both."""
+    try:
+        prep = prep if prep is not None else _pareto_all_prepare(X)
+        log_ratio, indicator = prep['log_ratio'], prep['indicator']
+        W = w.sum()
+        alpha = float(W / np.dot(w, log_ratio))
+        theta_tail = float(np.dot(w, indicator) / W)
+        if not np.isfinite(alpha) or not np.isfinite(theta_tail):
+            return np.full(2, np.nan)
+        return np.array([alpha, theta_tail])
+    except Exception:
+        return np.full(2, np.nan)
+
+
+def _pareto_all_influence(X: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Column 0: the Hill influence (`_pareto_shape_influence`'s own
+    psi/A); column 1: indicator - theta_tail (`_pareto_tail_influence`'s
+    own psi). Both from the one evaluation of `pareto_all` above."""
+    theta = pareto_all(X, w)
+    if not np.all(np.isfinite(theta)):
+        return np.full((len(X), 2), np.nan)
+    alpha, theta_tail = theta
+    x = np.asarray(X, dtype=float).reshape(-1)
+    psi_alpha = 1.0 / alpha - np.log(x / PARETO_X_MIN)
+    IF_alpha = psi_alpha * alpha ** 2
+    IF_tail = (x > PARETO_TAIL_C).astype(float) - theta_tail
+    return np.column_stack([IF_alpha, IF_tail])
+
+
+pareto_all.prepare = _pareto_all_prepare
+pareto_all.influence = _pareto_all_influence
+
+
 # ======================================================================
 # MVT nu (solved scalar) and MVT tail probability
 # ======================================================================
@@ -167,46 +215,53 @@ def _mvt_nu_prepare(X: np.ndarray) -> dict:
     return dict(r_sq=np.sum(np.asarray(X, dtype=float) ** 2, axis=1))
 
 
-@estimator(outputs=('nu',), eta=1e-12, name='nu')
-def mvt_nu(X: np.ndarray, w: np.ndarray, prep: dict = None) -> np.ndarray:
-    """Root-find of the weighted profile score in log(nu).
-
-    Brackets [_MVT_NU_LO, _MVT_NU_HI] in log(nu), extending geometrically
-    to [_MVT_NU_MIN, _MVT_NU_MAX] when the nominal bracket contains no
+def _mvt_nu_solve(r_sq: np.ndarray, w: np.ndarray, d: int, eta: float) -> float:
+    """The root-find shared by `mvt_nu` and `mvt_all`: brackets
+    [_MVT_NU_LO, _MVT_NU_HI] in log(nu), extending geometrically to
+    [_MVT_NU_MIN, _MVT_NU_MAX] when the nominal bracket contains no
     root; a one-signed score over the whole admissible range returns the
     matching cap, unless that cap rests on the box (`_at_bound`), in
-    which case the evaluation is a counted failure like any other rather
-    than a silent 1e6.
+    which case this returns NaN like any other failed solve rather than
+    a silent 1e6. Raises whatever `brentq` raises; callers catch it the
+    same way they catch any other failure.
     """
+    def score_log(log_nu):
+        return _mvt_score_weighted(r_sq, float(np.exp(log_nu)), w, d)
+
+    log_lo, log_hi = np.log(_MVT_NU_LO), np.log(_MVT_NU_HI)
+    log_nu_min, log_nu_max = np.log(_MVT_NU_MIN), np.log(_MVT_NU_MAX)
+    log_ext = np.log(_MVT_NU_EXT_FACTOR)
+
+    s_lo, s_hi = score_log(log_lo), score_log(log_hi)
+    while s_lo * s_hi > 0.0 and log_hi < log_nu_max:
+        log_hi = min(log_hi + log_ext, log_nu_max)
+        s_hi = score_log(log_hi)
+    while s_lo * s_hi > 0.0 and log_lo > log_nu_min:
+        log_lo = max(log_lo - log_ext, log_nu_min)
+        s_lo = score_log(log_lo)
+
+    if s_lo * s_hi > 0.0:
+        log_nu_hat = log_nu_max if s_hi < 0.0 else log_nu_min
+    else:
+        log_nu_hat = optimize.brentq(score_log, log_lo, log_hi, xtol=eta)
+    nu_hat = float(np.exp(log_nu_hat))
+
+    if not np.isfinite(nu_hat):
+        return float('nan')
+    if _at_bound(log_nu_hat, log_nu_min, log_nu_max):
+        return float('nan')
+    return nu_hat
+
+
+@estimator(outputs=('nu',), eta=1e-12, name='nu')
+def mvt_nu(X: np.ndarray, w: np.ndarray, prep: dict = None) -> np.ndarray:
+    """Root-find of the weighted profile score in log(nu); the solve
+    itself is `_mvt_nu_solve`, shared with `mvt_all`."""
     try:
         d = X.shape[1]
         r_sq = prep['r_sq'] if prep is not None else _mvt_nu_prepare(X)['r_sq']
-        eta = mvt_nu.eta
-
-        def score_log(log_nu):
-            return _mvt_score_weighted(r_sq, float(np.exp(log_nu)), w, d)
-
-        log_lo, log_hi = np.log(_MVT_NU_LO), np.log(_MVT_NU_HI)
-        log_nu_min, log_nu_max = np.log(_MVT_NU_MIN), np.log(_MVT_NU_MAX)
-        log_ext = np.log(_MVT_NU_EXT_FACTOR)
-
-        s_lo, s_hi = score_log(log_lo), score_log(log_hi)
-        while s_lo * s_hi > 0.0 and log_hi < log_nu_max:
-            log_hi = min(log_hi + log_ext, log_nu_max)
-            s_hi = score_log(log_hi)
-        while s_lo * s_hi > 0.0 and log_lo > log_nu_min:
-            log_lo = max(log_lo - log_ext, log_nu_min)
-            s_lo = score_log(log_lo)
-
-        if s_lo * s_hi > 0.0:
-            log_nu_hat = log_nu_max if s_hi < 0.0 else log_nu_min
-        else:
-            log_nu_hat = optimize.brentq(score_log, log_lo, log_hi, xtol=eta)
-        nu_hat = float(np.exp(log_nu_hat))
-
+        nu_hat = _mvt_nu_solve(r_sq, w, d, mvt_nu.eta)
         if not np.isfinite(nu_hat):
-            return np.full(1, np.nan)
-        if _at_bound(log_nu_hat, log_nu_min, log_nu_max):
             return np.full(1, np.nan)
         return np.array([nu_hat])
     except Exception:
@@ -263,6 +318,50 @@ def _mvt_tail_influence(X: np.ndarray, w: np.ndarray) -> np.ndarray:
 
 mvt_tail.prepare = _mvt_tail_prepare
 mvt_tail.influence = _mvt_tail_influence
+
+
+def _mvt_all_prepare(X: np.ndarray) -> dict:
+    return dict(r_sq=np.sum(np.asarray(X, dtype=float) ** 2, axis=1))
+
+
+@estimator(outputs=('nu', 'P_tail'), eta=1e-12, name='all')
+def mvt_all(X: np.ndarray, w: np.ndarray, prep: dict = None) -> np.ndarray:
+    """nu (`_mvt_nu_solve`, shared with `mvt_nu`) and P_tail (the
+    indicator mean on the same r = sqrt(r_sq)) from one pass. A failed
+    nu solve fails the whole vector (the module's own convention),
+    never a partial nu=NaN, P_tail=valid result.
+    """
+    try:
+        d = X.shape[1]
+        r_sq = prep['r_sq'] if prep is not None else _mvt_all_prepare(X)['r_sq']
+        nu_hat = _mvt_nu_solve(r_sq, w, d, mvt_all.eta)
+        if not np.isfinite(nu_hat):
+            return np.full(2, np.nan)
+        r = np.sqrt(r_sq)
+        theta_tail = float(np.dot(w, (r > MVT_TAIL_C).astype(float)) / w.sum())
+        return np.array([nu_hat, theta_tail])
+    except Exception:
+        return np.full(2, np.nan)
+
+
+def _mvt_all_influence(X: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Column 0: nu's own influence (`_mvt_nu_influence`); column 1:
+    the tail indicator's own influence (`_mvt_tail_influence`). A
+    failed nu solve fails the whole row, matching `mvt_all`'s own
+    failure convention.
+    """
+    theta = mvt_all(X, w)
+    if not np.all(np.isfinite(theta)):
+        return np.full((len(X), 2), np.nan)
+    IF_nu = _mvt_nu_influence(X, w)
+    IF_tail = _mvt_tail_influence(X, w)
+    if not np.all(np.isfinite(IF_nu)) or not np.all(np.isfinite(IF_tail)):
+        return np.full((len(X), 2), np.nan)
+    return np.column_stack([IF_nu[:, 0], IF_tail[:, 0]])
+
+
+mvt_all.prepare = _mvt_all_prepare
+mvt_all.influence = _mvt_all_influence
 
 
 # ======================================================================
