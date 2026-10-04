@@ -55,6 +55,7 @@ class SurveyRows:
     step_ratio: np.ndarray    # (5, q) A9 item 4
     quantized_start: str
     eta_rows: Optional[float] = None  # polish tolerance of every evaluation on `rows`; None = T's own
+    psi_bar: Optional[np.ndarray] = None  # (q,) the mass-weighted centring vector `I_proto` was centred by
 
 
 def cost_rule_M(N: int, q: int, eps: float) -> int:
@@ -428,6 +429,13 @@ def prototype_influences(
     mass = np.sum(np.where(finite, p[:, None], 0.0), axis=0)
     psi_bar = np.sum(np.where(finite, p[:, None] * I_proto, 0.0), axis=0) / mass
     I_proto -= psi_bar[None, :]
+    # Stored for the pilot-feedback refiner only (M3,
+    # spec/QIJ_pilot_feedback_interface.md section 2/4): the centring
+    # vector `I_proto` was just centred by, so a later partial re-survey
+    # can un-centre the prototypes it keeps before re-centring the whole
+    # (raw) array with the new masses. Pure bookkeeping -- no arithmetic
+    # above changes and nothing else reads this field.
+    sv.psi_bar = psi_bar.copy()
     return theta_Q, I_proto, busy_delta, sv
 
 

@@ -1023,6 +1023,260 @@ def fit_influence_model(
     return model, model_busy
 
 
+def refit_frozen(
+    model: InfluenceModel, Z: np.ndarray, xvq_new, I_proto_new: np.ndarray,
+    theta_Q_new: np.ndarray, eta: float,
+) -> InfluenceModel:
+    """
+    The same `InfluenceModel` re-solved on `xvq_new`'s prototypes with
+    FROZEN hyperparameters (spec/QIJ_pilot_feedback_interface.md
+    section 3): `gptrend`, `gpwidth`, `fit_weights`, `whitening`,
+    `width` (global) or `c` (local), `lam`, `s2`, `jitter`,
+    `constant_path` and `const_value` are carried over from `model`
+    UNCHANGED -- no width/c grid or bounded refinement
+    (`_width_grid_candidate`/`outer_obj`), no lam profiling
+    (`_lambda_floor`/`minimize_scalar`), and no jitter escalation
+    (`_cholesky_with_jitter`/`_eig_jitter`): the frozen `jitter[c]` is
+    added to A_c (or to the shared eigenvalues, under `fit_weights=
+    'mass'`) exactly as the chosen candidate's own escalated value was
+    at the original fit, without re-checking that it still suffices
+    for the new design.
+
+    Rebuilt per non-constant coordinate c, on c's own finite design in
+    the NEW `I_proto_new` (the same failed-evaluation-is-a-missing-
+    response rule as `fit_influence_model`, re-applied to the new
+    design -- `constant_path` itself is NOT re-derived, so a coordinate
+    constant at the original fit stays on the constant path here even
+    if its new column would no longer qualify, and vice versa): `m`
+    (the small-design basis fallback can cross the `m_full + 1`
+    threshold as M_c changes), `centers` (c's own whitened finite
+    prototype positions), `h_design` (that design's own CONN-spacing
+    slice, under `gpwidth='local'`), the mean basis `Hb`, the kernel
+    `K_c` at the FROZEN width/c, its (rescaled, under `fit_weights=
+    'mass'`) shared eigendecomposition `k_eigval`/`k_eigvec`/`hb_eig`,
+    `alpha`/`beta`/`g_chol`, and `mass_dhalf`. `h` and `bmu` are
+    rebuilt once for every live prototype/point of `xvq_new`
+    regardless of coordinate (`h` is the all-NaN array under
+    `gpwidth='global'`, exactly as `fit_influence_model` builds it).
+    `offset`/`median_sigma`/`p95_sigma` are recomputed over `Z`
+    exactly as `fit_influence_model`'s own closing block does, from
+    the rebuilt `psi0`/`uncertainty`; for a constant-path coordinate
+    they are left at `model`'s own frozen values (copied, not shared,
+    so this call never mutates `model`), since `fit_influence_model`
+    itself never revisits them past the constant-path branch of its
+    `groups` loop.
+
+    `theta_Q_new` and `eta` are accepted for signature symmetry with
+    `fit_influence_model`/`resurvey` but are UNUSED here: both are read
+    by `fit_influence_model` only inside the declared-noise floor
+    (`_lambda_floor`'s `n_c2`) and the constant-path spread test, and
+    both `lam` and `constant_path` are frozen, so neither quantity is
+    recomputed from them. `I_proto_new` is read at the model's own
+    (measured) width -- q columns, one per coordinate `model` was
+    fitted on.
+
+    This function does not batch coordinates sharing an identical new
+    finite design into one shared `eigh` the way `fit_influence_model`
+    does for its grid search: each non-constant coordinate's kernel and
+    eigendecomposition is formed independently (still mathematically
+    the group computation `fit_influence_model` would do, just not
+    reused across coordinates), since there is no search left to
+    amortize across a group. Cost: one `cdist` + one `eigh` + one
+    Cholesky pair per non-constant coordinate, O(M_new^3) each,
+    independent of N except for the two posterior passes over `Z`
+    (`offset`/`median_sigma`/`p95_sigma`).
+    """
+    I_proto_new = np.asarray(I_proto_new, dtype=float)
+    M_new, q = I_proto_new.shape
+    raw_centers = np.asarray(xvq_new.centers, dtype=float)
+    d_z = raw_centers.shape[1]
+
+    gptrend = model.gptrend
+    gpwidth = model.gpwidth
+    fit_weights = model.fit_weights
+    mean, transform = model.whitening
+    centers_full = (raw_centers - mean) @ transform.T
+
+    if gpwidth == 'local':
+        D_proto_full = cdist(centers_full, centers_full)
+        h_full = _conn_spacing(xvq_new.conn, D_proto_full)
+        bmu_full = np.asarray(xvq_new.bmu, dtype=np.intp).copy()
+    else:
+        h_full = np.full(M_new, np.nan, dtype=float)
+        bmu_full = None
+
+    p = np.asarray(xvq_new.p, dtype=float)
+    finite = np.isfinite(I_proto_new)  # (M_new, q)
+
+    # Frozen, read-only hyperparameters: carried over by reference
+    # (never index-assigned below), so sharing them with `model` is
+    # safe even across many `refit_frozen` passes.
+    constant_path = model.constant_path
+    width = model.width
+    c_arr = model.c
+    lam = model.lam
+    lam_floor = model.lam_floor
+    s2_arr = model.s2
+    jitter = model.jitter
+    at_bound = model.at_bound
+    n_width_evals = model.n_width_evals
+    ml_wall_time = model.ml_wall_time
+    const_value = model.const_value
+    # Mutated below (non-constant coordinates), so copied to keep
+    # `model` itself untouched.
+    offset = model.offset.copy()
+
+    m_full = (d_z + 1) if gptrend == 'affine' else (1 + d_z + d_z * (d_z + 1) // 2)
+
+    centers: List[np.ndarray] = [np.empty((0, d_z), dtype=float)] * q
+    h_design: List[Optional[np.ndarray]] = [None] * q
+    alpha: List[np.ndarray] = [np.empty(0, dtype=float)] * q
+    beta: List[np.ndarray] = [np.empty(0, dtype=float)] * q
+    m_arr = np.zeros(q, dtype=int)
+    g_chol: List[Optional[tuple]] = [None] * q
+    k_eigval: List[Optional[np.ndarray]] = [None] * q
+    k_eigvec: List[Optional[np.ndarray]] = [None] * q
+    hb_eig: List[Optional[np.ndarray]] = [None] * q
+    mass_dhalf: List[Optional[np.ndarray]] = [None] * q
+
+    for c in range(q):
+        if constant_path[c]:
+            continue
+
+        idx_c = np.where(finite[:, c])[0]
+        M_g = idx_c.size
+        centers_g = centers_full[idx_c]
+        m_g = 1 if M_g <= m_full + 1 else m_full
+        Hb_g = _basis(centers_g, m_g)
+
+        if gpwidth == 'global':
+            ell_c = float(width[c])
+            K_c = _matern32(cdist(centers_g, centers_g), ell_c)
+            h_design_g = None
+        else:
+            h_design_g = h_full[idx_c]
+            c_val = float(c_arr[c])
+            D_full_g = cdist(centers_g, centers_g)
+            if fit_weights == 'none':
+                ell_vec = c_val * h_design_g
+                K_c = _matern32_nonstationary(D_full_g, ell_vec, ell_vec, d_z)
+            else:
+                # The SAME cached pref/rscaled route
+                # `_width_grid_candidate`'s `fit_weights='mass'` branch
+                # uses (method_notes section 3): mathematically equal to
+                # `_matern32_nonstationary(D_full_g, ell_vec, ell_vec,
+                # d_z)` at ell_vec = c_val*h_design_g, but NOT bit for
+                # bit -- the KEY self-check (reproducing the original
+                # model's psi0/sigma to <= 1e-10 relative) needs the
+                # original fit's own rounding here, not just the same
+                # mathematical kernel.
+                h_row = h_design_g.reshape(-1, 1)
+                h_col = h_design_g.reshape(1, -1)
+                H2_g = h_row ** 2 + h_col ** 2
+                pref_g = (2.0 * h_row * h_col / H2_g) ** (d_z / 2.0)
+                rscaled_g = D_full_g * _SQRT2 / np.sqrt(H2_g)
+                s = (_SQRT3 / c_val) * rscaled_g
+                K_c = pref_g * _kappa(s)
+
+        lam_c = float(lam[c])
+        jit_c = float(jitter[c])
+
+        if fit_weights == 'none':
+            psi_c = I_proto_new[idx_c, c]
+            A = K_c + (lam_c + jit_c) * np.eye(M_g)
+            chol = cho_factor(A, lower=True)
+            AinvHb_c = cho_solve(chol, Hb_g)
+            G = Hb_g.T @ AinvHb_c
+            G_chol_c = cho_factor(G, lower=True)
+            Ainv_psi = cho_solve(chol, psi_c)
+            u_vec = Hb_g.T @ Ainv_psi
+            beta_c = cho_solve(G_chol_c, u_vec)
+            alpha_c = Ainv_psi - AinvHb_c @ beta_c
+
+            Lambda_K, V_K = np.linalg.eigh(K_c)
+            Lambda_K = np.maximum(Lambda_K, 0.0)
+            HbV_g = V_K.T @ Hb_g
+            dhalf_g = None
+        else:
+            p_g = p[idx_c]
+            mass_diag_g = _mass_diag(p_g)
+            dhalf_g = mass_diag_g ** -0.5
+            Hb_tilde_g = dhalf_g[:, None] * Hb_g
+            K_tilde_c = dhalf_g[:, None] * K_c * dhalf_g[None, :]
+
+            Lambda_K, V_K = np.linalg.eigh(K_tilde_c)
+            Lambda_K = np.maximum(Lambda_K, 0.0)
+            HbV_g = V_K.T @ Hb_tilde_g
+
+            y_c = dhalf_g * I_proto_new[idx_c, c]
+            w_c = 1.0 / (Lambda_K + lam_c + jit_c)
+            AinvHb_c = V_K @ (w_c[:, None] * HbV_g)
+            G = Hb_tilde_g.T @ AinvHb_c
+            G_chol_c = cho_factor(G, lower=True)
+            Ainv_y = V_K @ (w_c * (V_K.T @ y_c))
+            u_vec = Hb_tilde_g.T @ Ainv_y
+            beta_c = cho_solve(G_chol_c, u_vec)
+            alpha_tilde_c = Ainv_y - AinvHb_c @ beta_c
+            alpha_c = dhalf_g * alpha_tilde_c
+
+        centers[c] = centers_g
+        h_design[c] = h_design_g
+        m_arr[c] = m_g
+        alpha[c] = alpha_c
+        beta[c] = beta_c
+        g_chol[c] = G_chol_c
+        k_eigval[c] = Lambda_K
+        k_eigvec[c] = V_K
+        hb_eig[c] = HbV_g
+        mass_dhalf[c] = dhalf_g
+
+    model_new = InfluenceModel(
+        gptrend=gptrend,
+        gpwidth=gpwidth,
+        fit_weights=fit_weights,
+        alpha=alpha,
+        beta=beta,
+        centers=centers,
+        h_design=h_design,
+        whitening=model.whitening,
+        width=width,
+        c=c_arr,
+        h=h_full,
+        bmu=bmu_full,
+        lam=lam,
+        lam_floor=lam_floor,
+        s2=s2_arr,
+        at_bound=at_bound,
+        jitter=jitter,
+        constant_path=constant_path,
+        const_value=const_value,
+        m=m_arr,
+        n_width_evals=n_width_evals,
+        offset=offset,
+        ml_wall_time=ml_wall_time,
+        median_sigma=np.zeros(q, dtype=float),
+        p95_sigma=np.zeros(q, dtype=float),
+        g_chol=g_chol,
+        k_eigval=k_eigval,
+        k_eigvec=k_eigvec,
+        hb_eig=hb_eig,
+        mass_dhalf=mass_dhalf,
+    )
+
+    preds = psi0(model_new, Z)
+    for c in range(q):
+        if not constant_path[c]:
+            model_new.offset[c] = float(preds[:, c].mean())
+
+    sigma_full = uncertainty(model_new, Z)
+    for c in range(q):
+        if not constant_path[c]:
+            model_new.median_sigma[c] = float(np.median(sigma_full[:, c]))
+            model_new.p95_sigma[c] = float(np.percentile(sigma_full[:, c], 95))
+
+    return model_new
+
+
 def _coordinate_groups(model: InfluenceModel) -> List[List[int]]:
     """The non-constant coordinates grouped by shared design, in
     coordinate order: `fit_influence_model` assigns every coordinate in

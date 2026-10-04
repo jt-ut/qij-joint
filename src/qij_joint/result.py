@@ -107,6 +107,19 @@ nothing about. `sigma_status` is `None` under `sigma_points=False`;
 `'eval_failed'` (a NaN/exception among the 2n evaluations) under
 `True`, both failures leaving `sigma_mean`/`sigma_sd`/`sigma_bias`/
 `sigma_k`/`sigma_sign`/`sigma_response` NaN or empty.
+
+`feedback` (spec/QIJ_pilot_feedback_spec.md, QIJ_pilot_feedback_
+interface.md), off by default: after each round of the unified loop,
+when the round's measurements contradict the pilot (`core.feedback.
+round_trigger`), `qij.py`'s own refiner closure refines the offending
+X-VQ cells, re-surveys and re-fits the pilot with frozen
+hyperparameters, and `core.joint.run_joint` replays the state vector
+under it; `passes` records every pass that fired, `n_passes` its
+count, `evals_prototype_refine`/`rows_prototype_refine` the
+evaluations/rows that work spent (excluded from `evals_by_stage['full_
+data']`, included in `['total']`), `M_X_final` the live prototype
+count after every pass (`M_X` itself stays the stage-1 value).
+`feedback=False` leaves every other product bit-identical.
 """
 from __future__ import annotations
 
@@ -243,6 +256,30 @@ class QIJResult:
     sigma_k: np.ndarray             # (2n,) int, the direction index of each evaluation
     sigma_sign: np.ndarray          # (2n,) int, +-1
     sigma_response: np.ndarray      # (2n, q) R^(k+-), raw (spec section 3)
+    feedback: bool                  # spec/QIJ_pilot_feedback_spec.md; off by default -- every
+                                     # product byte-identical when False (interface section 0)
+    n_passes: int                   # number of feedback passes that fired and refined; 0 when
+                                     # feedback=False or none fired
+    evals_prototype_refine: int     # evaluations spent inside feedback passes (`xvq_refine.
+                                     # resurvey`), already EXCLUDED from evals_by_stage['full_
+                                     # data'] (interface section 5's accounting); 0 when
+                                     # feedback=False
+    rows_prototype_refine: int      # rows spent inside feedback passes, same accounting; 0 when
+                                     # feedback=False
+    M_X_final: int                  # the live prototype count after every feedback pass (==
+                                     # M_X when feedback=False or no pass fired); M_X itself
+                                     # stays the stage-1 value throughout
+    passes: list                    # one dict per SUCCESSFUL feedback pass (round, ratio (q,),
+                                     # fired (q,) bool, cells, n_intracell_splits, n_selected,
+                                     # sum_k, skipped, info=dict(n_cells, prototypes_added,
+                                     # n_selected, sum_k, skipped, evals, rows, wall)); empty
+                                     # when feedback=False or none succeeded
+                                     # (spec/QIJ_pilot_feedback_interface.md section 6)
+    fires: list                     # one dict per round whose trigger fired (section 6):
+                                     # round, ratio (q,), fired (q,) bool, n_intracell_splits,
+                                     # n_selected -- includes fires that selected nothing or
+                                     # whose refiner call declined/failed (never in `passes`);
+                                     # empty when feedback=False or no round ever fired
 
     @property
     def variance(self) -> np.ndarray:

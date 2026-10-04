@@ -165,7 +165,11 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     (spec/QIJ_mass_weighted_fit_spec.md) is recorded; `rank_rule` (A20
     amendment, spec/QIJ_mods_waves.md) is always 'measured_error';
     `n_update_scaled_<o>`/`n_update_shifted_<o>`/`n_update_negative_<o>`
-    (A20) are its own per-output products. The unified loop (spec/
+    (A20) are its own per-output products. `feedback`/`n_passes`/
+    `evals_prototype_refine`/`rows_prototype_refine`/`M_X_final`
+    (spec/QIJ_pilot_feedback_spec.md, QIJ_pilot_feedback_interface.md
+    5) are the pilot-feedback pass's own report; `M_X` above stays the
+    stage-1 value regardless. The unified loop (spec/
     QIJ_unified_loop_spec.md) removed `S_pred_<o>`, `joint_a_<o>` (A18's
     separate scale step, folded into the splits' own update), `L0`,
     `n_growth_rounds`, `growth_capped`, `n_check_rounds`,
@@ -206,6 +210,15 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     row['z'] = float(res.z)
     row['n_min'] = int(res.n_min)
     row['L_max'] = int(res.L_max)
+    # The pilot-feedback pass (spec/QIJ_pilot_feedback_spec.md,
+    # QIJ_pilot_feedback_interface.md 5): `M_X` above stays the stage-1
+    # value always; `M_X_final` is the live prototype count after every
+    # pass (== `M_X` under `feedback=False` or when none fired).
+    row['feedback'] = bool(res.feedback)
+    row['n_passes'] = int(res.n_passes)
+    row['evals_prototype_refine'] = int(res.evals_prototype_refine)
+    row['rows_prototype_refine'] = int(res.rows_prototype_refine)
+    row['M_X_final'] = int(res.M_X_final)
     # The sigma-points stage (spec/QIJ_sigma_points_spec.md 3): its own
     # 'sigma' stage entry (outside the loop above, whose own product
     # names -- 'wall_sigma', not 'wall_time_sigma' -- differ from the
@@ -334,6 +347,65 @@ def _qij_rounds(res) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _qij_passes(res) -> pd.DataFrame:
+    """`passes` for `--feedback` draws (spec/QIJ_pilot_feedback_
+    interface.md 5, section 6): one row per SUCCESSFUL feedback pass,
+    `round, ratio_<o>, fired_<o>, n_cells, prototypes_added,
+    n_intracell_splits, n_selected, sum_k, n_skipped, evals, rows, wall`
+    -- `ratio_<o>`/`fired_<o>` the trigger's own per-output report
+    (`core.feedback.round_trigger`, kept at the pass's own width);
+    `n_cells`/`prototypes_added`/`evals`/`rows`/`wall` from the
+    refiner's own `info` (`qij.py`'s `_FeedbackRefiner`);
+    `n_intracell_splits`/`n_selected`/`sum_k` the WHERE rule's own
+    report (section 6 rule 2'/3', `core.joint.run_joint`'s pass record);
+    `n_skipped` = len(skipped) (cells the WHERE rule selected but rule
+    3'/`xvq_refine.refine_cells` could not split). Empty (zero rows,
+    still the right columns) when `res.passes` is empty."""
+    passes = list(res.passes)
+    data = {'round': np.array([int(p['round']) for p in passes], dtype=int)}
+    for j, o in enumerate(res.outputs):
+        data[f'ratio_{o}'] = np.array(
+            [float(np.asarray(p['ratio'])[j]) for p in passes], dtype=float)
+        data[f'fired_{o}'] = np.array(
+            [bool(np.asarray(p['fired'])[j]) for p in passes], dtype=bool)
+    data['n_cells'] = np.array([int(p['info']['n_cells']) for p in passes], dtype=int)
+    data['prototypes_added'] = np.array(
+        [int(p['info']['prototypes_added']) for p in passes], dtype=int)
+    data['n_intracell_splits'] = np.array(
+        [int(p['n_intracell_splits']) for p in passes], dtype=int)
+    data['n_selected'] = np.array([int(p['n_selected']) for p in passes], dtype=int)
+    data['sum_k'] = np.array([int(p['sum_k']) for p in passes], dtype=int)
+    data['n_skipped'] = np.array(
+        [len(p['skipped']) if p['skipped'] is not None else 0 for p in passes], dtype=int)
+    data['evals'] = np.array([int(p['info']['evals']) for p in passes], dtype=int)
+    data['rows'] = np.array([int(p['info']['rows']) for p in passes], dtype=int)
+    data['wall'] = np.array([float(p['info']['wall']) for p in passes], dtype=float)
+    return pd.DataFrame(data)
+
+
+def _qij_fires(res) -> pd.DataFrame:
+    """`fires` for `--feedback` draws (spec/QIJ_pilot_feedback_
+    interface.md section 6): one row per round whose trigger fired --
+    `round, ratio_<o>, fired_<o>, n_intracell_splits, n_selected` --
+    including a fire that selected nothing (`n_selected == 0`) or whose
+    refiner call then declined/failed (so it never made it into
+    `passes`); the WHERE rule's own report at every fire
+    (`core.joint.run_joint`'s `fires` log). Written only when
+    `res.feedback` is True; empty (zero rows, still the right columns)
+    when no round ever fired."""
+    fires = list(res.fires)
+    data = {'round': np.array([int(f['round']) for f in fires], dtype=int)}
+    for j, o in enumerate(res.outputs):
+        data[f'ratio_{o}'] = np.array(
+            [float(np.asarray(f['ratio'])[j]) for f in fires], dtype=float)
+        data[f'fired_{o}'] = np.array(
+            [bool(np.asarray(f['fired'])[j]) for f in fires], dtype=bool)
+    data['n_intracell_splits'] = np.array(
+        [int(f['n_intracell_splits']) for f in fires], dtype=int)
+    data['n_selected'] = np.array([int(f['n_selected']) for f in fires], dtype=int)
+    return pd.DataFrame(data)
+
+
 def _qij_prototypes(res) -> pd.DataFrame:
     """`prototypes` for `--diag-draws`: `j, p, w_<d>, I_<o>, h`
     (method_notes section 3)."""
@@ -367,6 +439,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             sigma_points: bool = False,
             fit_weights: str = 'none',
             z: float = 2.0, n_min: int = 30, L_max: Optional[int] = None,
+            feedback: bool = False,
             tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
@@ -386,8 +459,15 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     by default, runs the optional sigma-points interval stage after
     refinement; when True, every draw also writes the `sigma_points`
     array product. `fit_weights` (spec/QIJ_mass_weighted_fit_spec.md)
-    picks the GP pilot's own kernel-regression noise. A21
-    (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
+    picks the GP pilot's own kernel-regression noise. `feedback`
+    (spec/QIJ_pilot_feedback_spec.md, QIJ_pilot_feedback_interface.md
+    5, section 6), off by default, turns on the pilot-feedback pass;
+    every draw under `feedback=True` also writes the `passes` array
+    product (one row per SUCCESSFUL pass, `_qij_passes`) and the
+    `fires` array product (one row per round whose trigger fired,
+    successful or not, `_qij_fires`), neither gated behind
+    `--diag-draws`.
+    A21 (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
     `refine_schedule`/`check_rule`/`tree_rule` as both parameters and
     products, and the unified loop (spec/QIJ_unified_loop_spec.md) then
     replaced A20/A21's own growth/check second stage entirely: the
@@ -411,7 +491,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   survey=survey, quantized_start=quantized_start,
                   sigma_points=sigma_points,
                   fit_weights=fit_weights,
-                  z=z, n_min=n_min, L_max=L_max).fit(X, T, pool=pool)
+                  z=z, n_min=n_min, L_max=L_max,
+                  feedback=feedback).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res),
@@ -419,6 +500,9 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   'bins': _qij_bins(res)}
         if res.sigma_points:
             arrays['sigma_points'] = _qij_sigma_points(res)
+        if res.feedback:
+            arrays['passes'] = _qij_passes(res)
+            arrays['fires'] = _qij_fires(res)
         if s in diag:
             arrays['points'] = _qij_points(res)
             arrays['prototypes'] = _qij_prototypes(res)

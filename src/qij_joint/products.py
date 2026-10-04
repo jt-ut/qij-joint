@@ -36,7 +36,7 @@ def method_dir(out_dir: str, dataset: str, estimator: str, N: int, method: str,
 # so the study's default run keeps today's folder name.
 QIJ_CANONICAL = dict(survey='moments', quantized_start='full-data', gptrend='quadratic',
                       gpwidth='global', sigma_points=True, M_X=None,
-                      z=2.0, n_min=30, L_max=None)
+                      z=2.0, n_min=30, L_max=None, feedback=False)
 
 
 def _num(x) -> str:
@@ -60,7 +60,10 @@ def dir_tag(method: str, config: dict) -> str:
     != 30, as `_nmin<n>`), `L_max` (named only when given, i.e. not
     None, as `_Lmax<L>`) -- so the study default (z=2, n_min=30,
     L_max=None) keeps the folder name `qij_eps0.01_widthlocal_
-    massfit_nosigma`. A21
+    massfit_nosigma`; then the pilot-feedback pass (spec/QIJ_pilot_
+    feedback_spec.md, QIJ_pilot_feedback_interface.md 5), named only
+    when on, as `_feedback` -- so a `feedback=False` run (the default)
+    keeps every folder name unchanged. A21
     (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
     `refine_schedule`/`check_rule`/`tree_rule` as both switches and
     config keys: a new run's folder name carries only the surviving
@@ -96,6 +99,8 @@ def dir_tag(method: str, config: dict) -> str:
             tag += f"_nmin{int(config['n_min'])}"
         if config['L_max'] is not None:
             tag += f"_Lmax{int(config['L_max'])}"
+        if config.get('feedback', False):
+            tag += '_feedback'
         return tag
     if method == 'boot':
         return ''
@@ -136,7 +141,10 @@ def ensure_config(md: str, config: dict) -> None:
     unified_loop_spec.md) carries no `z`/`n_min`/`L_max` at all: read
     as the loop's own defaults (2.0/30/None) below, so today's
     default-levers runs still match it, exactly like the `fit_weights`
-    shim above."""
+    shim above. A stored config.json from before the pilot-feedback
+    pass (spec/QIJ_pilot_feedback_spec.md, QIJ_pilot_feedback_
+    interface.md 5) carries no `feedback` at all either: read as
+    `False`, the same shim."""
     os.makedirs(md, exist_ok=True)
     path = os.path.join(md, 'config.json')
     requested = json.loads(json.dumps(config))
@@ -153,7 +161,7 @@ def ensure_config(md: str, config: dict) -> None:
         # (spec/QIJ_mass_weighted_fit_spec.md 3): read as 'none', so
         # today's `fit_weights='none'` runs still match it.
         stored = dict(stored, fit_weights='none')
-    for key, default in (('z', 2.0), ('n_min', 30), ('L_max', None)):
+    for key, default in (('z', 2.0), ('n_min', 30), ('L_max', None), ('feedback', False)):
         if key in requested and key not in stored:
             stored = dict(stored, **{key: default})
     # Ignore any stored key current code no longer knows (A21's own

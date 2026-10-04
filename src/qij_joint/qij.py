@@ -101,6 +101,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from typing import Optional
 
 import numpy as np
 from numpy.linalg import LinAlgError
@@ -172,6 +173,135 @@ def _wrap(T):
     return T
 
 
+class _FeedbackRefiner:
+    """`feedback=True`'s refiner closure (QIJ_pilot_feedback_interface.md
+    section 5, section 6 REVISION 2): built over stage 1's own state
+    (`Z`, `X`, `xvq`, `I_proto` at full width, `theta_Q` at full width,
+    `sv`, `model`, `measured`, `counter`, `pool`, `eta`, `eta_rows`,
+    `seed`) and called by `core.joint.run_joint` as `refiner(plan_cells,
+    bmu_current, leaf_size)` whenever a round's trigger fires and the
+    WHERE rule selects at least one cell. `plan_cells`: list of (j,
+    n_min_child_j), the WHERE rule's own selection (section 6 rule 2').
+    Each call: builds rule 3's own Q_j/k_j per cell, `xvq_refine.
+    refine_cells` (k_j-means on each selected cell), `xvq_refine.
+    resurvey` (one new quantized fit, the refined prototypes' influence
+    only, the rest kept), `influence_model.refit_frozen` (the same GP
+    re-solved on the new design with FROZEN hyperparameters), then
+    `_psi0` for every point. On success the closure's own state
+    (`xvq`/`I_proto`/`theta_Q`/`sv`/`model`) advances to the new design,
+    read by the NEXT call; on any failure (caught here, wrapped to None
+    per the interface) the state is left exactly as it was and
+    `run_joint` keeps going without refining. `n_passes`/`evals_total`/
+    `rows_total` are this closure's own running tallies, read back by
+    `QIJ.fit` after `run_joint` returns (`M_X_final` = `self.xvq.
+    M_used`, unchanged from stage 1 when no pass ever succeeded)."""
+
+    def __init__(self, Z, X, xvq, I_proto, theta_Q, sv, model, measured,
+                 counter, pool, eta, eta_rows, seed) -> None:
+        self.Z = Z
+        self.X = X
+        self.xvq = xvq
+        self.I_proto = I_proto
+        self.theta_Q = theta_Q
+        self.sv = sv
+        self.model = model
+        self.measured = measured
+        self.counter = counter
+        self.pool = pool
+        self.eta = eta
+        self.eta_rows = eta_rows
+        self.seed = seed
+        self.n_passes = 0
+        self.evals_total = 0
+        self.rows_total = 0
+        self.busy_total = 0.0
+
+    def __call__(self, plan_cells, bmu_current, leaf_size) -> Optional[dict]:
+        # Imported here, not at module level: a `feedback=False` run
+        # (the default, self-check path) must never require AGENT B's
+        # `core.xvq_refine` or AGENT C's `influence_model.refit_frozen`
+        # to exist -- this closure is only ever built, and only ever
+        # called, under `feedback=True`.
+        from .core import xvq_refine
+        from .core.influence_model import refit_frozen
+        t0 = time.perf_counter()
+
+        # Rule 3' (section 6): Q_j = points at bmu j whose CURRENT leaf
+        # holds >= 2 points (a singleton leaf is measured exactly -- it
+        # gets no prototype of its own, but still needs a bmu after a
+        # refinement, so it is left out of the k-means fit and picked up
+        # by `refine_cells`'s own nearest-of-k_j assignment instead).
+        # k_j = min(ceil(|Q_j| / n_min_child_j), #distinct rows of
+        # Z[Q_j]); a j whose Q_j is empty, or whose k_j < 2, cannot be
+        # split and is reported skipped (never passed to `refine_cells`).
+        bmu_current = np.asarray(bmu_current)
+        leaf_size = np.asarray(leaf_size)
+        plan = []
+        pre_skipped = []
+        for j, n_min_child_j in plan_cells:
+            j = int(j)
+            Q_j = np.flatnonzero((bmu_current == j) & (leaf_size >= 2))
+            if Q_j.size == 0:
+                pre_skipped.append(j)
+                continue
+            n_distinct = np.unique(self.Z[Q_j], axis=0).shape[0]
+            k_j = min(int(np.ceil(Q_j.size / float(n_min_child_j))), int(n_distinct))
+            if k_j < 2:
+                pre_skipped.append(j)
+                continue
+            plan.append((j, Q_j, k_j))
+
+        n_evals = 0
+        n_rows = 0
+        busy_delta = 0.0
+        if not plan:
+            # B5: nothing survives rule 3' (every selected cell had no
+            # Q_j or k_j < 2) -- no k-means, no quantized fit, no refit,
+            # no replay.
+            return None
+        try:
+            M_before = self.xvq.M_used
+            xvq_new, refined, in_refine_skipped = xvq_refine.refine_cells(
+                self.Z, self.xvq, plan, self.seed)
+            if not refined:
+                # B5: every cell in `plan` was still skipped by
+                # `refine_cells` itself (empty sub-cell or k-means
+                # failure) -- no quantized fit, no refit, no replay.
+                return None
+            (theta_Q_new, I_proto_new, sv_new,
+             n_evals, n_rows, busy_delta) = xvq_refine.resurvey(
+                self.counter, self.X, xvq_new, refined, self.I_proto,
+                self.theta_Q, self.sv, self.eta, self.pool, self.eta_rows)
+            model_new = refit_frozen(
+                self.model, self.Z, xvq_new,
+                I_proto_new[:, self.measured], theta_Q_new[self.measured], self.eta)
+            psi0_new = _psi0(model_new, self.Z)
+        except Exception:
+            self.evals_total += int(n_evals)
+            self.rows_total += int(n_rows)
+            self.busy_total += float(busy_delta)
+            return None
+        wall = time.perf_counter() - t0
+        prototypes_added = int(xvq_new.M_used) - int(M_before)
+        skipped = pre_skipped + list(in_refine_skipped)
+        sum_k = sum(len(ids) for _j, ids in refined)
+        info = dict(n_cells=int(len(refined)), cells=np.array([j for j, _ in refined], dtype=int),
+                     prototypes_added=prototypes_added, n_selected=int(len(plan_cells)),
+                     sum_k=int(sum_k), skipped=skipped,
+                     evals=int(n_evals), rows=int(n_rows), wall=float(wall))
+        self.xvq = xvq_new
+        self.I_proto = I_proto_new
+        self.theta_Q = theta_Q_new
+        self.sv = sv_new
+        self.model = model_new
+        self.n_passes += 1
+        self.evals_total += int(n_evals)
+        self.rows_total += int(n_rows)
+        self.busy_total += float(busy_delta)
+        return dict(psi0=psi0_new, offset=np.asarray(model_new.offset, dtype=float),
+                    bmu=np.asarray(xvq_new.bmu), info=info)
+
+
 def _theta_hat_task(T, case, X: np.ndarray, _task):
     """theta_hat = T(X, ones(N)) on the pool, submitted at draw start
     (method_notes section 2). Returns (evaluation, failure, wall time)."""
@@ -190,7 +320,7 @@ def _theta_hat_task(T, case, X: np.ndarray, _task):
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, survey,
                   sv, quantized_start, fit_weights, sigma_points,
-                  z, n_min, L_max) -> QIJResult:
+                  z, n_min, L_max, feedback) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -208,7 +338,11 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
     since the loop itself never ran to resolve it). `I_proto` and
     `sv.step_ratio` are the full-width survey products; `measured`
     restricts them to the reported outputs, exactly as the successful
-    path does (spec QIJ_mods_waves.md A11)."""
+    path does (spec QIJ_mods_waves.md A11). `feedback` is recorded as
+    given; the pass never ran (the loop itself never ran), so
+    `n_passes`/`evals_prototype_refine`/`rows_prototype_refine` are 0,
+    `passes` is empty and `M_X_final` is `xvq.M_used` (the stage-1
+    codebook, never refined)."""
     q = len(outputs)
     nan_q, false_q = np.full(q, np.nan), np.zeros(q, dtype=bool)
     nan_Nq = np.full((N, q), np.nan)
@@ -239,6 +373,8 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         quantized_start=quantized_start, fit_weights=fit_weights,
         sigma_points=sigma_points,
         z=z, n_min=n_min, L_max=(xvq.M_used if L_max is None else L_max),
+        feedback=feedback, n_passes=0, evals_prototype_refine=0,
+        rows_prototype_refine=0, M_X_final=xvq.M_used, passes=[], fires=[],
         **_joint_defaults(N, q), **_sigma_defaults(q),
     )
 
@@ -250,7 +386,8 @@ class QIJ:
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
                  survey: str = 'points', quantized_start: str = 'multistart',
                  sigma_points: bool = False, fit_weights: str = 'none',
-                 z: float = 2.0, n_min: int = 30, L_max: int = None) -> None:
+                 z: float = 2.0, n_min: int = 30, L_max: int = None,
+                 feedback: bool = False) -> None:
         """`z`, `n_min`, `L_max` are the unified loop's own user-exposed
         levers (spec/QIJ_unified_loop_spec.md 0, 4.4, 5), passed straight
         to `core.joint.run_joint`. `z` (default 2.0) is the stop's
@@ -262,7 +399,15 @@ class QIJ:
         fewer splits is itself unreliable). `L_max` (default None ->
         `M_X_used`, resolved inside `run_joint`) caps the number of
         leaves; `QIJResult.L_max` always records the resolved value,
-        never None."""
+        never None. `feedback` (spec/QIJ_pilot_feedback_spec.md,
+        QIJ_pilot_feedback_interface.md section 5), off by default,
+        turns on the pilot-feedback pass inside `run_joint`: when a
+        round's measurements contradict the pilot, a refiner closure
+        built here over stage 1's own state refines the offending
+        X-VQ cells, re-surveys and re-fits the pilot, and the loop
+        replays its state vector under it. `feedback=False` leaves
+        every product byte-identical to before this option existed
+        (no extra evaluations, no RNG use)."""
         if not z > 0:
             raise ValueError(f'z must be > 0 (got {z})')
         if n_min < 1:
@@ -282,6 +427,7 @@ class QIJ:
         self.z = z
         self.n_min = n_min
         self.L_max = L_max
+        self.feedback = feedback
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -394,7 +540,7 @@ class QIJ:
                                  self.gptrend, self.gpwidth, M_X_source, workers,
                                  self.survey, sv, self.quantized_start,
                                  self.fit_weights, self.sigma_points,
-                                 self.z, self.n_min, self.L_max)
+                                 self.z, self.n_min, self.L_max, self.feedback)
         # THE ARCHITECTURE RULE (spec/QIJ_mods_waves.md A20): `psi0_all`
         # is populated ONCE here, in survey units -- the GP's point
         # predictions -- and from this point on it IS the one per-point
@@ -479,9 +625,19 @@ class QIJ:
         # leaves' own (already measured-width) U, `B_hat` NaN on every
         # output always -- so neither is sliced by `measured` here any
         # more (`core.joint` module docstring).
+        # `feedback` (spec/QIJ_pilot_feedback_spec.md,
+        # QIJ_pilot_feedback_interface.md section 5): a refiner closure
+        # built over stage 1's own state, or None -- `run_joint` never
+        # calls it under `feedback=False`, so no import of AGENT B's/C's
+        # modules happens on that path (module docstring, `_FeedbackRefiner`).
+        refiner = (_FeedbackRefiner(Z, X, xvq, I_proto, theta_Q, sv, model, measured,
+                                     counter, pool, eta, eta_rows, self.seed)
+                   if self.feedback else None)
+
         jr = run_joint(X, counter, theta_hat, psi0_all, model, xvq, eta_full,
                        self.eps, offset, pool=pool, start=start_second_stage,
-                       measured=measured, z=self.z, n_min=self.n_min, L_max=self.L_max)
+                       measured=measured, z=self.z, n_min=self.n_min, L_max=self.L_max,
+                       feedback=self.feedback, refiner=refiner)
         # A failed output, or a failed initial bin measurement before
         # any continuation ran, voids every output's variance quantities.
         if jr.failed:
@@ -492,6 +648,31 @@ class QIJ:
                           B_hat=np.full(q, np.nan), a_bca=np.full(q, np.nan))
         second_stage_evals = int(jr.n_evals)
         second_stage_busy = float(jr.busy_delta)
+        # Accounting (interface section 5): the refiner's own
+        # evaluations/rows happen inside `run_joint`'s window (through
+        # `counter`, not through `n_evals`'s split-attempt count), so
+        # `jr.n_evals` above already keeps its today's meaning -- the
+        # loop's OWN measurements -- untouched. `feedback_passes` is
+        # read from `jr.passes` (empty, so every total below is 0, under
+        # `feedback=False` or when no pass ever fired); subtracted from
+        # the 'full_data' bucket below so those evaluations are not
+        # double-counted there, and kept inside 'total' (module
+        # docstring; "Total size-N includes them", interface section 5).
+        feedback_passes = list(getattr(jr, 'passes', None) or [])
+        feedback_fires = list(getattr(jr, 'fires', None) or [])
+        n_passes = len(feedback_passes)
+        # B3: read from the refiner's own running totals, not only from
+        # successful passes' `info` -- a pass that raised AFTER resurvey
+        # ran still spent real evaluations/rows against `counter`, and
+        # `refiner.evals_total`/`rows_total` include those (accumulated
+        # in `_FeedbackRefiner.__call__`'s except branch too).
+        if refiner is not None:
+            evals_prototype_refine = int(refiner.evals_total)
+            rows_prototype_refine = int(refiner.rows_total)
+        else:
+            evals_prototype_refine = 0
+            rows_prototype_refine = 0
+        M_X_final = int(refiner.xvq.M_used) if refiner is not None else int(xvq.M_used)
         second_stage_fields = dict(V_btw=jr.V_btw, V_win_hat=jr.V_win_hat,
                                     se_V_win=jr.se_V_win, V_tot_hat=jr.V_tot_hat,
                                     kappa=jr.kappa, se_kappa=jr.se_kappa, margin=jr.margin,
@@ -565,14 +746,25 @@ class QIJ:
         # eta_full's own evaluations (spec/QIJ_mods_waves.md A15) are
         # counted in their own stage, excluded from 'full_data' and
         # 'total' (module docstring); 0 for an estimator without
-        # `takes_start`, so both stay bit-identical there.
+        # `takes_start`, so both stay bit-identical there. The feedback
+        # pass's own evaluations/rows (interface section 5, counted
+        # above into `evals_prototype_refine`/`rows_prototype_refine`,
+        # both 0 under `feedback=False` or when no pass ever fired) ran
+        # inside this same window (`ev1c`..`ev3`) through `counter`, so
+        # they must also come OUT of 'full_data' here (never double-
+        # counted); 'total' is left as `ev3 - ...` so it still includes
+        # them (module docstring; interface section 5, "Total size-N
+        # includes them") -- bit-identical to before under
+        # `feedback=False`.
         evals_by_stage = {'prototype': ev1 - ev0,
-                           'full_data': ev0 + (ev3 - ev1c) - second_stage_evals - evals_eta_full,
+                           'full_data': (ev0 + (ev3 - ev1c) - second_stage_evals
+                                          - evals_eta_full - evals_prototype_refine),
                            'refinement': second_stage_evals, 'curvature': evals_curvature,
                            'eta_full': evals_eta_full, 'sigma': evals_sigma,
                            'total': ev3 - evals_curvature - evals_eta_full}
         rows_by_stage = {'prototype': rows1 - rows0,
-                          'full_data': rows0 + (rows3 - rows1c) - second_stage_evals * N - rows_eta_full,
+                          'full_data': (rows0 + (rows3 - rows1c) - second_stage_evals * N
+                                         - rows_eta_full - rows_prototype_refine),
                           'refinement': second_stage_evals * N, 'curvature': rows_curvature,
                           'eta_full': rows_eta_full, 'sigma': rows_sigma,
                           'total': rows3 - rows_curvature - rows_eta_full}
@@ -583,8 +775,13 @@ class QIJ:
                                'total': wall_time_total}
         # Parent work plus every pool task's own time, in place of each
         # parallel stage's share of the elapsed total.
+        # The refiner's own pooled busy time (resurvey's pool.map calls),
+        # discarded before this fix: accumulated on the closure as
+        # `busy_total` (including failed passes, same as evals/rows above).
+        refiner_busy = float(refiner.busy_total) if refiner is not None else 0.0
         busy_time_total = (wall_time_total + xvq_busy + model_busy + full_data_busy
-                            + second_stage_busy + curvature_busy + sigma_busy)
+                            + second_stage_busy + curvature_busy + sigma_busy
+                            + refiner_busy)
 
         # at_bound[:, 0] is whichever width parameter gpwidth fits
         # (method_notes section 3); `model` is already the measured
@@ -617,5 +814,9 @@ class QIJ:
             z=jr.z, n_min=jr.n_min, L_max=jr.L_max,
             quantized_start=self.quantized_start,
             fit_weights=self.fit_weights,
+            feedback=self.feedback, n_passes=n_passes,
+            evals_prototype_refine=evals_prototype_refine,
+            rows_prototype_refine=rows_prototype_refine,
+            M_X_final=M_X_final, passes=feedback_passes, fires=feedback_fires,
             **second_stage_fields, **joint_fields, **sigma_fields,
         )

@@ -66,6 +66,9 @@ def main(argv=None) -> None:
                         'stop may fire (default 30)')
     p.add_argument('--L-max', dest='L_max', type=int, default=None,
                    help='qij: cap on the number of leaves (default: M_X_used)')
+    p.add_argument('--feedback', dest='feedback', action='store_true',
+                   help='qij: the pilot-feedback pass (spec/QIJ_pilot_feedback_spec.md) -- '
+                        'refines the X-VQ where a round contradicts the pilot; off by default')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
@@ -84,7 +87,8 @@ def main(argv=None) -> None:
                       gpwidth=args.gpwidth, M_X=args.M_X,
                       survey=args.survey, quantized_start=args.quantized_start,
                       sigma_points=args.sigma_points, fit_weights=args.fit_weights,
-                      z=args.z, n_min=args.n_min, L_max=args.L_max)
+                      z=args.z, n_min=args.n_min, L_max=args.L_max,
+                      feedback=args.feedback)
     elif args.method == 'boot':
         config['B'] = args.B
     elif args.method == 'ijfd':
@@ -122,7 +126,7 @@ def main(argv=None) -> None:
         params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
                       survey=args.survey, quantized_start=args.quantized_start,
                       sigma_points=args.sigma_points, fit_weights=args.fit_weights,
-                      z=args.z, n_min=args.n_min, L_max=args.L_max)
+                      z=args.z, n_min=args.n_min, L_max=args.L_max, feedback=args.feedback)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
@@ -130,7 +134,7 @@ def main(argv=None) -> None:
             survey=args.survey, quantized_start=args.quantized_start,
             sigma_points=args.sigma_points,
             fit_weights=args.fit_weights,
-            z=args.z, n_min=args.n_min, L_max=args.L_max, tag=tag)
+            z=args.z, n_min=args.n_min, L_max=args.L_max, feedback=args.feedback, tag=tag)
     elif args.method == 'qijdt':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \

@@ -79,6 +79,7 @@ depth (double-counting nested regions, Sigma p != 1) is removed.
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -87,8 +88,9 @@ import numpy as np
 from ..parallel import call_T
 from .calibrate import kappa_hat, rank_scores, round_prefix, stop_test, vwin_hat
 from .differences import central_step, perturbed_weights, step_parameter
+from .feedback import attribute_intracell, round_trigger
 
-__all__ = ["JointResult", "run_joint", "two_means_split"]
+__all__ = ["JointResult", "run_joint", "two_means_split", "replay_state"]
 
 
 @dataclass
@@ -183,6 +185,18 @@ class JointResult:
     n_min: int
     L_max: int
     busy_delta: float
+    passes: list        # pilot-feedback pass log (spec/QIJ_pilot_feedback_interface.md
+                         # section 0/4, section 6 rule 2'/3'); empty when `feedback` is
+                         # off. Each successful pass is dict(round, ratio (q,), fired (q,)
+                         # bool, cells (the selected j's), n_intracell_splits, n_selected,
+                         # sum_k, skipped, info=refiner's own info dict).
+    fires: list          # per-round feedback diagnostic (section 6): one entry for EVERY
+                          # round whose trigger fired, successful pass or not -- dict(round,
+                          # ratio (q,), fired (q,) bool, n_intracell_splits, n_selected).
+                          # `n_selected` is the WHERE rule's own selection count even when
+                          # it is 0 (nothing selected) or the refiner then declined/failed
+                          # (those never make it into `passes`). Empty when `feedback` is off.
+    feedback: bool       # whether this run's loop had the pilot-feedback pass enabled.
 
 
 def two_means_split(rows: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
@@ -260,6 +274,91 @@ def _apply_update(psi_hat: np.ndarray, idx: np.ndarray, U: np.ndarray,
             n_shift[c] += 1
 
 
+def replay_state(psi0: np.ndarray, offset: np.ndarray, records: Sequence[dict],
+                  N: int, q: int, eta: float, theta_abs: np.ndarray):
+    """Pilot-feedback REPLAY (spec/QIJ_pilot_feedback_interface.md
+    section 0 step 6, section 4): rebuild the whole state vector from a
+    (possibly new) pilot `psi0`/`offset` and the run's own stored split
+    RECORDS -- no evaluation. `records` is the flat list this module
+    appends to (in original split order) as `run_joint` makes each
+    split: dict(parent, child_a, child_b, idx_small, idx_large,
+    U_small, U_large, t_small, t_large); `child_a`/`child_b` are the
+    ids `run_joint` assigned to the small/large child respectively
+    (its own `next_id`/`next_id+1`).
+
+    Root centring is redone exactly as `run_joint`'s own (spec 4.0);
+    then, for each record in order: the parent's U is read from a
+    scratch id->U map (root id 0 -> zeros(q), otherwise the U this
+    same replay assigned its own earlier record); the parent's point
+    set is idx_small union idx_large (disjoint, so no other record's
+    update has touched these indices since the parent itself was
+    created -- the same invariant `run_joint` relies on for its own
+    `split_W_parent`); G and W_parent are read BEFORE the children's
+    update, then `_apply_update` is applied (small, then large) with
+    the record's own stored U/t, onto SCRATCH n_update counters (the
+    run's own counters are untouched).
+
+    Returns (psi_hat (N, q), dict(G=(S, q), W_parent=(S, q)) in the
+    records' own order, dict(id -> dict(m, ebar, var_hat)) for every
+    child created along the replay, plus the root's own id 0 entry
+    (its pre-split state, in case it is still a leaf -- no records at
+    all)."""
+    psi_hat = psi0 - offset[None, :]
+    m_pre_root = psi_hat.mean(axis=0)
+    psi_hat = psi_hat - m_pre_root[None, :]
+
+    U_by_id = {0: np.zeros(q)}
+    per_leaf = {0: dict(m=m_pre_root, ebar=-m_pre_root, var_hat=psi_hat.var(axis=0))}
+    per_split_G: list = []
+    per_split_W_parent: list = []
+
+    n_scale = np.zeros(q, dtype=int)
+    n_shift = np.zeros(q, dtype=int)
+    n_neg = np.zeros(q, dtype=int)
+
+    for rec in records:
+        idx_small = rec['idx_small']
+        idx_large = rec['idx_large']
+        U_small = rec['U_small']
+        U_large = rec['U_large']
+        t_small = rec['t_small']
+        t_large = rec['t_large']
+        n_small = idx_small.size
+        n_large = idx_large.size
+        n_parent = n_small + n_large
+
+        U_k = U_by_id[rec['parent']]
+        idx_parent = np.concatenate([idx_small, idx_large])
+        W_parent = (n_parent / N) * psi_hat[idx_parent].var(axis=0) / N
+
+        m_pre_small = psi_hat[idx_small].mean(axis=0)
+        m_pre_large = psi_hat[idx_large].mean(axis=0)
+        G_s = (n_small * (m_pre_small - U_k) ** 2
+               + n_large * (m_pre_large - U_k) ** 2) / N ** 2
+        per_split_G.append(G_s)
+        per_split_W_parent.append(W_parent)
+
+        _apply_update(psi_hat, idx_small, U_small, t_small, eta, theta_abs,
+                      n_scale, n_shift, n_neg)
+        _apply_update(psi_hat, idx_large, U_large, t_large, eta, theta_abs,
+                      n_scale, n_shift, n_neg)
+
+        var_small = psi_hat[idx_small].var(axis=0)
+        var_large = psi_hat[idx_large].var(axis=0)
+        per_leaf[rec['child_a']] = dict(m=m_pre_small, ebar=U_small - m_pre_small,
+                                        var_hat=var_small)
+        per_leaf[rec['child_b']] = dict(m=m_pre_large, ebar=U_large - m_pre_large,
+                                        var_hat=var_large)
+        U_by_id[rec['child_a']] = U_small
+        U_by_id[rec['child_b']] = U_large
+
+    split_out = dict(
+        G=np.array(per_split_G) if per_split_G else np.zeros((0, q)),
+        W_parent=np.array(per_split_W_parent) if per_split_W_parent else np.zeros((0, q)),
+    )
+    return psi_hat, split_out, per_leaf
+
+
 def _central_task(T, case, X: np.ndarray, task):
     """One round's one-shot central-pair evaluation, on the pool (the
     same failure boundary as `ivq._bin_task`'s pool path -- module
@@ -286,7 +385,7 @@ def _central_task(T, case, X: np.ndarray, task):
 
 
 def _failed_result(N: int, q: int, z: float, n_min: int, L_max: int,
-                    busy_delta: float = 0.0) -> JointResult:
+                    busy_delta: float = 0.0, feedback: bool = False) -> JointResult:
     """A failed draw: the shared constant-path pre-check failed before
     any evaluation. Every variance/leaf/split/round quantity is void;
     `qij.py` NaNs the per-output fields it reads directly, so the exact
@@ -312,6 +411,7 @@ def _failed_result(N: int, q: int, z: float, n_min: int, L_max: int,
         n_update_scale=np.zeros(q, dtype=int), n_update_shift=np.zeros(q, dtype=int),
         n_update_negative=np.zeros(q, dtype=int), state_psi_hat=np.full((N, q), np.nan),
         rank_rule='measured_error', z=z, n_min=n_min, L_max=L_max, busy_delta=busy_delta,
+        passes=[], fires=[], feedback=feedback,
     )
 
 
@@ -320,6 +420,7 @@ def run_joint(
     model, xvq, eta: float, eps: float, offset: np.ndarray, pool=None,
     start: np.ndarray = None, measured: Optional[Sequence[int]] = None, *,
     z: float = 2.0, n_min: int = 30, L_max: Optional[int] = None,
+    feedback: bool = False, refiner=None,
 ) -> JointResult:
     """
     The unified measured loop (module docstring; spec/QIJ_unified_loop_
@@ -352,6 +453,30 @@ def run_joint(
     bit. All of one round's evaluations run in a single `pool.map` call
     (spec 4.2/4.3), bit-identical across worker counts (module
     docstring, `_central_task`).
+
+    `feedback`/`refiner` (spec/QIJ_pilot_feedback_interface.md section
+    0/4, section 6 REVISION 2): `feedback=False` (the default) takes
+    NONE of the code paths below that read them -- every product is
+    BIT-IDENTICAL to a build without this feature. When `feedback=True`,
+    after every round whose splits are measured, the round's trigger
+    (`core.feedback.round_trigger`) runs on the round's own split
+    products; on a fire, the INTRA-CELL WHERE rule
+    (`core.feedback.attribute_intracell`, rule 2') runs over every split
+    made SINCE THE LAST SUCCESSFUL PASS (all splits so far, for the
+    first pass); if it selects anything, `refiner(plan_cells,
+    bmu_current, leaf_size)` (supplied by `qij.py`; `leaf_size` is each
+    point's CURRENT leaf size, live or closed) is called and, on
+    success, its new pilot is installed by a full REPLAY (`replay_state`,
+    below) of every split made so far -- this module never re-evaluates
+    past splits -- and the "since the last pass" marker advances to the
+    current split count (a pass consumes its evidence). A fire that
+    selects nothing, or whose refiner call declines/fails, is recorded
+    in `fires` only (never `passes`) and the marker does not advance. A
+    replay record (parent id, child ids, the cut's index sets, measured
+    U/t) is stored for EVERY split regardless of `feedback`, so a
+    later/external call to `replay_state` with the ORIGINAL pilot
+    reproduces this run's own psi_hat/G/W_parent exactly (self-check,
+    interface section 4).
     """
     N, q = psi0_all.shape
     if measured is None:
@@ -363,7 +488,7 @@ def run_joint(
         L_max = M_X_used
 
     if np.any(model.constant_path):
-        return _failed_result(N, q, z, n_min, L_max)
+        return _failed_result(N, q, z, n_min, L_max, feedback=feedback)
 
     # std0 (spec 4.2): the per-output std of the POPULATED vector over
     # the whole cloud, a unit fixed once, at population -- every cut's
@@ -409,6 +534,23 @@ def run_joint(
     round_V_win: list = []
     round_margin: list = []
     round_n_splits: list = []
+
+    # Pilot feedback (spec/QIJ_pilot_feedback_interface.md section 4,
+    # section 6): `replay_records` is built for EVERY split regardless of
+    # `feedback` (the self-check needs it from a normal run too);
+    # `passes`/`fires`/`current_bmu`/`last_pass_end` only matter under
+    # `feedback=True`. `current_bmu` is read fresh from `xvq` here, once
+    # -- harmless under `feedback=False` (never read again below in that
+    # case). `last_pass_end` indexes into `replay_records` (and the
+    # parallel `split_D`/`split_floor`/`split_W_parent` lists, all built
+    # in the same original split order): the number of splits that had
+    # been made as of the last SUCCESSFUL pass (0 before any pass --
+    # rule 2', "all splits so far, for the first pass").
+    replay_records: list = []
+    passes: list = []
+    fires: list = []
+    current_bmu = np.asarray(xvq.bmu)
+    last_pass_end = 0
 
     n_evals = 0
     capped = False
@@ -601,6 +743,18 @@ def run_joint(
 
             m_pre_small = info['U_small_pred']
             m_pre_large = info['U_large_pred']
+            # pilot-feedback REPLAY record (interface section 4, `replay_state` above,
+            # and section 0 step 2's CHILD-LEVEL attribution): stored for EVERY split
+            # regardless of `feedback`. U_k/m_pre_small/m_pre_large are kept alongside
+            # the replay fields so the round's own feedback hook can build child_R/
+            # child_P (section 0 step 2) without recomputing them.
+            replay_records.append(dict(
+                parent=leaf_id, child_a=next_id, child_b=next_id + 1,
+                idx_small=idx_small, idx_large=idx_large,
+                U_small=U_small, U_large=U_large, t_small=t_small, t_large=t_large,
+                U_k=U_k, m_pre_small=m_pre_small, m_pre_large=m_pre_large,
+            ))
+
             ebar_small = U_small - m_pre_small
             ebar_large = U_large - m_pre_large
             delta_U_small_vec = eta * theta_abs / t_small
@@ -621,6 +775,99 @@ def run_joint(
             this_round_splits += 1
 
         round_n_splits.append(this_round_splits)
+
+        # Pilot feedback (spec/QIJ_pilot_feedback_interface.md section
+        # 0/4, section 6 REVISION 2): after the round's splits are
+        # measured, TRIGGER on the round's own D/floor against SW (=
+        # this round's own W_all, read at the TOP of this iteration --
+        # the leaves standing at the round's START, raw pilot within,
+        # kappa NOT applied) and Vtot (= V_btw + V_win, also read at
+        # this iteration's top, i.e. the start of the round).
+        # `feedback=False` never enters here.
+        if feedback and this_round_splits > 0:
+            D_round = np.array(split_D[-this_round_splits:])
+            floor_round = np.array(split_floor[-this_round_splits:])
+            SW = W_all.sum(axis=0)
+            fire, ratio, excess = round_trigger(D_round, floor_round, SW, V_tot, eps)
+            if np.any(fire):
+                # INTRA-CELL WHERE (rule 2'): every split SINCE THE LAST
+                # SUCCESSFUL PASS (all splits so far, for the first pass --
+                # `last_pass_end` only advances on a successful pass, below),
+                # under the CURRENT bmu. D/floor/W_parent are read from the
+                # live lists (a previous replay may have overwritten
+                # `split_W_parent`; `split_D`/`split_floor` never change).
+                since_records = replay_records[last_pass_end:]
+                D_since = split_D[last_pass_end:]
+                floor_since = split_floor[last_pass_end:]
+                W_parent_since = split_W_parent[last_pass_end:]
+                since_splits = [
+                    dict(idx_small=rec['idx_small'], idx_large=rec['idx_large'],
+                         D=D_since[i], floor=floor_since[i], W_parent=W_parent_since[i])
+                    for i, rec in enumerate(since_records)
+                ]
+                n_intracell_splits = 0
+                for s in since_splits:
+                    idx_parent = np.concatenate([s['idx_small'], s['idx_large']])
+                    if idx_parent.size and np.unique(current_bmu[idx_parent]).size == 1:
+                        n_intracell_splits += 1
+                plan_cells, _scores = attribute_intracell(since_splits, current_bmu, fire)
+                n_selected = len(plan_cells)
+                fires.append(dict(round=round_idx, ratio=ratio, fired=fire,
+                                   n_intracell_splits=n_intracell_splits,
+                                   n_selected=n_selected))
+                out = None
+                if plan_cells and refiner is not None:
+                    # leaf_size (N,): every point's CURRENT leaf size (live
+                    # or closed -- `leaves` only ever holds a node with no
+                    # children right now, since a leaf is popped exactly
+                    # when it is successfully split, above).
+                    leaf_size = np.empty(N, dtype=int)
+                    for leaf in leaves.values():
+                        leaf_size[leaf['indices']] = leaf['n']
+                    reason = None
+                    try:
+                        out = refiner(plan_cells, current_bmu, leaf_size)
+                        if out is None:
+                            reason = "declined (returned None)"
+                    except Exception as exc:
+                        reason = f"raised {exc!r}"
+                        out = None
+                    if reason is not None:
+                        warnings.warn(
+                            f"pilot-feedback refiner {reason} at round {round_idx} "
+                            f"({n_selected} cells in plan); keeping the current "
+                            f"pilot and continuing without refining.",
+                            RuntimeWarning,
+                        )
+                if out is not None:
+                    psi_hat, split_replay, leaf_replay = replay_state(
+                        out['psi0'], out['offset'], replay_records, N, q, eta, theta_abs)
+                    split_G = list(split_replay['G'])
+                    split_W_parent = list(split_replay['W_parent'])
+                    for lid in leaves:
+                        if lid in leaf_replay:
+                            leaves[lid]['m'] = leaf_replay[lid]['m']
+                            leaves[lid]['ebar'] = leaf_replay[lid]['ebar']
+                            leaves[lid]['var_hat'] = leaf_replay[lid]['var_hat']
+                    current_bmu = np.asarray(out['bmu'])
+                    info = out.get('info') or {}
+                    passes.append(dict(
+                        round=round_idx, ratio=ratio, fired=fire,
+                        cells=np.array([j for j, _ in plan_cells], dtype=int),
+                        n_intracell_splits=n_intracell_splits, n_selected=n_selected,
+                        sum_k=info.get('sum_k'), skipped=info.get('skipped'),
+                        info=info,
+                    ))
+                    # The pass consumed its evidence (rule 2'): splits made
+                    # up to and including this round are no longer "since
+                    # the last pass" for the next fire.
+                    last_pass_end = len(replay_records)
+                # out is None: either nothing was selected (no refiner call
+                # at all) or a refiner call declined/raised (already warned
+                # above); the loop proceeds with today's pilot, nothing
+                # else to undo (no replay happened), and `last_pass_end`
+                # does not advance -- these splits' evidence is still live
+                # for the next fire.
 
     ordered_ids = sorted(leaves.keys())
     L_final = len(ordered_ids)
@@ -655,7 +902,7 @@ def run_joint(
     valid = abc_den > 0.0
     a_bca_out[valid] = abc_num[valid] / (6.0 * np.sqrt(N) * abc_den[valid] ** 1.5)
 
-    return JointResult(
+    result = JointResult(
         V_btw=V_btw, V_win_hat=V_win, se_V_win=se_V_win, V_tot_hat=V_tot,
         kappa=kappa, se_kappa=se_kappa, margin=margin, B_hat=B_hat, a_bca=a_bca_out,
         L=L_final, n_splits=n_splits_total, n_rounds=round_idx, n_evals=n_evals,
@@ -679,4 +926,10 @@ def run_joint(
         n_update_scale=n_update_scale, n_update_shift=n_update_shift,
         n_update_negative=n_update_negative, state_psi_hat=psi_hat,
         rank_rule='measured_error', z=z, n_min=n_min, L_max=L_max, busy_delta=busy_delta,
+        passes=passes, fires=fires, feedback=feedback,
     )
+    result._replay_records = replay_records  # debug-only; not a dataclass field,
+    # not read by any product/report code -- kept so `replay_state` can be
+    # exercised directly against a run's own records (interface section 4
+    # self-check); see build report.
+    return result
