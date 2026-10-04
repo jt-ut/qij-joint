@@ -193,7 +193,12 @@ def _moments_survey_rows(
     the rows stand for: an estimator whose value depends on the weight
     total (GMM2D's penalty, a = 1/sum(w)) is then the same estimator on
     the rows as on the data. Vectorized over every large field at once.
-    Returns (rows, row's field, row's base weight)."""
+    Returns (rows, row's field, row's base weight); a 1-D sample (N,)
+    is surveyed as (N, 1) and its rows returned 1-D, the shape the
+    estimator was handed."""
+    flat = X.ndim == 1
+    if flat:
+        X = X[:, None]
     d_x = X.shape[1]
     N = X.shape[0]
     n, mean, cov = _field_moments(X, bmu, M_used)
@@ -226,6 +231,8 @@ def _moments_survey_rows(
     rows = np.concatenate([rows_small, rows_large], axis=0)
     row_field = np.concatenate([field_small, field_large])
     weight0 = np.concatenate([weight_small, weight_large])
+    if flat:
+        rows = rows[:, 0]
     return rows, row_field, weight0
 
 
