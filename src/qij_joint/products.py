@@ -36,7 +36,7 @@ def method_dir(out_dir: str, dataset: str, estimator: str, N: int, method: str,
 # so the study's default run keeps today's folder name.
 QIJ_CANONICAL = dict(survey='moments', quantized_start='full-data', gptrend='quadratic',
                       gpwidth='global', sigma_points=True, M_X=None,
-                      z=2.0, n_min=30, L_max=None)
+                      z=2.0, n_min=30, L_max=None, pilot='gp', gp_floor='isotropic')
 
 
 def _num(x) -> str:
@@ -49,18 +49,23 @@ def dir_tag(method: str, config: dict) -> str:
     from `config` rather than letting `--out` be used to separate them.
     `qij` -> `eps<eps>`, e.g. `eps0.02`, then one suffix per setting
     that differs from `QIJ_CANONICAL`, in a fixed order: `survey`,
-    `quantized_start`, `gptrend`, `gpwidth`, then `fit_weights`
+    `quantized_start`, `gptrend`, `gpwidth`, then `pilot`
+    (spec/QIJ_pilot_floor_options_interface.md Option 1) as a
+    non-canonical suffix right after `gpwidth`'s own, named only when
+    `'affine'`, as `_affinepilot`, then `fit_weights`
     (spec/QIJ_mass_weighted_fit_spec.md 3) as a non-canonical suffix
     right after `gpwidth`'s own, named only when `'mass'`, as
     `_massfit` -- so a `fit_weights='none'` run keeps today's folder
-    name -- then `sigma_points` (named only when False, as `_nosigma`),
+    name -- then `gp_floor` (spec/QIJ_pilot_floor_options_interface.md
+    Option 2), named only when `'mass'`, as `_massfloor`, then
+    `sigma_points` (named only when False, as `_nosigma`),
     `M_X` (named only when not None, as `_MX<int>`), then the unified
     loop's own levers (spec/QIJ_unified_loop_spec.md 0, 4.4, 5):
     `z` (named only when != 2, as `_z<z>`), `n_min` (named only when
     != 30, as `_nmin<n>`), `L_max` (named only when given, i.e. not
     None, as `_Lmax<L>`) -- so the study default (z=2, n_min=30,
-    L_max=None) keeps the folder name `qij_eps0.01_widthlocal_
-    massfit_nosigma`. A21
+    L_max=None, pilot='gp', gp_floor='isotropic') keeps the folder name
+    `qij_eps0.01_widthlocal_massfit_nosigma`. A21
     (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
     `refine_schedule`/`check_rule`/`tree_rule` as both switches and
     config keys: a new run's folder name carries only the surviving
@@ -84,8 +89,12 @@ def dir_tag(method: str, config: dict) -> str:
             tag += f"_trend{config['gptrend']}"
         if config['gpwidth'] != QIJ_CANONICAL['gpwidth']:
             tag += f"_width{config['gpwidth']}"
+        if config.get('pilot', QIJ_CANONICAL['pilot']) != QIJ_CANONICAL['pilot']:
+            tag += '_affinepilot'
         if config['fit_weights'] == 'mass':
             tag += '_massfit'
+        if config.get('gp_floor', QIJ_CANONICAL['gp_floor']) == 'mass':
+            tag += '_massfloor'
         if config['sigma_points'] != QIJ_CANONICAL['sigma_points']:
             tag += '_nosigma'
         if config['M_X'] != QIJ_CANONICAL['M_X']:
@@ -136,7 +145,9 @@ def ensure_config(md: str, config: dict) -> None:
     unified_loop_spec.md) carries no `z`/`n_min`/`L_max` at all: read
     as the loop's own defaults (2.0/30/None) below, so today's
     default-levers runs still match it, exactly like the `fit_weights`
-    shim above."""
+    shim above. A stored config.json from before `pilot`/`gp_floor`
+    (spec/QIJ_pilot_floor_options_interface.md) existed carries neither
+    key: read as their own defaults ('gp'/'isotropic'), same shim."""
     os.makedirs(md, exist_ok=True)
     path = os.path.join(md, 'config.json')
     requested = json.loads(json.dumps(config))
@@ -153,7 +164,8 @@ def ensure_config(md: str, config: dict) -> None:
         # (spec/QIJ_mass_weighted_fit_spec.md 3): read as 'none', so
         # today's `fit_weights='none'` runs still match it.
         stored = dict(stored, fit_weights='none')
-    for key, default in (('z', 2.0), ('n_min', 30), ('L_max', None)):
+    for key, default in (('z', 2.0), ('n_min', 30), ('L_max', None),
+                          ('pilot', 'gp'), ('gp_floor', 'isotropic')):
         if key in requested and key not in stored:
             stored = dict(stored, **{key: default})
     # Ignore any stored key current code no longer knows (A21's own

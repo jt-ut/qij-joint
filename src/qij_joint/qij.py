@@ -96,6 +96,23 @@ in one pool batch (`core.sigma_points`, its own `'sigma'` stage, outside
 `'total'`'s audited meaning). It adds `QIJResult.sigma_interval`; every
 other product is exactly as before this option existed when it is
 False.
+
+`pilot` (spec/QIJ_pilot_floor_options_interface.md Option 1), off by
+default (`'gp'`), picks which stage-1 fit populates `psi0_all`: `'gp'`
+is today's `fit_influence_model` + `psi0`; `'affine'` is the ported
+affine pilot (`core.affine_pilot`, no bridge table/pricing -- the
+unified loop has no adjacency splits), fit per X-VQ cell from the
+cell's own point-average and a weighted-LS gradient over CONN
+neighbours. Under `'affine'` no GP is fitted: `sigma` is NaN (N, q) and
+every GP-model-derived product (`ell`/`lam`/`ell_bound`/`lam_bound`/
+`c`/`c_bound`/`prototype_h`) is NaN/False; the unified loop runs exactly
+as today with the `AffinePilot` in place of `model`, reading the same
+`constant_path`/`offset` attributes. `gp_floor` (Option 2), off by
+default (`'isotropic'`), picks the GP pilot's own declared-noise floor
+eigenbasis -- `'isotropic'` (today's, solved on the unscaled projected
+kernel eigenbasis) or `'mass'` (solved on the SAME eigenbasis the
+mass-weighted fit uses, under `fit_weights='mass'`) -- read only under
+`pilot='gp'`, passed straight to `fit_influence_model`.
 """
 from __future__ import annotations
 
@@ -190,7 +207,7 @@ def _theta_hat_task(T, case, X: np.ndarray, _task):
 def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
                   gptrend, gpwidth, M_X_source, workers, survey,
                   sv, quantized_start, fit_weights, sigma_points,
-                  z, n_min, L_max) -> QIJResult:
+                  z, n_min, L_max, pilot, gp_floor) -> QIJResult:
     """The result of a draw whose influence model could not be fitted:
     every variance and model quantity NaN, every count after stage 1
     zero, the X-VQ and prototype survey diagnostics kept. `eta_Q` and
@@ -237,6 +254,7 @@ def _failed_draw(outputs, measured, N, xvq, W_X, I_proto, counter, t_start,
         eta_full=float('nan'),
         survey_step_ratio=np.asarray(sv.step_ratio, dtype=float)[:, measured],
         quantized_start=quantized_start, fit_weights=fit_weights,
+        pilot=pilot, gp_floor=gp_floor,
         sigma_points=sigma_points,
         z=z, n_min=n_min, L_max=(xvq.M_used if L_max is None else L_max),
         **_joint_defaults(N, q), **_sigma_defaults(q),
@@ -250,7 +268,8 @@ class QIJ:
                  gptrend: str = 'affine', gpwidth: str = 'global', M_X: int = None,
                  survey: str = 'points', quantized_start: str = 'multistart',
                  sigma_points: bool = False, fit_weights: str = 'none',
-                 z: float = 2.0, n_min: int = 30, L_max: int = None) -> None:
+                 z: float = 2.0, n_min: int = 30, L_max: int = None,
+                 pilot: str = 'gp', gp_floor: str = 'isotropic') -> None:
         """`z`, `n_min`, `L_max` are the unified loop's own user-exposed
         levers (spec/QIJ_unified_loop_spec.md 0, 4.4, 5), passed straight
         to `core.joint.run_joint`. `z` (default 2.0) is the stop's
@@ -262,13 +281,27 @@ class QIJ:
         fewer splits is itself unreliable). `L_max` (default None ->
         `M_X_used`, resolved inside `run_joint`) caps the number of
         leaves; `QIJResult.L_max` always records the resolved value,
-        never None."""
+        never None.
+
+        `pilot` (spec/QIJ_pilot_floor_options_interface.md Option 1)
+        picks the stage-1 fit that fills `psi0_all`: `'gp'` (default,
+        today's `fit_influence_model`) or `'affine'` (the ported affine
+        pilot, `core.affine_pilot.fit_affine_pilot`, no GP fitted --
+        `sigma` is NaN and every GP-model-derived product is NaN/False).
+        `gp_floor` (Option 2) picks the GP pilot's declared-noise floor
+        eigenbasis -- `'isotropic'` (default, today's) or `'mass'`
+        (the mass-weighted fit's own rescaled eigenbasis) -- read only
+        under `pilot='gp'`, passed to `fit_influence_model`."""
         if not z > 0:
             raise ValueError(f'z must be > 0 (got {z})')
         if n_min < 1:
             raise ValueError(f'n_min must be >= 1 (got {n_min})')
         if L_max is not None and L_max < 2:
             raise ValueError(f'L_max must be >= 2 or None (got {L_max})')
+        if pilot not in ('gp', 'affine'):
+            raise ValueError(f"pilot must be 'gp' or 'affine' (got {pilot!r})")
+        if gp_floor not in ('isotropic', 'mass'):
+            raise ValueError(f"gp_floor must be 'isotropic' or 'mass' (got {gp_floor!r})")
         self.eps = eps
         self.seed = seed
         self.vq_transform = vq_transform
@@ -282,6 +315,8 @@ class QIJ:
         self.z = z
         self.n_min = n_min
         self.L_max = L_max
+        self.pilot = pilot
+        self.gp_floor = gp_floor
 
     def fit(self, X: np.ndarray, T, pool=None) -> QIJResult:
         """Run the method on one draw: stage 1 (X-VQ, prototype
@@ -382,10 +417,25 @@ class QIJ:
             # bin measurements that reuse one shared evaluation across
             # every output. Identity `measured` reproduces today's
             # full-width model bit for bit.
-            model, model_busy = fit_influence_model(
-                Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
-                gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool,
-                fit_weights=self.fit_weights)
+            #
+            # `pilot='affine'` (spec/QIJ_pilot_floor_options_interface.md
+            # Option 1) skips the GP entirely: `core.affine_pilot` is
+            # imported lazily, here, so the default `pilot='gp'` path
+            # never depends on that module existing. `gp_floor` (Option
+            # 2) is passed to `fit_influence_model` only when it is not
+            # today's default, so the default call stays textually
+            # unchanged -- it works whether or not that module's own
+            # `gp_floor` keyword has landed yet.
+            if self.pilot == 'affine':
+                from .core.affine_pilot import fit_affine_pilot
+                model = fit_affine_pilot(Z, xvq, I_proto[:, measured], theta_Q[measured])
+                model_busy = 0.0
+            else:
+                floor_kwargs = {} if self.gp_floor == 'isotropic' else {'gp_floor': self.gp_floor}
+                model, model_busy = fit_influence_model(
+                    Z, xvq, I_proto[:, measured], theta_Q[measured], eta,
+                    gptrend=self.gptrend, gpwidth=self.gpwidth, pool=pool,
+                    fit_weights=self.fit_weights, **floor_kwargs)
         except (RuntimeError, LinAlgError):
             # A failed stage 1 is recorded as failed, never retried; a
             # submitted `theta_future` is left uncollected and uncounted,
@@ -394,7 +444,8 @@ class QIJ:
                                  self.gptrend, self.gpwidth, M_X_source, workers,
                                  self.survey, sv, self.quantized_start,
                                  self.fit_weights, self.sigma_points,
-                                 self.z, self.n_min, self.L_max)
+                                 self.z, self.n_min, self.L_max,
+                                 self.pilot, self.gp_floor)
         # THE ARCHITECTURE RULE (spec/QIJ_mods_waves.md A20): `psi0_all`
         # is populated ONCE here, in survey units -- the GP's point
         # predictions -- and from this point on it IS the one per-point
@@ -403,8 +454,16 @@ class QIJ:
         # posterior sd) is a stored survey diagnostic only (A21's
         # architecture rule: it feeds no decision and is never carried
         # alongside psi_hat as a second vector).
-        psi0_all = _psi0(model, Z)
-        sigma_all = _uncertainty(model, Z)
+        if self.pilot == 'affine':
+            # spec/QIJ_pilot_floor_options_interface.md Option 1: no GP
+            # posterior exists under the affine pilot, so `sigma_all` is
+            # NaN (N, q) rather than a stored diagnostic.
+            from .core.affine_pilot import affine_psi0
+            psi0_all = affine_psi0(model, Z)
+            sigma_all = np.full((N, q), np.nan)
+        else:
+            psi0_all = _psi0(model, Z)
+            sigma_all = _uncertainty(model, Z)
         offset = np.asarray(model.offset, dtype=float)
         wall_time_prototype = time.perf_counter() - t0
         ev1, rows1 = counter.snapshot()
@@ -592,12 +651,23 @@ class QIJ:
         # field below is used as-is, at `model`'s own (measured) width
         # -- only the T-output arrays (`theta_hat`, `I_proto`, `c_q`,
         # `survey_step_ratio`) still need `[measured]`.
-        local = self.gpwidth == 'local'
-        ell_bound = np.zeros(q, dtype=bool) if local else model.at_bound[:, 0].copy()
-        c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
-        ell, lam = np.array(model.width), np.array(model.lam)
-        lam_bound, c_arr = model.at_bound[:, 1].copy(), np.array(model.c)
-        prototype_h = np.array(model.h)
+        if self.pilot == 'affine':
+            # spec/QIJ_pilot_floor_options_interface.md Option 1: no GP
+            # was fitted, so every GP-model-derived product is NaN/False
+            # rather than read from `model` (an `AffinePilot`, which
+            # carries none of these).
+            ell_bound = np.zeros(q, dtype=bool)
+            c_bound = np.zeros(q, dtype=bool)
+            ell, lam = np.full(q, np.nan), np.full(q, np.nan)
+            lam_bound, c_arr = np.zeros(q, dtype=bool), np.full(q, np.nan)
+            prototype_h = np.full(xvq.M_used, np.nan)
+        else:
+            local = self.gpwidth == 'local'
+            ell_bound = np.zeros(q, dtype=bool) if local else model.at_bound[:, 0].copy()
+            c_bound = model.at_bound[:, 0].copy() if local else np.zeros(q, dtype=bool)
+            ell, lam = np.array(model.width), np.array(model.lam)
+            lam_bound, c_arr = model.at_bound[:, 1].copy(), np.array(model.c)
+            prototype_h = np.array(model.h)
 
         return QIJResult(
             outputs=outputs, N=N, theta_hat=theta_hat[measured], theta_hat_full=theta_hat,
@@ -617,5 +687,6 @@ class QIJ:
             z=jr.z, n_min=jr.n_min, L_max=jr.L_max,
             quantized_start=self.quantized_start,
             fit_weights=self.fit_weights,
+            pilot=self.pilot, gp_floor=self.gp_floor,
             **second_stage_fields, **joint_fields, **sigma_fields,
         )

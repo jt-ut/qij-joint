@@ -66,6 +66,12 @@ def main(argv=None) -> None:
                         'stop may fire (default 30)')
     p.add_argument('--L-max', dest='L_max', type=int, default=None,
                    help='qij: cap on the number of leaves (default: M_X_used)')
+    p.add_argument('--pilot', choices=['gp', 'affine'], default='gp',
+                   help='qij: the stage-1 fit filling psi0_all (default gp)')
+    p.add_argument('--gp-floor', dest='gp_floor', choices=['isotropic', 'mass'],
+                   default='isotropic',
+                   help='qij: the GP pilot\'s declared-noise floor eigenbasis '
+                        '(default isotropic; read only under --pilot gp)')
     p.add_argument('--point-curvature', dest='point_curvature', action='store_true',
                     help='ijfd: real per-point central-stencil b_hat/c_q/a (spec A13, '
                          'coordinator extension); off by default (planner ruling)')
@@ -84,7 +90,8 @@ def main(argv=None) -> None:
                       gpwidth=args.gpwidth, M_X=args.M_X,
                       survey=args.survey, quantized_start=args.quantized_start,
                       sigma_points=args.sigma_points, fit_weights=args.fit_weights,
-                      z=args.z, n_min=args.n_min, L_max=args.L_max)
+                      z=args.z, n_min=args.n_min, L_max=args.L_max,
+                      pilot=args.pilot, gp_floor=args.gp_floor)
     elif args.method == 'boot':
         config['B'] = args.B
     elif args.method == 'ijfd':
@@ -122,7 +129,8 @@ def main(argv=None) -> None:
         params.update(gptrend=args.gptrend, gpwidth=args.gpwidth, M_X=args.M_X,
                       survey=args.survey, quantized_start=args.quantized_start,
                       sigma_points=args.sigma_points, fit_weights=args.fit_weights,
-                      z=args.z, n_min=args.n_min, L_max=args.L_max)
+                      z=args.z, n_min=args.n_min, L_max=args.L_max,
+                      pilot=args.pilot, gp_floor=args.gp_floor)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.eps, args.diag_draws, args.force,
@@ -130,7 +138,8 @@ def main(argv=None) -> None:
             survey=args.survey, quantized_start=args.quantized_start,
             sigma_points=args.sigma_points,
             fit_weights=args.fit_weights,
-            z=args.z, n_min=args.n_min, L_max=args.L_max, tag=tag)
+            z=args.z, n_min=args.n_min, L_max=args.L_max,
+            pilot=args.pilot, gp_floor=args.gp_floor, tag=tag)
     elif args.method == 'qijdt':
         params['eps'] = args.eps
         params['diag_draws'] = [args.diag_draws.start, args.diag_draws.stop] \

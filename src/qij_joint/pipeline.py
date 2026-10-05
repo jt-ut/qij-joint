@@ -155,7 +155,10 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
     per stage and per output, plus `survey`, `quantized_start`,
     `eta_full` (A15), the ABC interval's ingredients (`a`, `b_hat`,
     `c_q`, `c_q_one_sided`, `eta_Q`, spec/QIJ_mods_waves.md A10) and the
-    unified loop's own scalars (spec/QIJ_unified_loop_spec.md 4.4, 4.5):
+    unified loop's own scalars (spec/QIJ_unified_loop_spec.md 4.4, 4.5),
+    plus `pilot`/`gp_floor` (spec/QIJ_pilot_floor_options_interface.md,
+    both recorded as given; defaults 'gp'/'isotropic' leave every other
+    column unchanged):
     `L`, `n_splits`, `n_rounds`, `n_evals` (two per split ATTEMPT,
     successful or not), `capped`, `stop_met`, and
     the loop's own user-exposed levers `z`, `n_min`, `L_max` (`L_max`
@@ -189,7 +192,8 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, res) -> di
            'M_X': int(res.M_X), 'M_X_source': res.M_X_source, 'n_failed': int(res.n_failed),
            'survey': res.survey,
            'quantized_start': res.quantized_start, 'eta_Q': float(res.eta_Q),
-           'eta_full': float(res.eta_full)}
+           'eta_full': float(res.eta_full),
+           'pilot': res.pilot, 'gp_floor': res.gp_floor}
     for stage in ('prototype', 'full_data', 'refinement', 'curvature', 'eta_full', 'total'):
         row[f'evals_{stage}'] = int(res.evals_by_stage[stage])
         row[f'rows_{stage}'] = int(res.rows_by_stage[stage])
@@ -367,6 +371,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
             sigma_points: bool = False,
             fit_weights: str = 'none',
             z: float = 2.0, n_min: int = 30, L_max: Optional[int] = None,
+            pilot: str = 'gp', gp_floor: str = 'isotropic',
             tag: str = '') -> Tuple[int, int]:
     """`qij`: a sequential draw loop; with `workers > 1` one pool is
     created for the run and passed to every draw's fit, so only the
@@ -386,8 +391,12 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
     by default, runs the optional sigma-points interval stage after
     refinement; when True, every draw also writes the `sigma_points`
     array product. `fit_weights` (spec/QIJ_mass_weighted_fit_spec.md)
-    picks the GP pilot's own kernel-regression noise. A21
-    (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
+    picks the GP pilot's own kernel-regression noise. `pilot`
+    (spec/QIJ_pilot_floor_options_interface.md Option 1) picks the
+    stage-1 fit itself, `'gp'` (default) or `'affine'`; `gp_floor`
+    (Option 2) picks the GP pilot's declared-noise floor eigenbasis,
+    `'isotropic'` (default) or `'mass'`, read only under `pilot='gp'`.
+    A21 (spec/QIJ_mods_waves.md A21) removed `ivqbins`/`pilot`/
     `refine_schedule`/`check_rule`/`tree_rule` as both parameters and
     products, and the unified loop (spec/QIJ_unified_loop_spec.md) then
     replaced A20/A21's own growth/check second stage entirely: the
@@ -411,7 +420,8 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
                   survey=survey, quantized_start=quantized_start,
                   sigma_points=sigma_points,
                   fit_weights=fit_weights,
-                  z=z, n_min=n_min, L_max=L_max).fit(X, T, pool=pool)
+                  z=z, n_min=n_min, L_max=L_max,
+                  pilot=pilot, gp_floor=gp_floor).fit(X, T, pool=pool)
         row = _qij_row(dataset, estimator, N, s, dseed, res)
         row.update(search_audit(T, X, res.theta_hat_full, dataset, estimator))
         arrays = {'step_ratio': _qij_step_ratio(res),

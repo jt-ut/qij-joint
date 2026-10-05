@@ -98,6 +98,17 @@ the GP's per-point posterior sd: under A20/A21's architecture rule it
 is read by no decision and is carried here only as a stored survey
 diagnostic, never as a per-point companion of `psi_hat`.
 
+`pilot` (spec/QIJ_pilot_floor_options_interface.md Option 1) picks
+which stage-1 fit fills `psi0_all`: `'gp'` (the default, today's
+`fit_influence_model`) or `'affine'` (the ported affine pilot,
+`core.affine_pilot`, no GP fitted). Under `'affine'`, `sigma` is NaN
+and every GP-model-derived product (`ell`/`lam`/`ell_bound`/
+`lam_bound`/`c`/`c_bound`/`prototype_h`) is NaN/False; `offset` and
+`constant_path` still come from the pilot, with the same definitions as
+`InfluenceModel`'s own. `gp_floor` (Option 2) picks the GP pilot's own
+declared-noise floor eigenbasis -- `'isotropic'` (the default) or
+`'mass'` -- and only matters under `pilot='gp'`.
+
 `sigma_points` (spec/QIJ_sigma_points_spec.md) picks the optional
 interval stage that runs after refinement and the curvature stage, on
 the full data: `.sigma_interval(level)` from the stored `sigma_mean`/
@@ -229,6 +240,15 @@ class QIJResult:
     quantized_start: str           # 'multistart' or 'full-data' (A9 item 5)
     fit_weights: str               # 'none' or 'mass' (spec/QIJ_mass_weighted_fit_spec.md);
                                     # the GP pilot's own setting, beside gptrend/gpwidth
+    pilot: str                     # 'gp' (default) or 'affine' (spec/QIJ_pilot_floor_
+                                    # options_interface.md Option 1): which stage-1 pilot
+                                    # filled psi0_all. Under 'affine' no GP is fitted --
+                                    # sigma is NaN and every GP-model-derived product
+                                    # (ell/lam/ell_bound/lam_bound/c/c_bound/prototype_h) is
+                                    # NaN/False.
+    gp_floor: str                  # 'isotropic' (default) or 'mass' (spec/QIJ_pilot_floor_
+                                    # options_interface.md Option 2): the GP pilot's own
+                                    # declared-noise floor eigenbasis, under pilot='gp' only
     sigma_points: bool              # spec/QIJ_sigma_points_spec.md 1
     sigma_status: Optional[str]     # None under sigma_points=False; else 'ok'/
                                      # 'base_unconverged'/'eval_failed'

@@ -56,6 +56,22 @@ already was; `'none'` keeps rebuilding the kernel from c*h_design_g
 every candidate, since the cached form reorders the floating point and
 is not byte-identical to that route. Cost is reported by the existing
 `ml_wall_time` product.
+
+`gp_floor` (spec/QIJ_pilot_floor_options_interface.md option 2) picks
+the eigenbasis and declared-noise level the floor lam_floor,c is solved
+on: `'isotropic'` (default), the UNSCALED projected kernel eigenbasis
+(Lambda, V of A = (I-P) K (I-P) + tau*P) with n_c2 =
+2*eta^2*theta_Q[c]^2*median_j(1/t_j^2), exactly as before this option
+existed; or `'mass'`, which, whenever `fit_weights='mass'` has already
+built the group's rescaled eigenbasis (Lambda_t, V_t of K~ = D^-1/2 K
+D^-1/2), reads the floor off THAT basis instead -- z_t = V_t^T
+ytilde_proj[c], n_c2_t = 2*eta^2*theta_Q[c]^2*median_j(m_tilde_j/t_j^2)
+-- and skips the unscaled projection/eigh entirely (never computed for
+that group); under `fit_weights='none'` there is no rescaled basis to
+read, so `'mass'` falls back to the exact `'isotropic'` computation
+(same code path, same numbers, not merely close). `gp_floor` never
+changes the objective (`z_obj`/`Lambda_obj`) or the posterior, only
+which (z, Lambda, n_c2) `_lambda_floor` sees.
 """
 
 from __future__ import annotations
@@ -130,6 +146,7 @@ class InfluenceModel:
     gptrend: str                   # 'affine' or 'quadratic' (method_notes section 3)
     gpwidth: str                   # 'global' or 'local' (method_notes section 3)
     fit_weights: str               # 'none' or 'mass' (spec/QIJ_mass_weighted_fit_spec.md)
+    gp_floor: str                  # 'isotropic' or 'mass' (spec/QIJ_pilot_floor_options_interface.md option 2)
     alpha: List[np.ndarray]        # per coordinate, (M_c,) GP weights on the kernel term; length 0 on the constant path
     beta: List[np.ndarray]         # per coordinate, (m_c,) mean-basis coefficients; length 0 on the constant path
     centers: List[np.ndarray]      # per coordinate, (M_c, d_z) whitened positions of that coordinate's finite prototypes
@@ -490,6 +507,7 @@ def _width_grid_candidate(
     d_z: int, W_g: np.ndarray, tau_g: float, M_minus_m: int,
     cols_g: Sequence[int], psi_proj: Dict[int, np.ndarray], n_c2_g: Dict[int, float],
     fit_weights: str, mass_ctx: Optional[_MassContext],
+    gp_floor: str = 'isotropic', n_c2_floor_g: Optional[Dict[int, float]] = None,
 ) -> Tuple[dict, float]:
     """
     One width/c-grid candidate's outer objective (method_notes section
@@ -504,12 +522,20 @@ def _width_grid_candidate(
     lam_c against A_c = K + lam_c*diag(1/m_tilde_j) by the symmetric
     rescaling K~ = D^-1/2 K D^-1/2: ONE extra `eigh`, of K~'s own
     projected form (`mass_ctx`, built once per group), shared by every
-    lam_c and every coordinate exactly as the (always-computed) floor
-    eigh already is -- never a per-coordinate or per-lambda
-    factorization. The declared-noise floor (`_lambda_floor`) is
-    unaffected by the mass weighting and always reads the UNSCALED floor
-    eigenbasis, both routes alike. `mass_ctx` is None under
-    `fit_weights='none'`.
+    lam_c and every coordinate exactly as the floor eigh already is --
+    never a per-coordinate or per-lambda factorization.
+
+    `gp_floor` (spec/QIJ_pilot_floor_options_interface.md option 2)
+    picks which eigenbasis/declared-noise pair `_lambda_floor` reads.
+    Under `gp_floor='isotropic'` (default) the floor always reads the
+    UNSCALED projected eigenbasis (Lambda, V) and `n_c2_g`, exactly as
+    before this option existed. Under `gp_floor='mass'` AND
+    `fit_weights='mass'` the floor instead reads the SAME rescaled
+    eigenbasis (Lambda_t, V_t) and `n_c2_floor_g` the objective already
+    uses -- and the unscaled projected eigh (Lambda, V) is never built
+    for this group, since nothing else needs it. Under `gp_floor='mass'`
+    with `fit_weights='none'` there is no rescaled basis (`mass_ctx` is
+    None): the floor falls back to the exact `'isotropic'` computation.
     """
     t0 = time.perf_counter()
     param = math.exp(log_param)
@@ -526,16 +552,21 @@ def _width_grid_candidate(
         s = (_SQRT3 / param) * mass_ctx.rscaled
         K = mass_ctx.pref * _kappa(s)
 
-    # The floor eigenbasis (always unscaled K/W_g/tau_g, spec section 5
-    # Q&A: the declared-noise floor does not change under 'mass').
-    C = W_g.T @ K                      # (m_g, M_g)
-    E = C @ W_g                        # (m_g, m_g)
-    E[np.diag_indices_from(E)] += tau_g
-    WC = W_g @ C                       # (M_g, M_g)
-    A = K - WC - WC.T + W_g @ (E @ W_g.T)
-    Lambda, V = np.linalg.eigh(A)
-    Lambda = np.maximum(Lambda[:M_minus_m], 0.0)
-    V = V[:, :M_minus_m]
+    # The unscaled projected eigenbasis (today's floor eigenbasis under
+    # `gp_floor='isotropic'`, spec/QIJ_pilot_floor_options_interface.md
+    # option 2): skipped entirely when `gp_floor='mass'` has its own
+    # rescaled basis to read instead (fit_weights='mass' below) -- the
+    # ONLY combination where this eigh buys nothing.
+    skip_unscaled_floor = (fit_weights == 'mass' and gp_floor == 'mass')
+    if not skip_unscaled_floor:
+        C = W_g.T @ K                      # (m_g, M_g)
+        E = C @ W_g                        # (m_g, m_g)
+        E[np.diag_indices_from(E)] += tau_g
+        WC = W_g @ C                       # (M_g, M_g)
+        A = K - WC - WC.T + W_g @ (E @ W_g.T)
+        Lambda, V = np.linalg.eigh(A)
+        Lambda = np.maximum(Lambda[:M_minus_m], 0.0)
+        V = V[:, :M_minus_m]
 
     if fit_weights == 'mass':
         dhalf, W_t, tau_t = mass_ctx.dhalf, mass_ctx.W_t, mass_ctx.tau_t
@@ -552,16 +583,27 @@ def _width_grid_candidate(
     per_c: Dict[int, dict] = {}
     total_nll = 0.0
     for c in cols_g:
-        z = V.T @ psi_proj[c]
+        # The floor's own (z, Lambda, n_c2): the unscaled projection
+        # under `gp_floor='isotropic'`, or whenever `fit_weights='none'`
+        # leaves no rescaled basis to read (spec/
+        # QIJ_pilot_floor_options_interface.md option 2); the SAME
+        # rescaled basis/declared-noise the objective uses when both
+        # `gp_floor` and `fit_weights` are `'mass'`.
+        if skip_unscaled_floor:
+            z_floor = V_t.T @ mass_ctx.ytilde_proj[c]
+            Lambda_floor = Lambda_t
+            n_c2_floor_c = n_c2_floor_g[c]
+        else:
+            z_floor = V.T @ psi_proj[c]
+            Lambda_floor = Lambda
+            n_c2_floor_c = n_c2_g[c]
 
-        # lam_c is bounded below by lam_floor,c at THIS candidate width
-        # (spec/QIJ_mass_weighted_fit_spec.md 2: computed from the
-        # isotropic projection regardless of `fit_weights`).
-        lam_floor_c = _lambda_floor(z, Lambda, M_minus_m, n_c2_g[c])
+        # lam_c is bounded below by lam_floor,c at THIS candidate width.
+        lam_floor_c = _lambda_floor(z_floor, Lambda_floor, M_minus_m, n_c2_floor_c)
         lo_bound = max(math.log(lam_floor_c), _LOG_LAM_LO)
 
         if fit_weights == 'none':
-            z_obj, Lambda_obj = z, Lambda
+            z_obj, Lambda_obj = z_floor, Lambda_floor
         else:
             z_obj, Lambda_obj = V_t.T @ mass_ctx.ytilde_proj[c], Lambda_t
 
@@ -602,7 +644,7 @@ def _grid_task(T, case, X, task):
 def fit_influence_model(
     Z: np.ndarray, xvq, I_proto: np.ndarray, theta_Q: np.ndarray, eta: float,
     gptrend: str = 'affine', gpwidth: str = 'global', pool=None,
-    fit_weights: str = 'none',
+    fit_weights: str = 'none', gp_floor: str = 'isotropic',
 ) -> Tuple[InfluenceModel, float]:
     """
     The initial influence estimate for every estimand coordinate
@@ -624,6 +666,15 @@ def fit_influence_model(
     `bin_posterior_variance`), by the symmetric rescaling K~_c =
     D^-1/2 K_c D^-1/2 (section 2): the group's own shared-eigendecomposition
     route serves both, on K~_c in place of K_c.
+
+    `gp_floor` (spec/QIJ_pilot_floor_options_interface.md option 2)
+    picks the eigenbasis/declared-noise pair the floor lam_floor,c is
+    solved on: `'isotropic'` (default), the unscaled projected kernel
+    eigenbasis, byte-identical to before this option existed; or
+    `'mass'`, the SAME rescaled eigenbasis (and mass-referred declared
+    noise) the objective already uses under `fit_weights='mass'` --
+    exactly `'isotropic'` when `fit_weights='none'` (no rescaled basis
+    exists to read).
 
     A prototype whose evaluation failed for coordinate c is a missing
     response: coordinate c's design is exactly the prototypes where
@@ -648,6 +699,8 @@ def fit_influence_model(
     """
     if fit_weights not in ('none', 'mass'):
         raise ValueError(f"unknown fit_weights {fit_weights!r}")
+    if gp_floor not in ('isotropic', 'mass'):
+        raise ValueError(f"unknown gp_floor {gp_floor!r}")
     p = np.asarray(xvq.p, dtype=float)
     I_proto = np.asarray(I_proto, dtype=float)
     theta_Q = np.asarray(theta_Q, dtype=float)
@@ -764,9 +817,12 @@ def fit_influence_model(
         grid_log_param = np.linspace(math.log(param_min), math.log(param_max), _N_WIDTH_GRID)
 
         # Q/W_g/tau_g project out the UNSCALED mean basis (method_notes
-        # section 3); the declared-noise floor always reads this
-        # projection, both `fit_weights` routes alike (spec/
-        # QIJ_mass_weighted_fit_spec.md 5).
+        # section 3); the declared-noise floor reads this projection
+        # under `gp_floor='isotropic'` (default, both `fit_weights`
+        # routes alike, spec/QIJ_mass_weighted_fit_spec.md 5) or under
+        # `gp_floor='mass'` with `fit_weights='none'` (no rescaled basis
+        # to read instead, spec/QIJ_pilot_floor_options_interface.md
+        # option 2).
         Q, W_g, tau_g = _basis_projection(Hb_g, M_g)
         M_minus_m = M_g - m_g
         psi_proj = {c: Q @ (Q.T @ I_proto[idx_g, c]) for c in cols_g}
@@ -805,13 +861,27 @@ def fit_influence_model(
                                      ytilde_proj=ytilde_proj_g, logdet_D=logdet_D_g,
                                      pref=pref_g, rscaled=rscaled_g)
 
+        # n_c^2_t = 2*eta^2*theta_Q,c^2*median_j(m_tilde_j/t_j^2), the
+        # floor's declared noise referred to the rescaled problem (spec/
+        # QIJ_pilot_floor_options_interface.md option 2); only built
+        # (and only read by `_width_grid_candidate`) under
+        # `gp_floor='mass'` AND `fit_weights='mass'` -- m_tilde_j is the
+        # SAME normalized mass as `fit_weights='mass'` own noise model.
+        n_c2_floor_g = None
+        if gp_floor == 'mass' and mass_ctx is not None:
+            mtilde_g = p_g / np.mean(p_g)
+            mtilde_over_t2_median_g = float(np.median(mtilde_g / t_g ** 2))
+            n_c2_floor_g = {c: 2.0 * eta ** 2 * float(theta_Q[c]) ** 2 * mtilde_over_t2_median_g
+                             for c in cols_g}
+
         gi = len(group_ctx)
         group_ctx.append((idx_g, M_g, centers_g, m_g, Hb_g, D_full_g, h_design_g,
                            param_min, param_max, grid_log_param, W_g, tau_g, M_minus_m,
-                           cols_g, psi_proj, n_c2_g, mass_ctx))
+                           cols_g, psi_proj, n_c2_g, mass_ctx, n_c2_floor_g))
         for lp in grid_log_param:
             tasks.append((float(lp), gpwidth, D_full_g, h_design_g, d_z, W_g, tau_g,
-                          M_minus_m, cols_g, psi_proj, n_c2_g, fit_weights, mass_ctx))
+                          M_minus_m, cols_g, psi_proj, n_c2_g, fit_weights, mass_ctx,
+                          gp_floor, n_c2_floor_g))
             task_group.append(gi)
 
     # Every group's five grid candidates -- independent of each other
@@ -840,17 +910,18 @@ def fit_influence_model(
     # profiled restricted NLLs.
     for gi, (idx_g, M_g, centers_g, m_g, Hb_g, D_full_g, h_design_g, param_min, param_max,
              grid_log_param, W_g, tau_g, M_minus_m, cols_g, psi_proj, n_c2_g,
-             mass_ctx) in enumerate(group_ctx):
+             mass_ctx, n_c2_floor_g) in enumerate(group_ctx):
         t_shared0 = time.perf_counter()
         trace = traces[gi]
 
         def outer_obj(log_param: float, _trace=trace, _cols_g=cols_g,
                        _psi_proj=psi_proj, _W=W_g, _tau=tau_g, _M_minus_m=M_minus_m,
                        _n_c2=n_c2_g, _gpwidth=gpwidth, _D=D_full_g, _h=h_design_g,
-                       _dz=d_z, _fit_weights=fit_weights, _mass_ctx=mass_ctx) -> float:
+                       _dz=d_z, _fit_weights=fit_weights, _mass_ctx=mass_ctx,
+                       _gp_floor=gp_floor, _n_c2_floor=n_c2_floor_g) -> float:
             entry, _wall = _width_grid_candidate(
                 log_param, _gpwidth, _D, _h, _dz, _W, _tau, _M_minus_m, _cols_g, _psi_proj, _n_c2,
-                _fit_weights, _mass_ctx)
+                _fit_weights, _mass_ctx, _gp_floor, _n_c2_floor)
             _trace.append(entry)
             return entry['nll']
 
@@ -980,6 +1051,7 @@ def fit_influence_model(
         gptrend=gptrend,
         gpwidth=gpwidth,
         fit_weights=fit_weights,
+        gp_floor=gp_floor,
         alpha=alpha,
         beta=beta,
         centers=centers,

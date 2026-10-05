@@ -390,6 +390,11 @@ def run_joint(
     }
     closed: set = set()
 
+    # Per-leaf cut cache (performance only, below): `two_means_split`'s
+    # cut, G_l, and the noise floor, keyed by leaf id -- see the walk's
+    # own comment at ~465 for why these are safe to memoize.
+    cut_cache: Dict[int, dict] = {}
+
     n_update_scale = np.zeros(q, dtype=int)
     n_update_shift = np.zeros(q, dtype=int)
     n_update_negative = np.zeros(q, dtype=int)
@@ -468,55 +473,80 @@ def run_joint(
         # `calibrate.round_prefix`'s own input array. A judgement call
         # (spec silent on the exact walk order): every open, non-closed
         # leaf is evaluated this way every round, not just a prefix cut
-        # short once the running sum reaches the excess -- recomputing
-        # an unused cut next round is cheap and this keeps the pass
-        # simple and unambiguous; `round_prefix` still sizes the round
-        # to the smallest prefix of SURVIVORS.
+        # short once the running sum reaches the excess -- `round_prefix`
+        # still sizes the round to the smallest prefix of SURVIVORS.
+        #
+        # Performance only (bit-identical output): the cut
+        # (`two_means_split`), G_l, and the floor are cached by leaf id
+        # in `cut_cache`, computed once per leaf and reused on every
+        # later round until that leaf is split or closed. They depend
+        # only on `idx` (the leaf's own point indices, fixed from the
+        # leaf's creation until it is split), `psi_hat[idx]` (THE
+        # ARCHITECTURE RULE's single state vector, but `_apply_update`
+        # only ever rewrites the indices of whichever leaf is actually
+        # split that round -- a leaf's own points are disjoint from
+        # every other leaf's by construction, so an unsplit leaf's
+        # rows never move), and the run-level constants `std0`/`eta`/
+        # `theta_abs`/`delta` (fixed before the loop, never reassigned)
+        # -- nothing round-dependent. `kappa` (and the binding output
+        # c*) IS round-dependent (`calibrate.kappa_hat` over every
+        # split made so far) and stays OUTSIDE the cache: `expected_
+        # gain = G_l*kappa` and its floor comparison are recomputed
+        # fresh every round from the cached G_l/floor, cheap relative
+        # to the cut/G_l computation they replace. A cache entry is
+        # dropped when its leaf closes (the infeasible-cut case never
+        # creates one: `closed` already keeps it from being walked
+        # again) or splits (popped below, with the leaf itself).
         survivors: list = []
         for j in order:
             k = cand_ids[j]
             leaf = leaves[k]
-            idx = leaf['indices']
-            cut = two_means_split(psi_hat[idx] / std0)
-            if cut is None:
+            cached = cut_cache.get(k)
+            if cached is None:
+                idx = leaf['indices']
+                cut = two_means_split(psi_hat[idx] / std0)
+                if cut is None:
+                    closed.add(k)
+                    continue
+                idx_a, idx_b = idx[cut[0]], idx[cut[1]]
+                if idx_a.size <= idx_b.size:
+                    idx_small, idx_large = idx_a, idx_b
+                else:
+                    idx_small, idx_large = idx_b, idx_a
+                n_small, n_large = int(idx_small.size), int(idx_large.size)
+                p_small, p_large = n_small / N, n_large / N
+                U_small_pred = psi_hat[idx_small].mean(axis=0)
+                U_large_pred = psi_hat[idx_large].mean(axis=0)
+                U_k = leaf['U']
+                G_l = (n_small * (U_small_pred - U_k) ** 2
+                       + n_large * (U_large_pred - U_k) ** 2) / N ** 2
+                t_small = step_parameter(delta, p_small)
+                t_large = step_parameter(delta, p_large)
+                delta_U_small = eta * theta_abs / t_small
+                # n_Delta/b_Delta (spec 4.1, "the noise floor for closing";
+                # the measured-check spec's terms, spec/
+                # QIJ_joint_check_measured_spec.md section 4 -- "as today",
+                # spec section 5): evaluated here PRE-measurement, so
+                # U_small/U_large are the predicted (psi_hat) values, the
+                # same substitution G_l already makes; delta_U at the small
+                # child's own step (another judgement call, spec silent on
+                # which step feeds a priori floor terms).
+                n_delta = ((2.0 * p_small / N) * (np.abs(U_small_pred) + np.abs(U_large_pred))
+                           * delta_U_small)
+                b_delta = (p_small / N) * (1.0 + p_small / p_large) * delta_U_small ** 2
+                floor = n_delta + b_delta
+                cached = dict(
+                    idx_small=idx_small, idx_large=idx_large, n_small=n_small, n_large=n_large,
+                    p_small=p_small, p_large=p_large, t_small=t_small, t_large=t_large,
+                    U_small_pred=U_small_pred, U_large_pred=U_large_pred, G_l=G_l, floor=floor,
+                )
+                cut_cache[k] = cached
+            expected_gain = cached['G_l'] * kappa
+            if np.all(expected_gain < cached['floor']):
                 closed.add(k)
+                cut_cache.pop(k, None)
                 continue
-            idx_a, idx_b = idx[cut[0]], idx[cut[1]]
-            if idx_a.size <= idx_b.size:
-                idx_small, idx_large = idx_a, idx_b
-            else:
-                idx_small, idx_large = idx_b, idx_a
-            n_small, n_large = int(idx_small.size), int(idx_large.size)
-            p_small, p_large = n_small / N, n_large / N
-            U_small_pred = psi_hat[idx_small].mean(axis=0)
-            U_large_pred = psi_hat[idx_large].mean(axis=0)
-            U_k = leaf['U']
-            G_l = (n_small * (U_small_pred - U_k) ** 2
-                   + n_large * (U_large_pred - U_k) ** 2) / N ** 2
-            t_small = step_parameter(delta, p_small)
-            t_large = step_parameter(delta, p_large)
-            delta_U_small = eta * theta_abs / t_small
-            # n_Delta/b_Delta (spec 4.1, "the noise floor for closing";
-            # the measured-check spec's terms, spec/
-            # QIJ_joint_check_measured_spec.md section 4 -- "as today",
-            # spec section 5): evaluated here PRE-measurement, so
-            # U_small/U_large are the predicted (psi_hat) values, the
-            # same substitution G_l already makes; delta_U at the small
-            # child's own step (another judgement call, spec silent on
-            # which step feeds a priori floor terms).
-            n_delta = ((2.0 * p_small / N) * (np.abs(U_small_pred) + np.abs(U_large_pred))
-                       * delta_U_small)
-            b_delta = (p_small / N) * (1.0 + p_small / p_large) * delta_U_small ** 2
-            floor = n_delta + b_delta
-            expected_gain = G_l * kappa
-            if np.all(expected_gain < floor):
-                closed.add(k)
-                continue
-            survivors.append((k, float(expected_gain[c_star]), dict(
-                idx_small=idx_small, idx_large=idx_large, n_small=n_small, n_large=n_large,
-                p_small=p_small, p_large=p_large, t_small=t_small, t_large=t_large,
-                U_small_pred=U_small_pred, U_large_pred=U_large_pred, G_l=G_l, floor=floor,
-            )))
+            survivors.append((k, float(expected_gain[c_star]), cached))
 
         if not survivors:
             break  # every candidate closed: nothing splittable remains
@@ -566,6 +596,7 @@ def run_joint(
             _, _, val_minus, failed_m, _ = raw_results[2 * i + 1]
             if failed_p or failed_m:
                 closed.add(leaf_id)  # cancelled: the parent stays as a final bin, closed
+                cut_cache.pop(leaf_id, None)
                 continue
             t_small = info['t_small']
             t_large = info['t_large']
@@ -580,6 +611,7 @@ def run_joint(
             U_small = U_small_full[measured]
 
             leaf = leaves.pop(leaf_id)
+            cut_cache.pop(leaf_id, None)
             U_k = leaf['U']
             p_parent = leaf['n'] / N
             U_large = (p_parent * U_k - p_small * U_small) / p_large
