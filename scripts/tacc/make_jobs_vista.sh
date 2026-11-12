@@ -37,9 +37,10 @@ HEAD=$(cd "$CLONE" && git rev-parse --short=12 HEAD)
 mkdir -p "$JOBS" "$LOGS"
 : > "$JOBS/batches.txt"
 
-# job NAME WALL RUNS_DIR "<one run.py command line per element, without the python and the script path>"...
+# job NAME WALL RUNS_DIR DEST_DIR "<one run.py command line per element, without the python and the script path>"...
+# RUNS_DIR is where the draws are written (scratch); DEST_DIR is where the job rsyncs them when it ends (work).
 job() {
-    local name=$1 wall=$2 runs=$3; shift 3
+    local name=$1 wall=$2 runs=$3 dest=$4; shift 4
     local body=""
     for line in "$@"; do
         # a line is "<dataset> <estimator> <method> [extra flags]"; the draws are fanned out per core
@@ -71,8 +72,8 @@ python -c "import qij_joint, sys; f = qij_joint.__file__; print('qij_joint from'
 mkdir -p $runs
 echo "=== \$(date '+%F %T') $name at $COMMIT on \$(hostname), $CORES draws at a time"
 $body
-echo "=== runs done \$(date '+%F %T'); syncing to $PROJ/runs"
-mkdir -p $PROJ/runs && rsync -a $runs/ $PROJ/runs/ && echo "=== synced \$(date '+%F %T')"
+echo "=== runs done \$(date '+%F %T'); syncing to $dest"
+mkdir -p $dest && rsync -a $runs/ $dest/ && echo "=== synced \$(date '+%F %T')"
 rm -rf \$STAGE
 EOF
     chmod +x "$JOBS/$name.sh"; echo "$name" >> "$JOBS/batches.txt"
@@ -86,22 +87,22 @@ smoke)
     for c in "cloudfil_u p1" "mvt all" "fp all" "imf all" "pareto all"; do
         lines+=("$c oracle" "$c ij" "$c boot --B 50" "$c qij --eps 0.1")
     done
-    job smoke 00:30:00 "$SCR/smoke/runs" "${lines[@]}"
+    job smoke 00:30:00 "$SCR/smoke/runs" "$PROJ/smoke/runs" "${lines[@]}"     # never into the tree
     ;;
 refs)
     for ds in mvt fp imf pareto; do
-        job "ref_${ds}_oracle_ij" 01:00:00 "$SCR/runs" "$ds all oracle" "$ds all ij"
+        job "ref_${ds}_oracle_ij" 01:00:00 "$SCR/runs" "$PROJ/runs" "$ds all oracle" "$ds all ij"
         wall=02:00:00; [ "$ds" = imf ] && wall=06:00:00      # imf's refit is an optimizer: 5e6 refits per 1000 draws
-        job "ref_${ds}_boot" "$wall" "$SCR/runs" "$ds all boot --B 5000"
+        job "ref_${ds}_boot" "$wall" "$SCR/runs" "$PROJ/runs" "$ds all boot --B 5000"
     done
     ;;
 qij)
     for eps in $EPS_ALL; do
-        job "qij_cloudfil_u_p1_eps${eps:0:6}" 03:00:00 "$SCR/runs" "cloudfil_u p1 qij --eps $eps"
+        job "qij_cloudfil_u_p1_eps${eps:0:6}" 03:00:00 "$SCR/runs" "$PROJ/runs" "cloudfil_u p1 qij --eps $eps"
     done
     for ds in mvt fp imf pareto; do
         lines=(); for eps in $EPS_ALL; do lines+=("$ds all qij --eps $eps"); done
-        job "qij_${ds}_all" 04:00:00 "$SCR/runs" "${lines[@]}"
+        job "qij_${ds}_all" 04:00:00 "$SCR/runs" "$PROJ/runs" "${lines[@]}"
     done
     ;;
 *) echo "unknown job set $SET"; exit 1 ;;
