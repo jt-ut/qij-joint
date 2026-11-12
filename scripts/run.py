@@ -49,12 +49,14 @@ def main(argv=None) -> None:
     p.add_argument('--level', type=float, default=0.84, help='qij: the test\'s level')
     p.add_argument('--M', type=int, default=None,
                    help='qij: pilot size (default: the budget rule M(eps) = 3 (kappa_r / eps)^(r/2), r = min(d, q))')
+    p.add_argument('--k', type=int, default=None,
+                   help='qij: the cap on splits per round (default: --workers, the number of jobs the evaluations run on)')
     args = p.parse_args(argv)
 
     config = dict(method=args.method, dataset=args.dataset, estimator=args.estimator,
                   N=args.N, seed=args.seed, code_commit=products.code_commit())
     if args.method == 'qij':
-        config.update(eps=args.eps, level=args.level, M=args.M)
+        config.update(eps=args.eps, level=args.level, M=args.M, k=args.k, workers=args.workers)
     elif args.method == 'boot':
         config['B'] = args.B
 
@@ -84,11 +86,11 @@ def main(argv=None) -> None:
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, args.workers, args.B, args.force, tag=tag)
     else:
-        params.update(eps=args.eps, level=args.level, M=args.M)
+        params.update(eps=args.eps, level=args.level, M=args.M, k=args.k)
         written, skipped = pipeline.run_qij(
             args.dataset, args.estimator, args.N, args.draws, args.seed,
             args.out, eps=args.eps, level=args.level, M=args.M,
-            workers=args.workers, tag=tag, force=args.force)
+            workers=args.workers, tag=tag, force=args.force, k=args.k)
 
     products.append_log(md, sys.argv, params, written, skipped)
     products.write_manifest(md)

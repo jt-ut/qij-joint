@@ -57,6 +57,11 @@ def dir_tag(method: str, config: dict) -> str:
             tag += f"_level{_num(config['level'])}"
         if config.get('M') is not None:
             tag += f"_M{int(config['M'])}"
+        # k, the cap on splits per round, defaults to the number of workers the evaluations run on (the author's rule,
+        # 2026-11-12); the folder name carries the value that applies, so two runs with different k never share a folder
+        k_eff = config.get('k') if config.get('k') is not None else config.get('workers')
+        if k_eff is not None:
+            tag += f"_k{int(k_eff)}"
         return tag
     if method == 'boot':
         return f"B{int(config['B'])}"

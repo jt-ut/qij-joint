@@ -195,7 +195,7 @@ def _qij_row(dataset: str, estimator: str, N: int, s: int, seed: int, eps: float
 def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: int,
             out_dir: str, eps: float = 0.01, level: float = 0.84, M: Optional[int] = None,
             workers: Optional[int] = None, tag: Optional[str] = None,
-            force: bool = False) -> Tuple[int, int]:
+            force: bool = False, k: Optional[int] = None) -> Tuple[int, int]:
     """`qij`: a sequential draw loop through the ported method
     (`qij_joint.method.run`, spec/METHOD_qij.md); one persistent pool for
     the run, built as `run_boot` builds its own (`workers=None` -> 1, in
@@ -218,7 +218,7 @@ def run_qij(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: in
         dseed = seed + s
         X = case.draw(N, dseed)
         t0 = time.perf_counter()
-        res = run_method(T, X, eps=eps, level=level, M=M, pool=pool, seed=dseed, vq_transform=case.vq_transform)
+        res = run_method(T, X, eps=eps, level=level, M=M, k=k, pool=pool, seed=dseed, vq_transform=case.vq_transform)
         wall = time.perf_counter() - t0
         row = _qij_row(dataset, estimator, N, s, dseed, eps, level, res, wall, workers)
         arrays = {'rounds': pd.DataFrame([_per_output(r, res.outputs) for r in res.rounds_table]),

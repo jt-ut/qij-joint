@@ -86,20 +86,88 @@ class Interpolant:
         for s, c in zip(self.start, self.chunks): out += x[s:s + len(c)] @ c[:, idx]
         return out
 
+    # ---- the redundancy rule in the kernel's metric ----
+    # A row whose kernel column lies (nearly) in the span of the active rows' kernel columns adds no constraint the interpolant
+    # can hold: the fit would carry it on the jitter, alpha would grow as 1 / (its Schur complement), and with values known only
+    # to the step term the reproduction fails (fp, 2026-11-12: 2-3-point leaves, |alpha| 2e5, residual = jit x alpha). Such a
+    # row is kept as a measurement, not a constraint, exactly as core/span.py keeps a row dependent in the weights. The test:
+    # s = G_rr - g' H g, the row's Schur complement against the rows of the last fit (less the rows that are leaving) and the
+    # rows accepted earlier in the same batch; redundant when s <= KERNEL_TOL G_rr (the span rule's relative form) or
+    # s <= 100 jit (within two orders of the jitter: the jitter, not the data, would be holding the row).
+    KERNEL_TOL = 1e-8
+
+    def begin_batch(self):
+        """Start a batch of candidate rows (called by the method whenever its rows may change between two fits)."""
+        self._cache = {}; self._leave = []; self._bids = []; self._bU = np.zeros((len(self.ids), 0)); self._bL = np.zeros((0, 0))
+        self._H_leave = None
+
+    def leaving(self, rid):
+        """Register a row of the last fit that leaves before the next fit (a split parent, a repaired leaf's old row). Every
+        leaving row of a batch is registered before the batch's first candidate: the batch's Schur-complement factor is built
+        against the inverse without the leaving rows, and a row leaving later would make it stale."""
+        if not hasattr(self, '_cache'): self.begin_batch()
+        if self.P0 is None or rid not in self.ids: return
+        assert not self._bids, 'a row leaves after candidates were accepted in this batch: register the leaving rows first'
+        pos = self.ids.index(rid)
+        if pos not in self._leave: self._leave.append(pos); self._H_leave = None
+
+    def kernel_test(self, rid, idx, w, A_fit, combo=None):
+        """Test the candidate row (idx, w) in the kernel's metric and cache its column for the next fit. combo = (ids, coefs)
+        when the row is that combination of stored or batch-cached rows (its column is formed from theirs); else the column is
+        computed from the points. A_fit: the CSR of the rows of the last fit, in their order. Returns (redundant, rel) with
+        rel = s / G_rr."""
+        if not hasattr(self, '_cache'): self.begin_batch()
+        idx = np.asarray(idx, np.int64); w = np.asarray(w, float)
+        if combo is not None:
+            c = np.zeros(self.N)
+            for j, coef in zip(*combo):
+                c += coef * (self._cache[j] if j in self._cache else self.col(self.ids.index(j)))
+        else:
+            Arow = sp.csr_matrix((w, idx, np.array([0, len(idx)])), shape=(1, self.N)); c = np.empty((1, self.N)); self.columns(Arow, c); c = c[0]
+        G_rr = float(w @ c[idx])
+        if self.P0 is None:                                  # before the first fit (the pilot rows): nothing to test against
+            self._cache[rid] = c; return False, 1.0
+        g = np.asarray(A_fit @ c, float)
+        if self._leave:                                      # the rows that leave: their border entries are dropped, and the
+            L = np.asarray(self._leave, int); g[L] = 0.0     # inverse without them is H' = H - H_L (H_LL)^-1 H_L'
+        x = self.solve(g); s = G_rr - float(g @ x)
+        if self._leave:
+            if self._H_leave is None:
+                HL = self.inverse_columns(L); self._H_leave = (HL, HL[L])
+            HL, HLL = self._H_leave
+            v = x[L]; s += float(v @ np.linalg.solve(HLL, v))
+            xb = HL @ np.linalg.solve(HLL, v)                # H g - H' g, needed for the batch cross terms
+        else: xb = np.zeros_like(x)
+        if self._bids:                                       # the rows accepted earlier in this batch: Schur complement of the batch block
+            C = np.array([float(w @ self._cache[j][idx]) for j in self._bids])
+            u = C - self._bU.T @ (x - xb)
+            z = sl.solve_triangular(self._bL, u, lower=True, check_finite=False); s -= float(z @ z)
+        else: u = np.zeros(0); z = np.zeros(0)
+        rel = s / G_rr if G_rr > 0 else 0.0
+        if s <= self.KERNEL_TOL * G_rr or s <= 100.0 * self.jit:
+            return True, rel
+        self._cache[rid] = c                                 # accepted: extend the batch's Schur-complement factor
+        b = len(self._bids); Lb = np.zeros((b + 1, b + 1)); Lb[:b, :b] = self._bL; Lb[b, :b] = z; Lb[b, b] = np.sqrt(max(s, 1e-300))
+        self._bL = Lb; self._bU = np.column_stack([self._bU, g]) if b else g[:, None]; self._bids.append(rid)
+        return False, rel
+
     # ---- the fit ----
     def fit(self, ids, A, y, combos):
         """Fit psi-hat through the rows ids (the method's row order; A: their CSR, y: (m, J)). Against the previous fit, a position
         whose id changed or that is new gets a new column; combos {id: (ids_j, coefs_j)} gives the rows that are the combination
-        sum_j coefs_j row_j of other rows. Returns psi-hat (N, J)."""
+        sum_j coefs_j row_j of other rows. A column cached by `kernel_test` is used as it is. Returns psi-hat (N, J)."""
         m = len(ids); m0 = len(self.ids); assert m >= m0
+        cache = getattr(self, '_cache', {})
         new = [r for r in range(m) if r >= m0 or ids[r] != self.ids[r]]
         stored = {i: r for r, i in enumerate(self.ids)}; at = {ids[r]: r for r in new}
-        comb = [r for r in new if ids[r] in combos]; part = np.zeros((len(comb), self.N))
+        cached = [r for r in new if ids[r] in cache]
+        comb = [r for r in new if ids[r] in combos and ids[r] not in cache]; part = np.zeros((len(comb), self.N))
         for c, r in enumerate(comb):                         # the stored part of every combination, before its positions are overwritten
             for j, w in zip(*combos[ids[r]]):
                 if j not in at: part[c] += w * self.col(stored[j])
         if m > m0: self.chunks.append(np.empty((m - m0, self.N))); self.start.append(m0)
-        direct = [r for r in new if ids[r] not in combos]
+        for r in cached: self.col(r)[:] = cache[ids[r]]
+        direct = [r for r in new if ids[r] not in combos and ids[r] not in cache]
         app = [r for r in direct if r >= m0]; inpl = [r for r in direct if r < m0]
         if app:
             if app == list(range(m0, m)): self.columns(A[app], self.chunks[-1])
@@ -110,12 +178,13 @@ class Interpolant:
             for c, r in enumerate(inpl): self.col(r)[:] = tmp[c]
         for c, r in enumerate(comb):
             for j, w in zip(*combos[ids[r]]):
-                if j in at: assert ids[at[j]] not in combos; part[c] += w * self.col(at[j])
+                if j in at: assert ids[at[j]] not in combos or ids[at[j]] in cache; part[c] += w * self.col(at[j])
             self.col(r)[:] = part[c]
         Bd = np.empty((m, len(new)))                         # the border of the new positions: G[:, new] = A c_new
         for c, r in enumerate(new): Bd[:, c] = A @ self.col(r)
         self._factor(m, new, Bd)
         self.ids = list(ids)
+        self.begin_batch()
         alpha = self.solve(y); psi = self.dot_T(alpha); tol = 1e-8 * max(1.0, float(np.abs(y).max()))
         res = y - A @ psi
         if np.abs(res).max() > tol:                          # rounding of the jittered solve: one refinement step

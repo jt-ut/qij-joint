@@ -251,6 +251,43 @@ submission on an explicit go). V6 rsync back into the canonical tree; summaries;
 - [ ] 5 canonical-draw export + stage 1 figures + stage 2 strip
 - [ ] 6 slide text
 - [x] runs/ delete-now set removed (50 → 16 GB, 2026-11-12)
-- [ ] canonical tree: approval, manifests in products.method_dir, references moved with provenance read from their runs.log
-- [ ] Vista: push main (author's word), venv, clone, submit scripts; reference runs for the four paper datasets; qij studies for five cases
+- [x] canonical tree (approved "ok go", 2026-11-12): products.method_dir writes `runs/<dataset>_N<N>/<folder>`;
+      config.json carries the code commit and refuses a mismatch; manifest.json per folder and a generated
+      README.md (commits a964327, 6f4d897, pushed). The sheared filament's references moved in with manifests
+      written from their runs.log (oracle 10 000 draws, boot_B5000 and boot_B10000 1000, ij_p1 and ij_p2 1000;
+      all Stampede3, 3–4 Oct) and a `notes` line naming where each came from; jackknife/ moved beside them
+      (no manifest: not a driver product). summarize_shearmix.py and frontier_shearmix.py read the tree
+      (--runs, qij_<core>_eps*); the summary cache's stored paths remapped, cache hit confirmed, numbers
+      unchanged. Attributable summary and figure folders of the deleted studies removed; full_warm and
+      qij_pilot_compare (unknown provenance) left. Still under shearmix4/: the two October qij studies.
+- [x] Vista: venv /home1/08772/jjt277/envs/qij_vista (numpy 1.24.4, scipy 1.13.1, pandas 2.1.1, pyarrow 21,
+      h5py 3.7, scikit-learn 1.5.2); the shared work clone at main, installed editable; job generator
+      scripts/tacc/make_jobs_vista.sh wrote three sets under $WORK/projects/QIJ_JOINT/jobs: smoke (1 job),
+      refs (8), qij (15). Nothing submitted.
+- [x] the smoke set dropped (author: a failed real job writes no product; deficient jobs create bloat). In its place a
+      local one-draw check of mvt, imf, fp at N = 10⁴ through the driver (2026-11-12, "yes go"): oracle, ij, boot
+      B = 20 and qij at ε = 0.01, into the session scratchpad. Oracle, ij, boot: all three fine. qij: mvt fine
+      (703 evaluations, within 0.7 ε). **Two defects found, both method-level, awaiting the author's ruling:**
+      (1) **fp**: the tree reaches 1280 leaves before the test, and the first test fit (3598 rows: 1319 pilot,
+      1280 leaves, 1100 contrasts) fails the interpolant's reproduction assert (residual 1e-5, tolerance 1.5e-7).
+      Mechanism measured: 20 pivots of the tail factor below 1e-4 of the largest; the worst rows are mean rows and
+      contrasts on leaves of 2–3 points whose kernel columns are nearly dependent; |α| = 2e5 and the residual is
+      exactly jitter × α. With exact influences the values are consistent and α stays small (the bed passed fp);
+      with the forward difference's truncation (fp's η = 1e-12, step 2e-6) the near-dependent system is slightly
+      inconsistent. Remedies: (i) the redundancy rule in the kernel's metric: a row whose Schur-complement pivot
+      relative to its own Gram diagonal is ≤ 1e-8 is kept as a measurement, not a constraint (recommended; the same
+      rule as core/span.py, applied where the interpolant is actually singular); (ii) central differences on fp
+      (truncation 1e-12; doubles the evaluation cost); (iii) a looser reproduction tolerance (hides it).
+      (2) **imf at k = 1**: with one split per round (what the driver runs with one worker, since k defaults to the
+      pool size) the stop misses on 2 of 6 contrast seeds by 3 and 5 ε; with k = 16 all 6 pass. Measured mechanism:
+      at k = 1 the tree stops at 40–52 leaves with one low-mass leaf (0.002–0.054 M☉, 50–143 stars) holding 96–99 %
+      of the model's error; that leaf's single contrast came out at 0.02 and 0.055 of its own standard deviation, so
+      its term is tiny, and the plug-in quantile, which weights leaves by their measured terms, cannot widen for it
+      (METHOD_qij.md §4 approximation 1). The evaluations themselves are exact to 4 decimals (checked at three leaf
+      sizes and three steps), so this is the test's accounting, not the estimator. Remedies: (i) k becomes the
+      method's own parameter, default 16 as every bed suite ran, independent of the pool (the minimum for the runs);
+      (ii) the plug-in weakness itself is a design matter, to be read off the 1000-draw study's miss rate.
+- [ ] rulings on (1) and (2) → fix → rerun the three one-draw checks → submit refs (8 jobs) and qij (15 jobs) → rsync
+- [ ] budget rule note: imf and pareto are 1-D data, so r = 1 and M = 49 at ε = 0.01; fp r = 3, M = 1319;
+      mvt clusters in its 10-D coordinates, r = 2, M = 300
 - [ ] stale files deleted; vqboot branches (separate, not for the talk)

@@ -26,6 +26,9 @@ COMMIT=${COMMIT:?COMMIT=<hash the clone must be at>}
 CLONE=${CLONE:-/work2/08772/jjt277/stampede3/software/qij_joint}
 VENV=${VENV:-/home1/08772/jjt277/envs/qij_vista}
 ACCOUNT=AST24021; PARTITION=gg; CORES=144; N=${N:-10000}; SEED=0
+# qij runs 16 workers per draw (so k, the cap on splits per round, is 16 by the author's rule k = the number of jobs),
+# 9 draws at a time on the node's 144 cores; oracle, ij and boot run one draw per core.
+QIJ_WORKERS=${QIJ_WORKERS:-16}; QIJ_PAR=$((CORES / QIJ_WORKERS))
 FIRST=${FIRST:-0}; LAST=${LAST:-1000}
 SCR=${SCRATCH:?SCRATCH not set}/QIJ_JOINT
 PROJ=${WORK:?WORK not set}/projects/QIJ_JOINT
@@ -43,12 +46,15 @@ job() {
     local name=$1 wall=$2 runs=$3 dest=$4; shift 4
     local body=""
     for line in "$@"; do
-        # a line is "<dataset> <estimator> <method> [extra flags]"; the draws are fanned out per core
+        # a line is "<dataset> <estimator> <method> [extra flags]"; the draws are fanned out over the node: one per core for
+        # oracle, ij and boot; QIJ_PAR at a time with QIJ_WORKERS workers each for qij
+        local par=$CORES wk=1
+        case "$line" in *" qij"*) par=$QIJ_PAR; wk=$QIJ_WORKERS;; esac
         body+="
-echo \"--- \$(date '+%F %T') $line draws $FIRST:$LAST\"
+echo \"--- \$(date '+%F %T') $line draws $FIRST:$LAST, $par at a time, $wk worker(s) each\"
 mkdir -p $LOGS/${name}_draws
-seq $FIRST $((LAST - 1)) | xargs -P $CORES -I{} sh -c \\
-    'python \$STAGE/scripts/run.py $line --N $N --draws \$1:\$((\$1 + 1)) --seed $SEED --workers 1 --out $runs > $LOGS/${name}_draws/\$(echo \"$line\" | tr \" \" _)_s\$1.log 2>&1 || echo \"draw \$1 of [$line] failed (exit \$?)\"' _ {}"
+seq $FIRST $((LAST - 1)) | xargs -P $par -I{} sh -c \\
+    'python \$STAGE/scripts/run.py $line --N $N --draws \$1:\$((\$1 + 1)) --seed $SEED --workers $wk --out $runs > $LOGS/${name}_draws/\$(echo \"$line\" | tr \" \" _)_s\$1.log 2>&1 || echo \"draw \$1 of [$line] failed (exit \$?)\"' _ {}"
     done
     cat > "$JOBS/$name.sh" <<EOF
 #!/bin/bash

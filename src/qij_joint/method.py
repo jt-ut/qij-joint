@@ -425,9 +425,13 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
             redundant.append((rid, kind, rel, d)); disc_of[rid] = d
         pending.clear()
 
+    A_fit = None                                              # the CSR of the rows of the last fit, for the kernel-metric test
+
     def fit():
+        nonlocal A_fit
         A = rows.A(); y = rows.Y(); t = time.perf_counter()
         psi = est.fit(list(rows.order), A, y, rows.combo); timings['fit_s'] += time.perf_counter() - t
+        A_fit = A
         fitted.clear(); fitted.update(rows.order); direct_new.clear()
         resolve(psi)
         return psi
@@ -441,7 +445,8 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
         return all(expand(j, coef * c, out) for j, c in rec)
 
     def enter(idx, w, y, kind, at=None, rec=None):
-        """Test a new row against the span; enter it (taking position `at` when given) or keep it as redundant. Returns (id, entered)."""
+        """Test a new row against the span of the active rows (core/span.py) and, if it passes, in the kernel's metric
+        (Interpolant.kernel_test); enter it (taking position `at` when given) or keep it as redundant. Returns (id, entered)."""
         red, rel, data = span.test(idx, w)
         if red:
             rid = rows.add(idx, w, y, active=False); pending.append((rid, kind, rel))
@@ -452,7 +457,13 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
             out = {}
             if all(expand(j, c, out) for j, c in rec):
                 combo = (list(out.keys()), list(out.values()))
-        rid = rows.add(idx, w, y, at=at, combo=combo)
+        rid_next = len(rows.idx)                              # the id the row will get
+        kred, krel = est.kernel_test(rid_next, idx, w, A_fit, combo=combo)
+        if kred:
+            rid = rows.add(idx, w, y, active=False); pending.append((rid, kind + '/kernel', krel))
+            if rec is not None: recipe[rid] = rec
+            return rid, False
+        rid = rows.add(idx, w, y, at=at, combo=combo); assert rid == rid_next
         if rec is not None: recipe[rid] = rec
         if combo is None: direct_new.add(rid)
         span.add(rid, data); rel_accepted.append(rel)
@@ -512,7 +523,7 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
             qk = wchi2_quantile(cR_q[:, kk], alpha); U[kk] = WhR[kk] / max(qk, 1e-300) if WhR[kk] > 0 else 0.0
         if det.all(): U = np.zeros(J)
         ok = bool(np.all(U <= delta - Om))                    # the stop: U + Omega <= delta on every output
-        return psi, dict(rl=rl, cR=cR, cR_q=cR_q, det=det, delta=delta, passed=ok, psit=psit, R_hat=WhR, U=U)
+        return psi, dict(rl=rl, cR=cR, cR_q=cR_q, det=det, delta=delta, passed=ok, psit=psit, R_hat=WhR, U=U, e=e, active=acc)
 
     def evals_so_far():
         return ev.n_base + ev.n
@@ -557,6 +568,8 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
                 Om_r = Om_r - tm[l]; take.append(l)
                 if np.all(Ut <= dl - Om_r): break
             vals = ev([(leaves[l], np.full(len(leaves[l]), 1.0 / len(leaves[l]))) for l in take]) / s
+            for l in take:                                     # every row that leaves this round, before any repair row is tested
+                if con_of[l] in rows.active: est.leaving(con_of[l])
             for l, y in zip(take, vals):
                 idl = leaves[l]; nl = len(idl); old = con_of[l]; o_act = old in rows.active
                 if o_act: span.remove(old)                     # the direct row takes the position of the combination row
@@ -609,6 +622,8 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
         # row leaves when the children's rows enter. b's column is built as the combination of stored columns when its recipe
         # reaches them (an identity of the weights).
         vals = ev([(a, np.full(len(a), 1.0 / len(a))) for _, a, _ in cuts]) / s
+        for ls, _, _ in cuts:                                  # every parent row that leaves this round, before any child is tested
+            if con_of[ls] in rows.active: est.leaving(con_of[ls])
         for i_, (ls, a, b) in enumerate(cuts):
             nl = float(len(leaves[ls])); na, nb = len(a), len(b)
             ma = vals[i_]; mb = (nl * np.asarray(lmean[ls]) - na * ma) / nb
@@ -661,7 +676,13 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
                       rel_residual_redundant_max=(max(r[2] for r in redundant) if redundant else None),
                       rel_residual_entered_min=(min(rel_accepted) if rel_accepted else None))
     if record is not None:
-        record.update(psi_tilde=psit, redundant=[(rid, kd, rel, d.copy()) for rid, kd, rel, d in redundant],
+        # the last test, per tested leaf: the test row (points, weights, value in scaled units), whether it is an active row of
+        # psi-hat, and the misfit e the test assigned (scaled units); for a check of the test's accounting
+        if last is not None:
+            record['test_rows'] = {int(l): dict(idx=rows.idx[t_row[l]], w=rows.w[t_row[l]], y=np.asarray(rows.y[t_row[l]]), active=bool(a_),
+                                                e=np.asarray(last['e'][j]), term=np.asarray(last['cR'][j]), determined=bool(last['det'][j]))
+                                   for j, (l, a_) in enumerate(zip(last['rl'], last['active'])) if t_row[l] >= 0}
+        record.update(psi_tilde=psit, leaves=lab.copy(), redundant=[(rid, kd, rel, d.copy()) for rid, kd, rel, d in redundant],
                       counts=dict(base=int(ev.n_base), pilot=int(C), splits=int(n_split), tests=int(n_test), repairs=int(n_repair), q=int(J)))
     timings['total_s'] = time.perf_counter() - t_start
     return MethodResult(Vhat=Vhat, U=U, delta=delta, V_lb=V_lb, E=int(E), E_full=float(E_full), M=int(C), K=int(K), rounds=int(n_round),
