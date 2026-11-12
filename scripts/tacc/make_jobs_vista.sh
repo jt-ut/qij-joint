@@ -103,12 +103,15 @@ refs)
     done
     ;;
 qij)
+    # walls from the laptop's one-draw times at 16 workers (sheared Core 1 46 s, fp 115 s at eps 0.01, imf and mvt about
+    # 20 s), 9 draws at a time: Core 1 about 1.5 h per eps at eps 0.01; fp about 3.5 h at eps 0.01 and the 11 eps together
+    # within 12 h. A job that reaches its wall is resubmitted: finished draws are skipped.
     for eps in $EPS_ALL; do
-        job "qij_cloudfil_u_p1_eps${eps:0:6}" 03:00:00 "$SCR/runs" "$PROJ/runs" "cloudfil_u p1 qij --eps $eps"
+        job "qij_cloudfil_u_p1_eps${eps:0:6}" 04:00:00 "$SCR/runs" "$PROJ/runs" "cloudfil_u p1 qij --eps $eps"
     done
     for ds in mvt fp imf pareto; do
         lines=(); for eps in $EPS_ALL; do lines+=("$ds all qij --eps $eps"); done
-        job "qij_${ds}_all" 04:00:00 "$SCR/runs" "$PROJ/runs" "${lines[@]}"
+        job "qij_${ds}_all" 12:00:00 "$SCR/runs" "$PROJ/runs" "${lines[@]}"
     done
     ;;
 *) echo "unknown job set $SET"; exit 1 ;;

@@ -287,7 +287,14 @@ submission on an explicit go). V6 rsync back into the canonical tree; summaries;
       sizes and three steps), so this is the test's accounting, not the estimator. Remedies: (i) k becomes the
       method's own parameter, default 16 as every bed suite ran, independent of the pool (the minimum for the runs);
       (ii) the plug-in weakness itself is a design matter, to be read off the 1000-draw study's miss rate.
-- [ ] rulings on (1) and (2) → fix → rerun the three one-draw checks → submit refs (8 jobs) and qij (15 jobs) → rsync
+- [x] rulings (2026-11-12): (1) "ok do this" → Interpolant.kernel_test built (the redundancy rule in the kernel's
+      metric; leaving rows registered before each round's candidates; accepted columns cached for the fit);
+      (2) "k can be a parameter, but it should default to however many n_jobs the user specifies" → --k on the driver,
+      default --workers; the qij folder carries _k<k>; the Vista qij jobs run 16 workers per draw, 9 draws per node.
+      Reruns through the driver at 16 workers, N = 10⁴, ε = 0.01, draw 0: fp K 1281, E 3750, within 0.23 ε (211
+      kernel-redundant rows); imf K 75, E 223, within 0.13 ε; mvt K 220, E 741, within 1.31 ε (P_tail; design level);
+      sheared Core 1 K 234, E 709, within 0.47 ε. Commit 40f1a4e pushed; Vista clone at it; jobs regenerated.
+- [ ] submit refs (8 jobs) and qij (15 jobs) on the author's go → rsync into the tree → summaries → figures
 - [ ] budget rule note: imf and pareto are 1-D data, so r = 1 and M = 49 at ε = 0.01; fp r = 3, M = 1319;
       mvt clusters in its 10-D coordinates, r = 2, M = 300
 - [ ] stale files deleted; vqboot branches (separate, not for the talk)
