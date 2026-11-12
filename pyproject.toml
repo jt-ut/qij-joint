@@ -14,10 +14,8 @@ dependencies = [
     "pyarrow",
     "h5py",
     "joblib",
-    # vqlp is the vector quantizer, from github.com/jt-ut/vqlp. Named
-    # plainly rather than pinned to a path or URL, so it resolves against
-    # whatever is installed. Install it before this package.
-    "vqlp",
+    # the pilot's cells are sklearn's k-means++ (core/pilot.py); vqlp is no longer used (2026-11-12)
+    "scikit-learn",
 ]
 
 [tool.setuptools.packages.find]

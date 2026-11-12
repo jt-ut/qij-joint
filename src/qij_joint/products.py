@@ -1,12 +1,18 @@
-"""The only module that knows the product layout (Section 2): one
-directory per (dataset, estimator, N), one subdirectory per method, one
-scalar-row parquet and zero or more array parquets per draw, plus a
-JSON-lines run log.
+"""The only module that knows the product layout (Section 2): under the
+runs root, one case directory per (dataset, N), named `<dataset>_N<N>`,
+and inside it one folder per method configuration (`oracle`,
+`boot_B<B>`, `ij_<estimator>`, `qij_<estimator>_eps<eps>[_level<level>][_M<M>]`).
+Each folder holds one scalar-row parquet and zero or more array parquets
+per draw, the configuration manifest config.json, a JSON-lines run log
+runs.log, and the provenance summary manifest.json. The runs root also
+carries a README.md generated from every manifest.json beneath it.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
+import re
 import platform
 import socket
 import subprocess
@@ -19,12 +25,18 @@ import pyarrow.dataset as ds
 
 def method_dir(out_dir: str, dataset: str, estimator: str, N: int, method: str,
                tag: str = '') -> str:
-    """The directory `<out_dir>/<dataset>_<estimator>_N<N>/<folder>/`,
-    where `folder` is `method` if `tag == ''`, else `f'{method}_{tag}'`
-    -- `dir_tag` builds `tag` from a run's configuration, so different
-    configurations of a method land in different folders."""
-    folder = method if tag == '' else f'{method}_{tag}'
-    return os.path.join(out_dir, f'{dataset}_{estimator}_N{N}', folder)
+    """The directory `<out_dir>/<dataset>_N<N>/<folder>/`. The folder name
+    is the method, then the estimator for `ij` and `qij` only (the oracle
+    and the bootstrap record theirs in config.json), then `tag` when it
+    is not empty, joined by underscores: `oracle`, `boot_B5000`, `ij_p1`,
+    `qij_p1_eps0.01`. `dir_tag` builds `tag` from a run's configuration,
+    so different configurations of a method land in different folders."""
+    parts = [method]
+    if method in ('ij', 'qij'):
+        parts.append(estimator)
+    if tag != '':
+        parts.append(tag)
+    return os.path.join(out_dir, f'{dataset}_N{N}', '_'.join(parts))
 
 
 def _num(x) -> str:
@@ -37,10 +49,8 @@ def dir_tag(method: str, config: dict) -> str:
     from `config` rather than letting `--out` be used to separate them.
     `qij` -> `eps<eps>`, then `_level<level>` when the level is not
     0.84 and `_M<M>` when the pilot size is given (not the method's
-    own). `boot` -> `''` (`B` is not in the name -- replicates are a
-    deterministic prefix, so a smaller B is read from a larger run's
-    folder; `B` is still recorded in config.json and so still guarded).
-    `oracle`, `ij`, anything else -> `''`."""
+    own). `boot` -> `B<B>`, from `config['B']`. `oracle`, `ij`,
+    anything else -> `''`."""
     if method == 'qij':
         tag = f"eps{_num(config['eps'])}"
         if config.get('level', 0.84) != 0.84:
@@ -48,24 +58,47 @@ def dir_tag(method: str, config: dict) -> str:
         if config.get('M') is not None:
             tag += f"_M{int(config['M'])}"
         return tag
+    if method == 'boot':
+        return f"B{int(config['B'])}"
     return ''
 
 
-def ensure_config(md: str, config: dict) -> None:
+def code_commit() -> str:
+    """The git commit of the package source: the 12-character short hash
+    of HEAD in the repository holding this module, with `-dirty` appended
+    when `git status --porcelain` reports changes to tracked files, or
+    'unknown' when git is unavailable or the source is not in a
+    repository."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        head = subprocess.check_output(
+            ['git', '-C', here, 'rev-parse', '--short=12', 'HEAD'],
+            stderr=subprocess.DEVNULL).decode().strip()
+        status = subprocess.check_output(
+            ['git', '-C', here, 'status', '--porcelain', '--untracked-files=no'],
+            stderr=subprocess.DEVNULL).decode().strip()
+    except (OSError, subprocess.CalledProcessError):
+        return 'unknown'
+    return head + ('-dirty' if status else '')
+
+
+def ensure_config(md: str, config: dict, ignore: tuple = ()) -> None:
     """Write `md/config.json` if absent (atomically, like `_atomic_write`:
     `config.json.<pid>.tmp` then `os.replace`); if present, load it and
     compare to `config` after a JSON round-trip of `config` (so
     tuples/lists and ints/floats compare as stored), raising
     `RuntimeError` naming `md` and listing each differing key --
     including one present on only one side -- as `key: stored=<v>
-    requested=<v>`, and telling the caller to choose a different --out
-    study root or fix the arguments. Many single-draw processes may
+    requested=<v>`, and telling the caller to fix the arguments (or, when
+    only the commit differs, to pass --allow-commit-mismatch). Many single-draw processes may
     start against a new folder at once; each writes its own temp file,
     and they write identical content, so whichever `os.replace` lands
     last is harmless. The comparison is exact: a folder written by a
     method removed before the port (its config carries keys today's
     config never sets) does not match, so new products never land
-    beside old ones."""
+    beside old ones. Keys named in `ignore` are left out of the
+    comparison (the driver passes `('code_commit',)` only when the
+    author asks to continue a folder across a commit)."""
     os.makedirs(md, exist_ok=True)
     path = os.path.join(md, 'config.json')
     requested = json.loads(json.dumps(config))
@@ -77,15 +110,19 @@ def ensure_config(md: str, config: dict) -> None:
         return
     with open(path) as f:
         stored = json.load(f)
-    if stored != requested:
-        keys = sorted(set(stored) | set(requested))
+    stored_cmp = {k: v for k, v in stored.items() if k not in ignore}
+    requested_cmp = {k: v for k, v in requested.items() if k not in ignore}
+    if stored_cmp != requested_cmp:
+        keys = sorted(set(stored_cmp) | set(requested_cmp))
         diffs = '; '.join(
             f'{k}: stored={stored.get(k)} requested={requested.get(k)}'
             for k in keys if stored.get(k) != requested.get(k))
         raise RuntimeError(
             f'{md}: recorded configuration in config.json differs from the '
-            f'requested configuration ({diffs}); choose a different --out '
-            f'study root or fix the arguments.')
+            f'requested configuration ({diffs}). A folder holds one configuration '
+            f'and one code version: fix the arguments, or, if only code_commit '
+            f'differs and the commit did not touch the method, pass '
+            f'--allow-commit-mismatch.')
 
 
 def _scalar_path(md: str, s: int) -> str:
@@ -134,13 +171,13 @@ def write_draw(md: str, s: int, row: dict, arrays: Optional[dict] = None) -> Non
 
 def append_log(md: str, argv: list, params: dict, written: int, skipped: int) -> None:
     """One JSON line in `runs.log`: time, host, CPU, argv, parameters,
-    draws written/skipped (Section 2)."""
+    draws written/skipped, and the code commit (Section 2)."""
     os.makedirs(md, exist_ok=True)
     record = {
         'time': datetime.now().isoformat(timespec='seconds'),
         'host': socket.gethostname(), 'cpu_model': _cpu_model(),
         'cpu_count': os.cpu_count(), 'argv': list(argv), 'params': params,
-        'written': written, 'skipped': skipped,
+        'written': written, 'skipped': skipped, 'code_commit': code_commit(),
     }
     with open(os.path.join(md, 'runs.log'), 'a') as f:
         f.write(json.dumps(record) + '\n')
@@ -183,3 +220,123 @@ def collect_array(run_dir: str, dataset: str, estimator: str, N: int, method: st
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def _draw_ranges(draws: list) -> str:
+    """A compact string for a sorted list of draw indices: runs of
+    consecutive draws as `a..b`, single draws as `a`, joined by commas
+    (for example "0..43,88..131"); '' when there are none."""
+    parts = []
+    i = 0
+    while i < len(draws):
+        j = i
+        while j + 1 < len(draws) and draws[j + 1] == draws[j] + 1:
+            j += 1
+        parts.append(str(draws[i]) if i == j else f'{draws[i]}..{draws[j]}')
+        i = j + 1
+    return ','.join(parts)
+
+
+def write_manifest(md: str) -> dict:
+    """Rewrite `md/manifest.json`, the folder's provenance summary, from
+    what is on disk: config.json, runs.log (if present) and the
+    s<draw>.parquet scalar rows. It records the case folder name, the
+    folder, dataset, estimator, N and method (from the configuration),
+    the configuration itself, how many draws are present and which, the
+    times of the first and last runs.log entries, the hosts and code
+    commits seen in runs.log, and the first entry's argv. Without a
+    runs.log the times, hosts and argv are null and the commit list is
+    empty. Written atomically; the summary is also returned."""
+    with open(os.path.join(md, 'config.json')) as f:
+        config = json.load(f)
+    draws = sorted(int(m.group(1)) for m in
+                   (re.fullmatch(r's(\d+)\.parquet', n) for n in os.listdir(md))
+                   if m)
+    records = []
+    log = os.path.join(md, 'runs.log')
+    if os.path.exists(log):
+        with open(log) as f:
+            records = [json.loads(line) for line in f if line.strip()]
+    manifest = {
+        'case': os.path.basename(os.path.dirname(os.path.abspath(md))),
+        'folder': os.path.basename(os.path.abspath(md)),
+        'dataset': config.get('dataset'), 'estimator': config.get('estimator'),
+        'N': config.get('N'), 'method': config.get('method'),
+        'config': config,
+        'n_draws': len(draws), 'draws': _draw_ranges(draws),
+        'created': records[0]['time'] if records else None,
+        'last_write': records[-1]['time'] if records else None,
+        'hosts': sorted({r['host'] for r in records if 'host' in r}) if records else None,
+        'code_commits': sorted({r['code_commit'] for r in records if 'code_commit' in r}),
+        'argv_first': records[0].get('argv') if records else None,
+    }
+    path = os.path.join(md, 'manifest.json')
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        f.write(json.dumps(manifest, indent=1))
+    os.replace(tmp, path)
+    return manifest
+
+
+def write_readme(runs_root: str) -> str:
+    """Write `<runs_root>/README.md` from every manifest.json found two
+    levels down (`<case>/<folder>/manifest.json`): a header saying the
+    file is generated by this function and when, the layout rule, and
+    one table per case folder listing each method folder's method,
+    estimator, number of draws, draw ranges, first and last write,
+    hosts and code commits. Returns the path written."""
+    by_case = {}
+    for path in sorted(glob.glob(os.path.join(runs_root, '*', '*', 'manifest.json'))):
+        with open(path) as f:
+            m = json.load(f)
+        case = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        by_case.setdefault(case, []).append(m)
+
+    def hosts_cell(hosts):
+        """Hosts summarised by system: a TACC node name like c512-051.stampede3.tacc.utexas.edu counts
+        towards 'stampede3'; anything else towards its own name; e.g. 'stampede3 (23 nodes)'."""
+        if not hosts:
+            return ''
+        systems = {}
+        for h in hosts:
+            parts = h.split('.')
+            system = parts[1] if len(parts) >= 3 and parts[0][:1] == 'c' and parts[0][1:].replace('-', '').isdigit() else parts[0]
+            systems[system] = systems.get(system, 0) + 1
+        return ', '.join(f'{s} ({n} node{"s" if n != 1 else ""})' if n > 1 else s for s, n in sorted(systems.items()))
+
+    def cell(c, v):
+        if c == 'hosts':
+            return hosts_cell(v)
+        if v is None:
+            return ''
+        if isinstance(v, list):
+            return ', '.join(str(x) for x in v)
+        return str(v)
+
+    cols = ['folder', 'method', 'estimator', 'n_draws', 'draws', 'created',
+            'last_write', 'hosts', 'code_commits', 'notes']
+    lines = [
+        '# Runs',
+        '',
+        f'Generated by `qij_joint.products.write_readme` on '
+        f'{datetime.now().isoformat(timespec="seconds")}; do not edit by hand.',
+        '',
+        'Each case folder is `<dataset>_N<N>`, and inside it each method '
+        'configuration has its own folder: `oracle`, `boot_B<B>`, '
+        '`ij_<estimator>`, or `qij_<estimator>_eps<eps>[_level<level>][_M<M>]`. '
+        'A folder holds one `s<draw>.parquet` per draw (plus '
+        '`s<draw>.<kind>.parquet` arrays), its `config.json`, `runs.log` '
+        'and `manifest.json`.',
+    ]
+    for case in sorted(by_case):
+        lines += ['', f'## {case}', '',
+                  '| ' + ' | '.join(cols) + ' |',
+                  '|' + '---|' * len(cols)]
+        for m in sorted(by_case[case], key=lambda m: m.get('folder', '')):
+            lines.append('| ' + ' | '.join(cell(c, m.get(c)) for c in cols) + ' |')
+    path = os.path.join(runs_root, 'README.md')
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(tmp, path)
+    return path

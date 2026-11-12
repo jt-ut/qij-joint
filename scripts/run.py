@@ -1,10 +1,16 @@
 #!/usr/bin/env python3.9
 """CLI: one (dataset, estimator, method) over a range of draws (Section
-6.2). `--out` is the study root; the method folder's name is derived
-from the run's configuration (e.g. `qij_eps0.02`) and recorded, then
-checked on every later run, in that folder's `config.json`.
+6.2). `--out` is the runs root itself; products land in
+`<out>/<dataset>_N<N>/<folder>/`, where the folder is `oracle`,
+`boot_B<B>`, `ij_<estimator>` or `qij_<estimator>_eps<eps>[_level<level>][_M<M>]`.
+The run's configuration, including the git commit of the package
+source, is recorded in that folder's `config.json` on first use and
+checked on every later run; a mismatch is refused. After the batch the
+folder's `manifest.json` and the root's `README.md` are rewritten.
 
-    python scripts/run.py pareto tail qij --N 2000 --draws 0:1000 --out runs/cloudfil_s1000
+    python scripts/run.py cloudfil_u p1 qij --N 10000 --draws 0:1000 --eps 0.01 \
+        --out /Users/jtaylor/Dropbox/Research/QIJ_joint/runs
+    # -> runs/cloudfil_u_N10000/qij_p1_eps0.01/s00000.parquet ...
 """
 import os
 
@@ -32,8 +38,12 @@ def main(argv=None) -> None:
     p.add_argument('--draws', type=_range, required=True)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--workers', type=int, default=1)
-    p.add_argument('--out', required=True)
+    p.add_argument('--out', required=True,
+                   help='the runs root, e.g. /Users/jtaylor/Dropbox/Research/QIJ_joint/runs')
     p.add_argument('--force', action='store_true')
+    p.add_argument('--allow-commit-mismatch', action='store_true',
+                   help='drop code_commit from the config.json comparison, to continue '
+                        'a folder after a commit that did not touch the method')
     p.add_argument('--B', type=int, default=2000, help='boot replicates')
     p.add_argument('--eps', type=float, default=0.01, help='qij: the tolerance eps')
     p.add_argument('--level', type=float, default=0.84, help='qij: the test\'s level')
@@ -42,7 +52,7 @@ def main(argv=None) -> None:
     args = p.parse_args(argv)
 
     config = dict(method=args.method, dataset=args.dataset, estimator=args.estimator,
-                  N=args.N, seed=args.seed)
+                  N=args.N, seed=args.seed, code_commit=products.code_commit())
     if args.method == 'qij':
         config.update(eps=args.eps, level=args.level, M=args.M)
     elif args.method == 'boot':
@@ -50,7 +60,12 @@ def main(argv=None) -> None:
 
     tag = products.dir_tag(args.method, config)
     md = products.method_dir(args.out, args.dataset, args.estimator, args.N, args.method, tag)
-    products.ensure_config(md, config)
+    ignore = ()
+    if args.allow_commit_mismatch:
+        ignore = ('code_commit',)
+        print(f'warning: --allow-commit-mismatch: code_commit is not compared against '
+              f'{md}/config.json (running at {config["code_commit"]})', file=sys.stderr)
+    products.ensure_config(md, config, ignore=ignore)
 
     params = dict(N=args.N, draws=[args.draws.start, args.draws.stop],
                   seed=args.seed, workers=args.workers, force=args.force)
@@ -76,6 +91,8 @@ def main(argv=None) -> None:
             workers=args.workers, tag=tag, force=args.force)
 
     products.append_log(md, sys.argv, params, written, skipped)
+    products.write_manifest(md)
+    products.write_readme(args.out)
 
 
 if __name__ == '__main__':
