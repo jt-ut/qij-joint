@@ -1,5 +1,5 @@
 """The unconstrained parametrization of `GMM2D`'s theta
-(spec/QIJ_estimator_fit_spec.md section 2.2), for the trust-region Newton
+(spec/archive/QIJ_estimator_fit_spec.md section 2.2), for the trust-region Newton
 finish: pure functions, no state, no finite differences -- every
 Jacobian and second derivative below is a closed form.
 

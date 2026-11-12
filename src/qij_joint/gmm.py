@@ -5,7 +5,7 @@ identity.
 `GMM2D(K, n_starts=20, seed=0, reference=None)`
 fits by multi-start weighted EM (SQUAREM-accelerated), then finishes the
 winning start with the package's own trust-region Newton loop
-(spec/QIJ_estimator_fit_spec.md section 7: an exact Moré-Sorensen
+(spec/archive/QIJ_estimator_fit_spec.md section 7: an exact Moré-Sorensen
 subproblem solve each iteration, step accepted on the predicted-gain
 ratio or, for an interior Newton step, on the scaled gradient -- one
 finish, no gate, no second path) in the unconstrained parametrization of
@@ -13,7 +13,7 @@ finish, no gate, no second path) in the unconstrained parametrization of
 fit for `influence`.
 Follows `estimators.py`'s conventions: `T(X, w) -> ndarray(p,)` never
 raises (a failed fit is NaN); the one exception to "no state between
-calls" is `last_fit_info` (spec/QIJ_estimator_fit_spec.md 2.4), a
+calls" is `last_fit_info` (spec/archive/QIJ_estimator_fit_spec.md 2.4), a
 read-only diagnostic `__call__`/`influence`/`fit_and_influence` each
 overwrite with their own fit's status, final scaled score, EM and
 Newton iteration counts and labelling assignment, never consulted by
@@ -58,7 +58,7 @@ closed form.
 Parameter layout, the two-phase multi-start/EM design, the penalized
 M-step, SQUAREM acceleration, the trust-region Newton finish, and the
 score/Louis's-identity construction of `(psi, A)` are documented in
-`spec/method_notes.md`, section "GMM2D"; each is implemented here
+`spec/archive/method_notes.md`, section "GMM2D"; each is implemented here
 exactly as described there.
 
 `prepare(X)` holds the unweighted centering shift and the `(N, 6)`
@@ -66,7 +66,7 @@ feature buffer built from the centered X, both independent of `w` and
 otherwise rebuilt on every evaluation of the same X.
 
 The multi-start's start set is `n_starts` k-means starts plus greedy-EM
-starts from `seeding.py` (spec/QIJ_mods_waves.md A12 round 5, A15): a
+starts from `seeding.py` (spec/archive/QIJ_mods_waves.md A12 round 5, A15): a
 component grown to K by residual-driven insertion after Verbeek,
 Vlassis and Kroese (2003), one at 50*K over-segmentation cells and a
 second at 25*K cells, the second contributing its own ×1/2 and ×2
@@ -97,7 +97,7 @@ _LOG2PI = float(np.log(2.0 * np.pi))
 _ETA_DEFAULT = float(np.sqrt(np.finfo(float).eps))
 _COND_MAX_DEFAULT = 1e12
 
-# The racing screen's survivor count (spec/QIJ_estimator_search_spec.md
+# The racing screen's survivor count (spec/archive/QIJ_estimator_search_spec.md
 # 2.2, 5): "the old promotion count carried over" from the fixed
 # 25-iteration screen's own promotion count -- now the racing screen's
 # stopping target (it ends when at most this many starts remain) and
@@ -105,7 +105,7 @@ _COND_MAX_DEFAULT = 1e12
 _K_KEEP = 3
 
 # The second greedy-EM start's over-segmentation resolution
-# (spec/QIJ_mods_waves.md A15), beside `seeding.py`'s own 50*K default,
+# (spec/archive/QIJ_mods_waves.md A15), beside `seeding.py`'s own 50*K default,
 # and the covariance factors of its two scaled variants (A12 item 6).
 _GREEDY_CELL_FACTOR_2 = 25
 _GREEDY_VARIANT_FACTORS = (0.5, 2.0)
@@ -496,7 +496,7 @@ def _squarem_round(Q, XP, w, W, pis, mus, Ss, Scov, a_pen, K, budget, m):
 def _em_accelerated(X, Q, XP, w, W, pis, mus, Ss, ll, eta, Scov, a_pen, K, budget=None):
     """SQUAREM rounds (`_squarem_round`) from (pis, mus, Ss) with its own
     `ll`, until BOTH halves of the stop test pass or the 20*p iteration
-    cap fires (spec/QIJ_estimator_fit_spec.md section 5 items 1-2):
+    cap fires (spec/archive/QIJ_estimator_fit_spec.md section 5 items 1-2):
     the scaled gradient norm <= sqrt(eta), and the Aitken-projected
     remaining gain |ell_inf - ell_k| <= eta * max(|ell_k|, 1), with
     ell_k the penalized ll/W at iteration k, c_k = (ell_k - ell_{k-1}) /
@@ -600,7 +600,7 @@ def _em_accelerated(X, Q, XP, w, W, pis, mus, Ss, ll, eta, Scov, a_pen, K, budge
 
 def _run_em(X, Q, XP, w, pis0, mus0, Ss0, eta, Scov, a_pen):
     """Weighted EM for a single start, SQUAREM-accelerated
-    (`_em_accelerated`, spec/QIJ_estimator_fit_spec.md section 5). None
+    (`_em_accelerated`, spec/archive/QIJ_estimator_fit_spec.md section 5). None
     the moment the start degenerates (non-PD covariance or non-finite
     penalized ll) anywhere along the trajectory; otherwise runs to the
     joint Aitken/scaled-gradient stop test or the 20*p iteration cap
@@ -685,7 +685,7 @@ def _m_step_batched(w: np.ndarray, R: np.ndarray, XP: np.ndarray, K: int, S: int
 
 def _aitken_screen(ell_km2: float, ell_km1: float, ell_k: float):
     """The racing screen's own Aitken projection (spec/
-    QIJ_estimator_search_spec.md 2.2), restated for a plain-EM
+    spec/archive/QIJ_estimator_search_spec.md 2.2), restated for a plain-EM
     trajectory (no acceleration, so the sequence is only linearly
     convergent once it settles into that regime -- the two special
     cases below are what the fixed-budget screen's replacement needs
@@ -712,7 +712,7 @@ def _aitken_screen(ell_km2: float, ell_km1: float, ell_k: float):
 
 def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
                    K: int, Scov: np.ndarray, a_pen: float):
-    """The racing screen (spec/QIJ_estimator_search_spec.md 2.2),
+    """The racing screen (spec/archive/QIJ_estimator_search_spec.md 2.2),
     replacing the fixed-budget screen this function used to be. Every
     start in `starts` takes one PLAIN EM step per round (`_e_step_batched`/
     `_m_step_batched`, no acceleration: the Aitken projection assumes
@@ -819,7 +819,7 @@ def _phase1_batch(Q: np.ndarray, XP: np.ndarray, w: np.ndarray, starts: list,
 
 def _fit_em_multistart(X, Q, XP, w, K, n_starts, seed, eta, Scov, a_pen):
     """Pool = every surviving start, raced down by the screen
-    (`_phase1_batch`, spec/QIJ_estimator_search_spec.md 2.2) to at most
+    (`_phase1_batch`, spec/archive/QIJ_estimator_search_spec.md 2.2) to at most
     `_K_KEEP` survivors, each then run to convergence by `_run_em`'s
     own accelerated EM and Aitken stop; the best of those is kept.
     Starts are the `n_starts` k-means starts (`_starts`), the greedy-EM
@@ -1091,7 +1091,7 @@ def _score_at(X, Q, w, cfg, pis, mus, Ss, Scov, a_pen, W, s):
 
 def _trust_region_step(g: np.ndarray, H: np.ndarray, radius: float):
     """The trust-region subproblem, solved exactly (spec/
-    QIJ_estimator_fit_spec.md section 7): minimize the quadratic model
+    spec/archive/QIJ_estimator_fit_spec.md section 7): minimize the quadratic model
     m(s) = g.s + 1/2 s.H.s subject to ||s|| <= radius, for `H` symmetric
     and `g`, `H` the gradient and Hessian of the finish's own `fun` at
     the current point (Moré and Sorensen 1983; Nocedal and Wright 2006,
@@ -1193,7 +1193,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
          eta: float, reference=None, start: np.ndarray = None):
     """(dict_or_None, status), status in {'converged', 'em_cap',
     'newton_cap', 'newton_stalled', 'infeasible', 'linalg'}
-    (spec/QIJ_estimator_fit_spec.md 2.4, 7). The dict is None only for
+    (spec/archive/QIJ_estimator_fit_spec.md 2.4, 7). The dict is None only for
     'infeasible' (no start survived EM) and 'linalg' (the score/
     information could not be formed, or formed but is not PD at a point
     the finish calls converged -- a saddle wearing a small gradient);
@@ -1242,7 +1242,7 @@ def _fit(X: np.ndarray, w: np.ndarray, cfg: _Cfg, Q: np.ndarray, XP: np.ndarray,
         best = _fit_em_multistart(X, Q, XP, w, cfg.K, cfg.n_starts, cfg.seed,
                                    eta, Scov, a_pen)
         if best is not None:
-            # The split-and-merge finish (spec/QIJ_estimator_search_spec.md
+            # The split-and-merge finish (spec/archive/QIJ_estimator_search_spec.md
             # 2.3) starts from the racing screen's winner CONVERGED by the
             # local optimizer, trust-region finish included (a continuation
             # of the winner); from EM's endpoint alone its proposal ranking
@@ -1477,7 +1477,7 @@ FitInfo = namedtuple('FitInfo', ['status', 'score', 'n_iter_em', 'n_iter_newton'
 
 def _fit_info(fit, status) -> FitInfo:
     """`GMM2D.last_fit_info` from `_fit`'s own return
-    (spec/QIJ_estimator_fit_spec.md 2.4, 7): `score` is the final scaled
+    (spec/archive/QIJ_estimator_fit_spec.md 2.4, 7): `score` is the final scaled
     gradient norm of 2.3 whatever `status` is; `n_iter_em`/`n_iter_newton`
     /`label_order` are 0/0/None on 'infeasible' or 'linalg', since those
     two statuses have no dict (`_fit`'s docstring). `g0` is the scaled
@@ -1661,7 +1661,7 @@ def _try_smem_proposal(X, Q, XP, w, pis, mus, Ss, R, i, j, k, eta, Scov, a_pen,
 def split_merge(X, Q, XP, w, pis, mus, Ss, eta, Scov, a_pen, breadth=5,
                  split_offset=0.5):
     """The split-and-merge finish of the cold search
-    (spec/QIJ_estimator_search_spec.md 2.3; Ueda, Nakano, Ghahramani and
+    (spec/archive/QIJ_estimator_search_spec.md 2.3; Ueda, Nakano, Ghahramani and
     Hinton 2000), from the racing screen's converged winner. `X, Q, XP,
     w, Scov, a_pen` are exactly `_run_em`'s own arguments (centered
     rows, features, weights, the penalty's covariance and strength);
@@ -1756,7 +1756,7 @@ class GMM2D:
     output layout: a continuation of a previous fit, see module
     docstring), and an optional `eta`: when given, it replaces
     `self.eta` in the trust-region finish's convergence test for that
-    call alone (spec/QIJ_mods_waves.md A15's measured eta_full), leaving
+    call alone (spec/archive/QIJ_mods_waves.md A15's measured eta_full), leaving
     `self.eta` itself untouched for every other call. With `start`
     given, all three label components against `start`'s own components
     (never `self.reference`, and never the canonical sort); without it,

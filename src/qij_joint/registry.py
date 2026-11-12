@@ -7,11 +7,11 @@ QIJ should quantize in. Thirteen cases: the paper's six, matching
 (all), imf (all, Chabrier) -- plus their two joint (q=2) companions,
 pareto (all) and mvt (all), each one pass over the same draw computing
 both outputs at once -- plus five demo mixtures: mix11 (all, `GMM2D`,
-spec/method_notes.md section 5), cloudfil's two subject cores, p2
-(`P2Mixture`) and p1 (`P1Mixture`) (spec/QIJ_mods_waves.md A11), and
+spec/archive/method_notes.md section 5), cloudfil's two subject cores, p2
+(`P2Mixture`) and p1 (`P1Mixture`) (spec/archive/QIJ_mods_waves.md A11), and
 cloudfil_u's two subject cores -- the same demo rebuilt on a single
 well-specified sheared-Gaussian filament -- p2 (`P2ShearMixture`) and p1
-(`P1ShearMixture`) (spec/QIJ_shearmix_interface.md section 5).
+(`P1ShearMixture`) (spec/archive/QIJ_shearmix_interface.md section 5).
 """
 
 import json

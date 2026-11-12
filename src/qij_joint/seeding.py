@@ -1,4 +1,4 @@
-"""A residual-driven insertion start for `GMM2D` (spec/QIJ_mods_waves.md
+"""A residual-driven insertion start for `GMM2D` (spec/archive/QIJ_mods_waves.md
 A12, round 5, the author's ruling replacing rounds 1-4's two-level
 peak seeding; round 6, weight-aware; A15, a second start at a finer
 resolution). `greedy_em_start(...)` and `scaled_variants(...)` are the

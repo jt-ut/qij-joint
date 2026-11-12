@@ -51,6 +51,22 @@ def perturbed_weights(
     return (1.0 - t) * omega0 + t * omega0 * member_mask.astype(float) / p
 
 
+def evaluation_weights(u: np.ndarray, delta: float) -> Tuple[np.ndarray, float]:
+    """
+    The weights of one evaluation (`method.py`): for a weight vector u on
+    the N points, the direction g = N u - sum(u) (it sums to zero, so the
+    weights keep their total N) and omega = 1 + t g, t = delta / max|g|,
+    so no weight moves by more than the relative step delta. With psi_i =
+    N dT/dw_i and sum_i psi_i = 0, (T(omega) - T(1)) / t -> sum_i u_i
+    psi_i. For u = 1{i in K}/n_K this is `perturbed_weights(ones, K, t)`
+    at t = step_parameter(delta, n_K/N) exactly. Returns (omega, t).
+    """
+    u = np.asarray(u, dtype=float)
+    g = u.size * u - u.sum()
+    t = float(delta / np.abs(g).max())
+    return 1.0 + t * g, t
+
+
 def difference(
     p: float,
     delta: float,

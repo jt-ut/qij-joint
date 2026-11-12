@@ -5,16 +5,16 @@ every replicate's counts, in replicate order, from one RNG stream --
 workers only evaluate `T` on rows the parent already drew. It also
 evaluates `theta_hat = T(X, ones(N))` once, outside that RNG stream, so
 `BootstrapResult.bc_interval` has the point estimate its z0 needs
-(spec/QIJ_mods_waves.md A10) without touching the replicates themselves.
+(spec/archive/QIJ_mods_waves.md A10) without touching the replicates themselves.
 When `T.takes_start`, every replicate is warm-started from `theta_hat`
-(spec/QIJ_mods_waves.md A11), so `theta_hat` is awaited before the first
+(spec/archive/QIJ_mods_waves.md A11), so `theta_hat` is awaited before the first
 replicate chunk is dispatched; an estimator without `takes_start` is
 bit-identical to before, `theta_hat`'s own evaluation still overlapping
 the first replicate chunks. When warm, `eta_full` is also measured from
-`theta_hat` on the full data (spec/QIJ_mods_waves.md A15) and every
+`theta_hat` on the full data (spec/archive/QIJ_mods_waves.md A15) and every
 replicate's polish is held to it instead of `T`'s own declared `eta`,
 which the trust-region finish's own iteration cap (`gmm.py`'s
-`2 * p`, spec/QIJ_estimator_fit_spec.md 5.4) can otherwise reach before
+`2 * p`, spec/archive/QIJ_estimator_fit_spec.md 5.4) can otherwise reach before
 a fit at this scale has actually stalled. `measure_eta_full` never
 returns NaN (spec 2.3): a failed measurement falls back to `T.eta`
 itself, so `eta_full` here is always a finite, safe polish tolerance.
@@ -34,7 +34,7 @@ from .result import BootstrapResult
 
 def _theta_hat_task(T, case, X: np.ndarray, _task):
     """T(X, ones(N)) on the shared draw: the bootstrap's own full-data
-    point estimate (spec/QIJ_mods_waves.md A10), submitted to the pool
+    point estimate (spec/archive/QIJ_mods_waves.md A10), submitted to the pool
     at the start of `fit` so it overlaps with the first replicate
     chunks rather than blocking them, and computed outside the resample
     loop's own RNG stream. A failing evaluation is caught here, this
@@ -88,7 +88,7 @@ class Bootstrap:
         each replaced by a freshly drawn chunk as soon as it finishes, so
         no worker idles behind another chunk's evaluation. When
         `T.takes_start`, `theta_hat` is awaited up front, `eta_full`
-        (spec/QIJ_mods_waves.md A15) is measured from it once, and every
+        (spec/archive/QIJ_mods_waves.md A15) is measured from it once, and every
         chunk carries both as the replicates' warm start and polish
         tolerance."""
         X = np.asarray(X)

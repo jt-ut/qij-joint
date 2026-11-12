@@ -1,7 +1,7 @@
 """The four paper draws (pareto, mvt, fp, imf), the MVT VQ transform, the
-`mix11` demo mixture (spec/method_notes.md section 5), the
-`cloudfil_G_B6_P3_v1` demo (spec/QIJ_mods_waves.md A11) and its
-`cloudfil_G_U_P3_v1` sibling (spec/QIJ_shearmix_interface.md section 5,
+`mix11` demo mixture (spec/archive/method_notes.md section 5), the
+`cloudfil_G_B6_P3_v1` demo (spec/archive/QIJ_mods_waves.md A11) and its
+`cloudfil_G_U_P3_v1` sibling (spec/archive/QIJ_shearmix_interface.md section 5,
 one smooth sheared-Gaussian filament in place of the six beads); none of
 these demos is one of the paper's four.
 
@@ -88,7 +88,7 @@ def _cloudfil_G_B6_P3_v1_pop() -> dict:
 
 
 def cloudfil_G_B6_P3_v1(N: int, seed: int) -> np.ndarray:
-    """N draws from the `cloudfil_G_B6_P3_v1` mixture (spec/QIJ_mods_waves.md
+    """N draws from the `cloudfil_G_B6_P3_v1` mixture (spec/archive/QIJ_mods_waves.md
     A11): a multinomial component count from the file's weights, then a
     multivariate normal draw per component. Returns (N, 2)."""
     rng = np.random.default_rng(seed)
@@ -120,7 +120,7 @@ def _cloudfil_G_U_P3_v1_pop() -> dict:
 
 def cloudfil_G_U_P3_v1(N: int, seed: int) -> np.ndarray:
     """N draws from the `cloudfil_G_U_P3_v1` mixture
-    (spec/QIJ_shearmix_interface.md section 5): a multinomial component
+    (spec/archive/QIJ_shearmix_interface.md section 5): a multinomial component
     count from the file's weights (the 4 Gaussians then the filament, in
     file order), then a multivariate normal draw per Gaussian, and for
     the filament x ~ N(m, s2x), y = h(x) + sqrt(s2p) * eps -- mirroring

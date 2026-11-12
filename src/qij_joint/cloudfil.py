@@ -1,5 +1,5 @@
 """`P2Mixture`/`P1Mixture`: the `cloudfil_G_B6_P3_v1` demo's estimands
-(spec/QIJ_mods_waves.md A11). Both are a thin wrapper around
+(spec/archive/QIJ_mods_waves.md A11). Both are a thin wrapper around
 `GMM2D(K=10)` whose `outputs` are the 59 raw mixture parameters followed
 by seven derived outputs of one subject core -- position (x, y), log
 effective radius, log axis ratio, position angle, logit weight, log peak
@@ -82,7 +82,7 @@ def _select_subject(theta: np.ndarray, K: int, mu_true: np.ndarray,
                      Sigma_true: np.ndarray) -> int:
     """The fitted component nearest the subject's truth (`mu_true`,
     `Sigma_true`) by the Bhattacharyya distance of A6
-    (spec/QIJ_mods_waves.md A6): the metric that separates a spike from
+    (spec/archive/QIJ_mods_waves.md A6): the metric that separates a spike from
     the blob sharing its mean through the covariance term."""
     _, mus, Sigmas = _unpack_all(theta, K)
     Sbar = 0.5 * (Sigmas + Sigma_true)
@@ -130,7 +130,7 @@ def _derived_outputs(theta: np.ndarray, K: int, s: int, pa_lo: float) -> np.ndar
 def _jacobian(theta: np.ndarray, K: int, s: int, fd_step: float, pa_lo: float) -> np.ndarray:
     """(7, p) Jacobian of `_derived_outputs` at `theta`, `s` and `pa_lo`
     held fixed -- central finite differences of the deterministic closed
-    forms (spec/QIJ_mods_waves.md A11)."""
+    forms (spec/archive/QIJ_mods_waves.md A11)."""
     p = theta.shape[0]
     J = np.empty((len(_DERIVED_SUFFIXES), p))
     for c in range(p):
@@ -150,14 +150,14 @@ class _SubjectMixture:
     66-long output layout; only its first 59 entries (GMM2D's own
     layout) are used. `eta`, when given, replaces the wrapped `GMM2D`'s
     own declared eta in the polish's acceptance for that call alone
-    (spec/QIJ_mods_waves.md A15). `measured` defaults to the seven
+    (spec/archive/QIJ_mods_waves.md A15). `measured` defaults to the seven
     derived outputs' indices.
 
     A subclass sets the class attributes `_role` (the subject's `role`
     key in the packaged `.npz`), `_prefix` (its output-name prefix),
     `_pa_lo` (its position-angle branch's lower edge) and `periodic`
     (its periodic outputs' names and periods, `{'<prefix>_pa': pi}`
-    here, read by the sigma-points stage, `core/sigma_points.py`)."""
+    here; a periodic output's interval is read modulo its period)."""
 
     takes_start = True
     _role: str = None
@@ -183,7 +183,7 @@ class _SubjectMixture:
     @property
     def last_fit_info(self):
         """The wrapped `GMM2D`'s own `last_fit_info`
-        (spec/QIJ_estimator_fit_spec.md 2.4): component selection and the
+        (spec/archive/QIJ_estimator_fit_spec.md 2.4): component selection and the
         derived outputs' Jacobian add no fit of their own, so this
         status is exactly the raw mixture's."""
         return self._gmm.last_fit_info

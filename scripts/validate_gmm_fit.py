@@ -2,7 +2,7 @@
 """Direct-estimator validation of the mixture fit (spec/QIJ_estimator_fit_spec.md
 section 3, items 1-6): every check calls `GMM2D`/`P2Mixture` (via the
 `cloudfil`/`p2` registry case) directly -- no `qij`, `boot`, `oracle`,
-`ij` or `ijfd` pipeline invocation, at any size. Runs unchanged against
+or `ij` pipeline invocation, at any size. Runs unchanged against
 the old (`clean`) and the rewritten `_fit`: `--src` selects which
 package tree is imported, so the same script and the same reference
 artifacts (the stored `cloudfil_clean/cloudfil_p2_N10000` products) are

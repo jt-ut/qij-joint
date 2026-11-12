@@ -360,8 +360,22 @@ def _mvt_all_influence(X: np.ndarray, w: np.ndarray) -> np.ndarray:
     return np.column_stack([IF_nu[:, 0], IF_tail[:, 0]])
 
 
+def _mvt_all_per_point_loss(X: np.ndarray, theta: np.ndarray) -> np.ndarray:
+    """(N,): each row's loss at theta = (nu, P_tail): minus the log density of the standard multivariate t with nu degrees of
+    freedom at the row (the model `_mvt_nu_solve` fits, a function of r^2 only), plus minus the Bernoulli log likelihood of
+    the tail indicator 1{r > c} at P_tail. Used by qij_joint.method's quantized representation."""
+    from scipy.special import gammaln
+    X = np.asarray(X, dtype=float); d = X.shape[1]; r_sq = np.sum(X ** 2, axis=1)
+    nu, pt = float(theta[0]), float(np.clip(theta[1], 1e-12, 1.0 - 1e-12))
+    logf = (gammaln((nu + d) / 2.0) - gammaln(nu / 2.0) - 0.5 * d * np.log(nu * np.pi)
+            - 0.5 * (nu + d) * np.log1p(r_sq / nu))
+    y = (np.sqrt(r_sq) > MVT_TAIL_C).astype(float)
+    return -logf - (y * np.log(pt) + (1.0 - y) * np.log(1.0 - pt))
+
+
 mvt_all.prepare = _mvt_all_prepare
 mvt_all.influence = _mvt_all_influence
+mvt_all.per_point_loss = _mvt_all_per_point_loss
 
 
 # ======================================================================
@@ -457,8 +471,18 @@ def _fp_influence(X: np.ndarray, w: np.ndarray) -> np.ndarray:
         return np.full((len(X), 4), np.nan)
 
 
+def _fp_per_point_loss(X: np.ndarray, theta: np.ndarray) -> np.ndarray:
+    """(N,): each row's loss at theta = (a, b, c, scatter): the squared orthogonal distance of the standardized row to the
+    plane x_R = a x_sigma + b x_I + c, the quantity the weighted TLS fit minimizes. Used by qij_joint.method's quantized
+    representation."""
+    a, b, c = float(theta[0]), float(theta[1]), float(theta[2])
+    Xs = _fp_standardize(X)
+    return (Xs[:, 2] - a * Xs[:, 0] - b * Xs[:, 1] - c) ** 2 / (1.0 + a * a + b * b)
+
+
 fp.prepare = _fp_prepare
 fp.influence = _fp_influence
+fp.per_point_loss = _fp_per_point_loss
 
 
 # ======================================================================

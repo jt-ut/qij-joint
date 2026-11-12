@@ -1,0 +1,47 @@
+The measurement run of 2026-11-07 (scripts/quantized_run.py and method.run_quantized, both removed 2026-11-12): every pilot
+and tree evaluation on the quantized data (refits on the prototypes with their masses), the report on the data; N = 10^4,
+eps = 0.01. It is the evidence for the ruling that the method makes no quantized evaluation (spec/METHOD_as_built.md section 4).
+
+[  0.0 s] launch: 25 draws, 16 at a time, cap 300 s, stop launching after a draw over 60 s
+[ 54.3 s] mvt       0  within eps False  max|Vhat/V-1| 4.6579  per output [-4.6579 -0.0206]  prototypes 2705 (6 fits, 33.68 sd)  K 26  rounds 9  evals quantized 1136, data 6  wall 51.2 s  refit 0.0017 s  bed certified max|Vhat-1| 0.0069
+[ 54.3 s] mvt       2  within eps False  max|Vhat/V-1| 4.5872  per output [-4.5872 -0.0026]  prototypes 2705 (6 fits, 33.15 sd)  K 25  rounds 9  evals quantized 1134, data 6  wall 51.0 s  refit 0.0017 s  bed certified max|Vhat-1| 0.0020
+[ 54.3 s] mvt       3  within eps False  max|Vhat/V-1| 4.9339  per output [-4.9339 -0.0021]  prototypes 2705 (6 fits, 34.43 sd)  K 24  rounds 9  evals quantized 1132, data 6  wall 51.4 s  refit 0.0017 s  bed certified max|Vhat-1| 0.0019
+[ 54.9 s] mvt       1  within eps False  max|Vhat/V-1| 4.7444  per output [-4.7444 -0.0024]  prototypes 2705 (6 fits, 33.49 sd)  K 27  rounds 9  evals quantized 1138, data 6  wall 51.8 s  refit 0.0018 s  bed certified max|Vhat-1| 0.0020
+[ 54.9 s] mvt       4  within eps False  max|Vhat/V-1| 4.3467  per output [-4.3467 -0.0209]  prototypes 2705 (6 fits, 32.77 sd)  K 24  rounds 9  evals quantized 1132, data 6  wall 51.5 s  refit 0.0016 s  bed certified max|Vhat-1| 0.0018
+[184.5 s] shearmix  8  within eps False  max|Vhat/V-1| 0.1011  per output [-0.0253 -0.0217 -0.1011 -0.0779 -0.0444 -0.0239 -0.0763]  prototypes 2705 (6 fits, 0.23 sd)  K 161  rounds 15  evals quantized 1406, data 11  wall 181.1 s  refit 0.0874 s  bed certified max|Vhat-1| 0.0011
+[184.5 s] a draw took 181 s > 60 s: no further draws are launched (4 not run)
+[185.0 s] shearmix  4  within eps False  max|Vhat/V-1| 0.4013  per output [-0.0969 -0.1072 -0.3819 -0.4013 -0.2178 -0.1537 -0.2999]  prototypes 2705 (6 fits, 0.46 sd)  K 118  rounds 11  evals quantized 1320, data 11  wall 181.6 s  refit 0.0888 s  bed certified max|Vhat-1| 0.0015
+[192.5 s] shearmix  7  within eps False  max|Vhat/V-1| 0.0881  per output [-0.0275 -0.0387 -0.0644 -0.0668 -0.0881 -0.0288 -0.0363]  prototypes 2705 (6 fits, 0.28 sd)  K 168  rounds 16  evals quantized 1420, data 11  wall 189.1 s  refit 0.0867 s  bed certified max|Vhat-1| 0.0006
+[193.5 s] shearmix  9  within eps False  max|Vhat/V-1| 0.0505  per output [-0.0164 -0.0130 -0.0466 -0.0447 -0.0505 -0.0127 -0.0229]  prototypes 2705 (6 fits, 0.07 sd)  K 159  rounds 15  evals quantized 1402, data 11  wall 189.7 s  refit 0.0852 s  bed certified max|Vhat-1| 0.0011
+[199.5 s] shearmix  0  within eps False  max|Vhat/V-1| 0.0705  per output [-0.0221 -0.0205 -0.0425 -0.0376 -0.0705 -0.0238 -0.0264]  prototypes 2705 (6 fits, 0.12 sd)  K 167  rounds 15  evals quantized 1418, data 11  wall 196.1 s  refit 0.0852 s  bed certified max|Vhat-1| 0.0009
+[199.5 s] shearmix 10  within eps False  max|Vhat/V-1| 0.1281  per output [-0.0266 -0.0243 -0.1032 -0.0936 -0.1281 -0.0345 -0.0576]  prototypes 2705 (6 fits, 0.19 sd)  K 189  rounds 17  evals quantized 1462, data 11  wall 196.3 s  refit 0.0856 s  bed certified max|Vhat-1| 0.0010
+[200.5 s] shearmix  5  within eps False  max|Vhat/V-1| 0.0702  per output [-0.0231 -0.0338 -0.0631 -0.0702 -0.0543 -0.0119 -0.0299]  prototypes 2705 (6 fits, 0.25 sd)  K 164  rounds 15  evals quantized 1412, data 11  wall 197.3 s  refit 0.0864 s  bed certified max|Vhat-1| 0.0010
+[201.5 s] shearmix  2  within eps False  max|Vhat/V-1| 0.0689  per output [-0.0191 -0.0163 -0.0342 -0.0689 -0.0345 -0.0097 -0.0162]  prototypes 2705 (6 fits, 0.16 sd)  K 173  rounds 15  evals quantized 1430, data 11  wall 198.3 s  refit 0.0862 s  bed certified max|Vhat-1| 0.0018
+[202.0 s] shearmix  3  within eps False  max|Vhat/V-1| 0.1152  per output [-0.0154 -0.0155 -0.0518 -0.1152 -0.0694 -0.0182 -0.0331]  prototypes 2705 (6 fits, 0.16 sd)  K 184  rounds 15  evals quantized 1452, data 11  wall 198.6 s  refit 0.0875 s  bed certified max|Vhat-1| 0.0013
+[203.1 s] shearmix  6  within eps False  max|Vhat/V-1| 0.0850  per output [-0.0399 -0.0177 -0.0850 -0.0771 -0.0772 -0.0174 -0.0419]  prototypes 2705 (6 fits, 0.24 sd)  K 189  rounds 15  evals quantized 1462, data 11  wall 199.8 s  refit 0.0855 s  bed certified max|Vhat-1| 0.0010
+[204.1 s] shearmix  1  within eps False  max|Vhat/V-1| 0.0965  per output [-0.0164 -0.0192 -0.0965 -0.0786 -0.0439 -0.0294 -0.0470]  prototypes 2705 (6 fits, 0.10 sd)  K 181  rounds 15  evals quantized 1446, data 11  wall 200.7 s  refit 0.0857 s  bed certified max|Vhat-1| 0.0009
+[222.7 s] shearmix 12  within eps False  max|Vhat/V-1| 0.0400  per output [-0.0127 -0.0107 -0.0281 -0.0267 -0.0400 -0.0097 -0.0167]  prototypes 2705 (6 fits, 0.13 sd)  K 179  rounds 15  evals quantized 1442, data 11  wall 163.5 s  refit 0.0840 s  bed certified max|Vhat-1| 0.0011
+[224.2 s] shearmix 11  within eps False  max|Vhat/V-1| 0.2062  per output [-0.0383 -0.0352 -0.2062 -0.0562 -0.1536 -0.0804 -0.1576]  prototypes 2705 (6 fits, 0.24 sd)  K 186  rounds 16  evals quantized 1456, data 11  wall 165.2 s  refit 0.0820 s  bed certified max|Vhat-1| 0.0016
+[225.7 s] shearmix 13  within eps False  max|Vhat/V-1| 0.2423  per output [-0.1678 -0.1144 -0.2423 -0.2026 -0.1259 -0.1776 -0.1562]  prototypes 2705 (6 fits, 0.30 sd)  K 160  rounds 14  evals quantized 1404, data 11  wall 166.5 s  refit 0.0814 s  bed certified max|Vhat-1| 0.0008
+[225.7 s] shearmix 15  within eps False  max|Vhat/V-1| 0.2583  per output [-0.0663 -0.0287 -0.1443 -0.1357 -0.2583 -0.0412 -0.1112]  prototypes 2705 (6 fits, 0.47 sd)  K 157  rounds 15  evals quantized 1398, data 11  wall 166.3 s  refit 0.0827 s  bed certified max|Vhat-1| 0.0008
+[227.7 s] shearmix 14  within eps False  max|Vhat/V-1| 0.0657  per output [-0.0279 -0.0324 -0.0490 -0.0657 -0.0630 -0.0227 -0.0262]  prototypes 2705 (6 fits, 0.24 sd)  K 180  rounds 16  evals quantized 1444, data 11  wall 168.1 s  refit 0.0834 s  bed certified max|Vhat-1| 0.0007
+[300.2 s] CAP 300 s reached; 4 draws not launched
+[300.2 s]
+[300.2 s] SUMMARY shearmix: 16 draws; within eps on every output 0 / 16 (design level 84 %)
+[300.2 s]   output                   within med |.|/eps max |.|/eps bed med/eps
+[300.2 s]   p2_x                       0/16      2.595     16.776      0.037
+[300.2 s]   p2_y                       0/16      2.298     11.444      0.063
+[300.2 s]   p2_log_reff                0/16      7.468     38.194      0.092
+[300.2 s]   p2_log_axis_ratio          0/16      7.365     40.135      0.082
+[300.2 s]   p2_pa                      0/16      6.997     25.829      0.070
+[300.2 s]   p2_logit_w                 2/16      2.384     17.762      0.068
+[300.2 s]   p2_log_contrast            0/16      3.910     29.994      0.092
+[300.2 s]   median evaluations: quantized 1425, data 11; median wall 189.4 s; median prototypes 2705; median refit on the quantized data 0.0856 s
+[300.2 s]   per draw max_j |Vhat/V - 1| (quantized run) and the bed's certified max_j |Vhat - 1|: 0: 0.0705 / 0.0009, 1: 0.0965 / 0.0009, 2: 0.0689 / 0.0018, 3: 0.1152 / 0.0013, 4: 0.4013 / 0.0015, 5: 0.0702 / 0.0010, 6: 0.0850 / 0.0010, 7: 0.0881 / 0.0006, 8: 0.1011 / 0.0011, 9: 0.0505 / 0.0011, 10: 0.1281 / 0.0010, 11: 0.2062 / 0.0016, 12: 0.0400 / 0.0011, 13: 0.2423 / 0.0008, 14: 0.0657 / 0.0007, 15: 0.2583 / 0.0008
+[300.2 s] SUMMARY mvt: 5 draws; within eps on every output 0 / 5 (design level 84 %)
+[300.2 s]   output                   within med |.|/eps max |.|/eps bed med/eps
+[300.2 s]   nu                          0/5    465.785    493.388      0.194
+[300.2 s]   P_tail                      3/5      0.258      2.091      0.198
+[300.2 s]   median evaluations: quantized 1134, data 6; median wall 51.4 s; median prototypes 2705; median refit on the quantized data 0.0017 s
+[300.2 s]   per draw max_j |Vhat/V - 1| (quantized run) and the bed's certified max_j |Vhat - 1|: 0: 4.6579 / 0.0069, 1: 4.7444 / 0.0020, 2: 4.5872 / 0.0020, 3: 4.9339 / 0.0019, 4: 4.3467 / 0.0018
+[300.2 s] wall 300.2 s

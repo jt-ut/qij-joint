@@ -1,4 +1,4 @@
-"""Pure math for `ShearMix2D` (spec/QIJ_shearmix_interface.md section 3):
+"""Pure math for `ShearMix2D` (spec/archive/QIJ_shearmix_interface.md section 3):
 `Kg` free full-covariance Gaussians (cloud and cores) plus ONE sheared-
 Gaussian filament component,
 
@@ -503,7 +503,7 @@ def hessian(prep: Prep, w: np.ndarray, Kg: int, theta: np.ndarray, pen: Pen) -> 
     """H_theta = d^2 ell_p/d theta^2 (the Hessian ITSELF, not the
     information -- `info` below returns `-hessian(...)`), by Louis's
     (1982) identity exactly as `gmm._score_info`/`_score_info_penalized`
-    build GMM2D's own `A` (spec/method_notes.md section 5), reindexed
+    build GMM2D's own `A` (spec/archive/method_notes.md section 5), reindexed
     for `Kg` explicit Gaussian weights with `pi_f` implied -- the
     filament plays the role of GMM2D's own reference component (index
     `Kg` here, `K-1` there) -- plus the filament's own closed-form

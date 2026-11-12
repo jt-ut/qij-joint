@@ -1,5 +1,5 @@
 """`P2ShearMixture`/`P1ShearMixture`: the `cloudfil_G_U_P3_v1` demo's
-estimands (spec/QIJ_shearmix_interface.md section 5) -- `cloudfil.py`'s
+estimands (spec/archive/QIJ_shearmix_interface.md section 5) -- `cloudfil.py`'s
 `P2Mixture`/`P1Mixture` rebuilt on `shearmix.ShearMix2D` in place of
 `gmm.GMM2D`, the author's well-specified replacement for the six-bead
 filament demo. Both are a thin wrapper around `ShearMix2D(Kg=4)` whose
@@ -97,7 +97,7 @@ def _select_subject(theta: np.ndarray, Kg: int, mu_true: np.ndarray,
     """The fitted Gaussian (among the Kg free Gaussians only; the
     filament is never a subject candidate) nearest the subject's truth
     (`mu_true`, `Sigma_true`) by the Bhattacharyya distance of A6
-    (spec/QIJ_mods_waves.md A6): the metric that separates a spike from
+    (spec/archive/QIJ_mods_waves.md A6): the metric that separates a spike from
     the blob/filament sharing its mean through the covariance term."""
     _, _, mus, covs, _ = shearmix_model.unpack(Kg, theta)
     Sbar = 0.5 * (covs + Sigma_true)
@@ -191,7 +191,7 @@ class _SubjectShearMixture:
     key in the packaged `.npz`), `_prefix` (its output-name prefix) and
     `_pa_lo` (its position-angle branch's lower edge), plus `periodic`
     (its periodic outputs' names and periods, `{'<prefix>_pa': pi}`
-    here, read by the sigma-points stage, `core/sigma_points.py`)."""
+    here; a periodic output's interval is read modulo its period)."""
 
     takes_start = True
     _role: str = None
@@ -217,7 +217,7 @@ class _SubjectShearMixture:
     @property
     def last_fit_info(self):
         """The wrapped `ShearMix2D`'s own `last_fit_info`
-        (spec/QIJ_estimator_fit_spec.md 2.4): component selection and the
+        (spec/archive/QIJ_estimator_fit_spec.md 2.4): component selection and the
         derived outputs' Jacobian add no fit of their own, so this
         status is exactly the raw mixture's."""
         return self._mix.last_fit_info
@@ -230,6 +230,15 @@ class _SubjectShearMixture:
         """`ShearMix2D.loglik` on the raw mixture parameters (the
         derived outputs have no likelihood term)."""
         return self._mix.loglik(X, w, np.asarray(theta, dtype=float)[:self._mix.p], prep=prep)
+
+    def per_point_loss(self, X: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """(N,): each row's contribution to the loss at `theta` (37-long or the raw 30), minus the log mixture density of the
+        row (the penalty has no per-row term). Used by qij_joint.method's quantized representation to measure how much a
+        point mass at a unit's mean misstates the unit's points."""
+        from scipy.special import logsumexp
+        prep = self._mix.prepare(np.asarray(X, dtype=float))
+        lj = shearmix_model.log_joint(prep, self._mix.Kg, np.asarray(theta, dtype=float)[:self._mix.p])
+        return -logsumexp(lj, axis=1)
 
     def __call__(self, X: np.ndarray, w: np.ndarray, prep: tuple = None,
                  start: np.ndarray = None, eta: float = None, **kwargs) -> np.ndarray:

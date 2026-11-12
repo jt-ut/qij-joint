@@ -2,7 +2,7 @@
 """Direct-estimator validation of the mixture cold search
 (spec/QIJ_estimator_search_spec.md section 3, items 1-3): every check
 calls `GMM2D`/`P2Mixture` (via the `cloudfil`/`p2` registry case)
-directly -- no `qij`, `boot`, `oracle`, `ij` or `ijfd` pipeline
+directly -- no `qij`, `boot`, `oracle` or `ij` pipeline
 invocation, at any size. Runs unchanged against the pre-search-change
 tree and the rewritten one: `--src` selects which package tree is
 imported.

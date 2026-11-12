@@ -1,5 +1,5 @@
 """`ShearMix2D`: the estimator built on `shearmix_model.py`'s pure math
-(spec/QIJ_shearmix_interface.md section 4). `Kg` free full-covariance
+(spec/archive/QIJ_shearmix_interface.md section 4). `Kg` free full-covariance
 Gaussians (cloud and cores) plus ONE sheared-Gaussian filament component,
 fit by the same multi-start-EM / trust-region-Newton design as
 `gmm.GMM2D`, with the filament seeded and never relabelled.
