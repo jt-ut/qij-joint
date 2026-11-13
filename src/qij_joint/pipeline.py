@@ -142,7 +142,7 @@ def run_boot(dataset: str, estimator: str, N: int, draws: Iterable[int], seed: i
     return written, len(draws) - written
 
 
-_TIMING_KEYS = ('pilot_cells_s', 'pilot_eval_s', 'fit_s', 'eval_s', 'total_s')
+_TIMING_KEYS = ('pilot_cells_s', 'pilot_eval_s', 'fit_s', 'eval_s', 'total_s', 'busy_s')
 
 
 def _per_output(d: dict, outputs) -> dict:

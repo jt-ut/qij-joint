@@ -35,7 +35,8 @@ INTERFACE (shared with pipeline.py; keep it exactly)
     the J report evaluations), E_full (= E: every evaluation is on the full data), M, K (leaves), rounds, rounds_table (list of
     dicts: round, phase, n_taken, n_repaired, E, K, R_hat, U, delta, offset), leaves_table (list of dicts at the stop: leaf, n,
     mean per output, term per output, determined, bound per output, inferred), timings (dict: pilot_cells_s, pilot_eval_s,
-    fit_s, eval_s, total_s, full_refit_mean_s), intervals (None: core.abc's ABC needs a, b, c, not measured), outputs (names);
+    fit_s, eval_s, total_s, busy_s = the single-core-equivalent seconds: total_s with the pool's wall replaced by the sum of its tasks'
+    own times, the bootstrap's busy_time rule; full_refit_mean_s), intervals (None: core.abc's ABC needs a, b, c, not measured), outputs (names);
     eval_error (the redundant rows: count by kind, max and rms per output of value minus the value the active rows imply, in
     units of the output's scale); offset (J,) Omega at the stop; n_inferred (leaves whose mean is inferred at the stop);
     n_repaired; repairs (one dict per repaired leaf: round, leaf, n, inferred, measured, discrepancy = inferred - measured in
@@ -313,7 +314,7 @@ class _Evaluations:
 
     def __init__(self, T, X, evaluator, pool, measured):
         self.T, self.X, self.evaluator, self.pool, self.measured = T, X, evaluator, pool, np.asarray(measured, int)
-        self.n = 0; self.n_base = 0; self.wall = 0.0; self.counter = None; self.theta = None; self.eta_full = None; self.delta = None
+        self.n = 0; self.n_base = 0; self.wall = 0.0; self.pool_wall = 0.0; self.counter = None; self.theta = None; self.eta_full = None; self.delta = None
         self.flat = np.asarray(X).ndim == 1
         X2 = np.asarray(X, float); self.XA = X2[:, None] if self.flat else X2
         self.stats = dict(full_refits=0, full_s=0.0)
@@ -345,7 +346,7 @@ class _Evaluations:
             self.wall += time.perf_counter() - t0; return out
         tasks = [(i, u, self.delta, self.theta, self.eta_full, self.flat) for i, u in enumerate(us)]
         if self.pool is not None:
-            res = self.pool.map(_evaluation_task, tasks)
+            tp = time.perf_counter(); res = self.pool.map(_evaluation_task, tasks); self.pool_wall += time.perf_counter() - tp
         else:
             res = [_evaluation_task(self.T, None, self.XA, task) for task in tasks]
         for r in res:
@@ -372,7 +373,7 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
     X = np.asarray(X, float); N = X.shape[0]
     measured = list(getattr(T, 'measured', None) or range(len(T.outputs)))
     outputs = [str(T.outputs[i]) for i in measured]; J = len(measured)
-    timings = dict(pilot_cells_s=0.0, pilot_eval_s=0.0, fit_s=0.0, eval_s=0.0, total_s=0.0)
+    timings = dict(pilot_cells_s=0.0, pilot_eval_s=0.0, fit_s=0.0, eval_s=0.0, total_s=0.0, busy_s=0.0)
 
     ev = _Evaluations(T, X, evaluator, pool, measured)
     ev.base()
@@ -394,6 +395,7 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
         record.update(cells=inv.copy(), pilot_values=Yp.copy(), scale=s.copy())
     if pilot_only:                                            # the pilot only (no tree)
         timings['total_s'] = time.perf_counter() - t_start
+        timings['busy_s'] = timings['total_s'] - ev.pool_wall + ev.stats['full_s']
         st = ev.stats; timings['full_refit_mean_s'] = st['full_s'] / max(st['full_refits'], 1)
         return MethodResult(Vhat=None, U=None, delta=None, V_lb=None, E=int(ev.n_base + ev.n), E_full=float(ev.n_base + ev.n), M=int(C), K=1,
                             rounds=0, timings=timings, outputs=outputs, bound_eval=b_eval * s, eta_full=ev.eta_full)
@@ -685,6 +687,8 @@ def run(T, X, *, eps=0.01, level=0.84, M=None, k=None, pool=None, evaluator=None
         record.update(psi_tilde=psit, leaves=lab.copy(), redundant=[(rid, kd, rel, d.copy()) for rid, kd, rel, d in redundant],
                       counts=dict(base=int(ev.n_base), pilot=int(C), splits=int(n_split), tests=int(n_test), repairs=int(n_repair), q=int(J)))
     timings['total_s'] = time.perf_counter() - t_start
+    # single-core-equivalent seconds: the pool's wall replaced by the sum of its tasks' own times (bootstrap.py's busy_time rule)
+    timings['busy_s'] = timings['total_s'] - ev.pool_wall + ev.stats['full_s']
     return MethodResult(Vhat=Vhat, U=U, delta=delta, V_lb=V_lb, E=int(E), E_full=float(E_full), M=int(C), K=int(K), rounds=int(n_round),
                         rounds_table=rounds_table, leaves_table=leaves_table, timings=timings, intervals=None, outputs=outputs,
                         eval_error=eval_error, offset=Om * s2, n_inferred=int(sum(linf)), n_repaired=int(n_repair), repairs=repairs,
