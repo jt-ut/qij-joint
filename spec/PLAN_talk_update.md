@@ -294,7 +294,17 @@ submission on an explicit go). V6 rsync back into the canonical tree; summaries;
       Reruns through the driver at 16 workers, N = 10⁴, ε = 0.01, draw 0: fp K 1281, E 3750, within 0.23 ε (211
       kernel-redundant rows); imf K 75, E 223, within 0.13 ε; mvt K 220, E 741, within 1.31 ε (P_tail; design level);
       sheared Core 1 K 234, E 709, within 0.47 ε. Commit 40f1a4e pushed; Vista clone at it; jobs regenerated.
-- [ ] submit refs (8 jobs) and qij (15 jobs) on the author's go → rsync into the tree → summaries → figures
+- [x] time axis on equal footing (author, 2026-11-13: the talk shows cost in evaluations AND wall time). The October
+      figure's seconds were single-core-equivalent for both: boot's busy_time (sum of the replicates' own refit times;
+      October boot ran 112 workers, 656 s busy for 7 s wall) and qij at one worker (wall = busy). The port recorded only
+      wall, so at 16 workers qij would have been flattered up to 16×. Fix: method records busy_s = total_s with the
+      pool's wall replaced by the sum of its tasks' refit times (bootstrap's rule); pipeline writes it; the summary's
+      seconds for as-built qij = busy_s. Check: Core 1 draw 0 at 16 workers, busy_s 352 s, wall 52 s, E 709, K 234
+      (unchanged). Commit 7881404 pushed; Vista pulled; jobs regenerated at it. Slide text: label the axis CPU seconds
+      (core-seconds slightly favour qij: boot parallelises perfectly, qij's refit is serial).
+- [x] SUBMITTED 2026-11-13 (author's "ok go"): refs 8 jobs + qij 15 jobs, Slurm 1141544–1141566, all pending at
+      submit. Vista clone's remote set to github.com/jjtphd/qij-joint (author ran it; the account was renamed).
+- [ ] jobs down → rsync $WORK/projects/QIJ_JOINT/runs into Research/QIJ_joint/runs → manifests/README → summaries → figures
 - [ ] budget rule note: imf and pareto are 1-D data, so r = 1 and M = 49 at ε = 0.01; fp r = 3, M = 1319;
       mvt clusters in its 10-D coordinates, r = 2, M = 300
 - [ ] stale files deleted; vqboot branches (separate, not for the talk)
